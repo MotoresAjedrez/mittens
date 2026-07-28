@@ -1,4 +1,6 @@
-# MiMotor Tal
+# Mittens (MiMotor Tal)
+
+![logo](logo.png)
 
 **ELO: 1**
 
