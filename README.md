@@ -1,5 +1,7 @@
 # MiMotor Tal
 
+**ELO: 1**
+
 Motor de ajedrez UCI escrito en Rust. Esta carpeta contiene el codigo fuente completo, los pesos neuronales proporcionados y una serie de reparaciones de correctitud, reloj y robustez.
 
 ## Compilar en macOS
