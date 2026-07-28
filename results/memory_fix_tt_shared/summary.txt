@@ -1,0 +1,1 @@
+memory_fix_tt_shared: +14 =20 -6, 60.0%, CONFIRMADA

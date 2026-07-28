@@ -1,0 +1,30 @@
+id name MiMotor Tal v8 Reparado (Rust)
+id author Tavito y Claude
+option name Hash type spin default 64 min 1 max 1024
+option name Clear Hash type button
+option name Move Overhead type spin default 75 min 0 max 5000
+option name Threads type spin default 1 min 1 max 16
+option name Personalidad type combo default tal var tal var universal
+option name SyzygyPath type string default <empty>
+option name BookPath type string default <empty>
+option name OwnBook type check default true
+option name UseNNUE type check default false
+option name NNUEPath type string default <empty>
+option name UseNN type check default false
+option name NNPath type string default <empty>
+uciok
+info string NNUE cargada desde /Users/Tavito/mimotor-lichess-bot/engines/nn_weights/pesos_flat_3m.bin checksum 6a7a0a6ed6d6de80
+readyok
+info depth 1 score cp 116 nodes 96 time 0
+info depth 2 score cp 177 nodes 516 time 1
+info depth 3 score cp 177 nodes 963 time 3
+info depth 4 score cp 208 nodes 2654 time 8
+info depth 5 score cp 174 nodes 10379 time 32
+info depth 6 score cp 204 nodes 22683 time 75
+info depth 7 score cp 160 nodes 83396 time 279
+info depth 8 score cp 167 nodes 284836 time 1006
+info depth 9 score cp 164 nodes 490401 time 1719
+info depth 10 score cp 162 nodes 1227937 time 4201
+info depth 11 score cp 146 nodes 3054525 time 10004
+info depth 12 score cp 146 nodes 6204580 time 19873
+bestmove c3d5

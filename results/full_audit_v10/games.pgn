@@ -1,0 +1,110 @@
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "full_audit_v10"]
+[Black "deployed-hindsight"]
+[Result "0-1"]
+[Opening "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. a3 axb5 5. b3 Nf6 6. c3 d5 7. d3 dxe4 8. g3 Bg4 9. h3 Bxf3 10. a4 Bxd1 11. f3 Qxd3 12. b4 Qe2# 0-1
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "deployed-hindsight"]
+[Black "full_audit_v10"]
+[Result "1-0"]
+[Opening "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Bxc6 a5 5. Ba4 b6 6. Nc3 b5 7. Bxb5 a4 8. O-O a3 9. bxa3 c6 10. Bc4 c5 11. Nxe5 d6 12. Bxf7+ Ke7 13. Nd5# 1-0
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "full_audit_v10"]
+[Black "deployed-hindsight"]
+[Result "0-1"]
+[Opening "1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6 4. a3 Nxe4 5. b3 Bc5 6. c3 Nxf2 7. d3 Nxd1 8. g3 d5 9. h3 dxc4 10. a4 Qxd3 11. b4 Bf2# 0-1
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "deployed-hindsight"]
+[Black "full_audit_v10"]
+[Result "1-0"]
+[Opening "1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6"]
+
+1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6 4. O-O a6 5. d4 exd4 6. Re1 d3 7. e5 d2 8. Qxd2 a5 9. exf6+ Ne5 10. Bxf7+ Kxf7 11. Nxe5+ Ke6 12. Nc6+ Kf5 13. Qg5# 1-0
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "full_audit_v10"]
+[Black "deployed-hindsight"]
+[Result "0-1"]
+[Opening "1. e4 c5 2. Nf3 d6 3. d4 cxd4"]
+
+1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. a3 e5 5. b3 Nf6 6. c3 Nxe4 7. g3 Nxc3 8. h3 Nxd1 9. a4 Nc3 10. b4 Nd5 11. g4 Nxb4 12. h4 Nc2+ 13. Kd1 Nxa1 14. a5 Bxg4 15. h5 Bxf3+ 16. Be2 Bxh1 17. f3 Qc7 18. f4 Qc2+ 19. Ke1 Qxc1+ 20. Bd1 Nc2+ 21. Kf1 Qxd1+ 22. Kf2 Qe1# 0-1
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "deployed-hindsight"]
+[Black "full_audit_v10"]
+[Result "1-0"]
+[Opening "1. e4 c5 2. Nf3 d6 3. d4 cxd4"]
+
+1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Qxd4 d5 5. exd5 a6 6. Bc4 a5 7. Nc3 a4 8. Nb5 a3 9. Ng5 axb2 10. Bxb2 b6 11. d6 e6 12. Nc7+ Qxc7 13. dxc7 b5 14. Qd8# 1-0
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "full_audit_v10"]
+[Black "deployed-hindsight"]
+[Result "0-1"]
+[Opening "1. e4 c5 2. Nf3 Nc6 3. d4 cxd4"]
+
+1. e4 c5 2. Nf3 Nc6 3. d4 cxd4 4. a3 e5 5. b3 Nf6 6. c3 Nxe4 7. g3 Qf6 8. h3 dxc3 9. a4 c2 10. b4 cxd1=Q+ 11. Kxd1 Qxf3+ 12. Be2 Qxh1+ 13. Bf1 Qxf1+ 14. Kc2 Nxb4+ 15. Kb2 Nd3+ 16. Ka2 Nxc1+ 17. Kb2 Nd3+ 18. Ka2 Qc1 19. f3 Qb2# 0-1
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "deployed-hindsight"]
+[Black "full_audit_v10"]
+[Result "1-0"]
+[Opening "1. e4 c5 2. Nf3 Nc6 3. d4 cxd4"]
+
+1. e4 c5 2. Nf3 Nc6 3. d4 cxd4 4. Nxd4 a6 5. Nc3 a5 6. Bf4 a4 7. Ndb5 a3 8. Nc7+ Qxc7 9. Bxc7 axb2 10. Rb1 b6 11. Rxb2 b5 12. Bxb5 d6 13. Bxc6+ Bd7 14. Qd5 e6 15. Bxd7+ Kxd7 16. Qxa8 d5 17. Qd8+ Kc6 18. exd5+ exd5 19. Rb6+ Kc5 20. Qxd5# 1-0
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "full_audit_v10"]
+[Black "deployed-hindsight"]
+[Result "0-1"]
+[Opening "1. e4 c5 2. c3 d5 3. exd5 Qxd5"]
+
+1. e4 c5 2. c3 d5 3. exd5 Qxd5 4. a3 Nc6 5. b3 Nf6 6. d3 Bg4 7. f3 Bf5 8. g3 O-O-O 9. h3 e6 10. a4 Bd6 11. b4 Bxg3+ 12. Kd2 Bxd3 13. c4 Bxc4+ 14. Bd3 Qxd3# 0-1
+
+[Event "full_audit_v10 vs deployed-hindsight"]
+[Site "?"]
+[Date "2026.07.13"]
+[Round "?"]
+[White "deployed-hindsight"]
+[Black "full_audit_v10"]
+[Result "1-0"]
+[Opening "1. e4 c5 2. c3 d5 3. exd5 Qxd5"]
+
+1. e4 c5 2. c3 d5 3. exd5 Qxd5 4. Nf3 c4 5. Na3 a6 6. Nxc4 a5 7. Be2 a4 8. Nb6 a3 9. Nxd5 axb2 10. Bxb2 b6 11. Nc7+ Kd7 12. Nxa8 b5 13. Bxb5+ Nc6 14. Ne5+ Kd6 15. Nxf7+ Kc5 16. Qb3 e6 17. Qc4# 1-0
+

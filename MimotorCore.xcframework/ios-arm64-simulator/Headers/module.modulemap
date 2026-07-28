@@ -1,0 +1,6 @@
+// Permite hacer `import MiMotorCore` directamente desde Swift,
+// sin necesidad de un bridging header.
+module MiMotorCore {
+    header "mimotor.h"
+    export *
+}

@@ -1,0 +1,27 @@
+# +dotprod: instruccion NEON que acelera los productos punto de la NNUE
+# (~5.4% mas rapido, confirmado con 4 corridas limpias, mismos nodos --
+# sin cambio de comportamiento). El M5 la soporta (FEAT_DotProd=1) pero sin
+# esto el compilador no la usaba. Sin este archivo es facil olvidarla en
+# el proximo build y perder la ganancia sin darse cuenta.
+[build]
+rustflags = ["-C", "target-feature=+dotprod"]
+
+[target.aarch64-linux-android]
+linker = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android24-clang"
+ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+# El +dotprod de [build] es especifico del M5 de la Mac (confirmado con
+# FEAT_DotProd=1 ahi). Sin verificar que el celular soporte esa instruccion
+# ARM, vacio para no arriesgar un SIGILL en tiempo de ejecucion.
+rustflags = []
+
+# --- Android 32 bits (celulares viejos/economicos) ---
+[target.armv7-linux-androideabi]
+linker = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi24-clang"
+ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+rustflags = []
+
+# --- Emulador x86_64 (imagenes "Google APIs x86_64") ---
+[target.x86_64-linux-android]
+linker = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android24-clang"
+ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+rustflags = []

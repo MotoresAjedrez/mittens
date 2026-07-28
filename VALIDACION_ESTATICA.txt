@@ -1,0 +1,29 @@
+VALIDACION REALIZADA
+====================
+
+1. Todos los archivos .rs fueron analizados con tree-sitter-rust.
+   Resultado: 0 errores sintacticos en 14 archivos.
+
+2. pesos_v1.bin:
+   Tamano encontrado: 822532 bytes.
+   Tamano esperado para 770x256 + 256 + 256x32 + 32 + 32 + 1 f32:
+   822532 bytes.
+   Resultado: coincide.
+   Valores f32: 205633; todos finitos.
+   Rango observado: -0.7443063 a 0.5524302.
+   Checksum FNV-1a: 8616489ce65bce5f.
+
+3. Se revisaron las rutas de modulos y los nombres publicos agregados.
+
+NO EJECUTADO EN ESTE ENTORNO
+============================
+
+- cargo fmt
+- cargo check
+- cargo test
+- perft compilado
+- torneo h2h
+
+Motivo: el entorno no tenia rustc/cargo y no pudo descargar un toolchain.
+Esto no se presenta como una compilacion verificada. Compilar y ejecutar las
+pruebas en macOS antes de desplegar en Lichess.

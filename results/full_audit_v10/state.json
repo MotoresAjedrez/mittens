@@ -1,0 +1,14 @@
+{
+  "completed": 10,
+  "draws": 0,
+  "losses": 10,
+  "signature": {
+    "base_sha256": "151e9b4af65aea070168e330eacfcf0bc9e6f5ca808de8ee7513b4bea87fb755",
+    "candidate_sha256": "15bd69c5b972e8a066272c82f7cb58079e4510f574d83a58c60b345c8c2fde00",
+    "games": 40,
+    "movetime_ms": 600,
+    "openings_sha256": "6a50a2cc269aa4e2d25000cacaeebbd9e0bd7e83e436ab2efa588a7505ed26b9",
+    "weights_sha256": "c55c9ec9e30ec5495faeb852b19d9cb68b3977e140059de56ff4dc54db64700e"
+  },
+  "wins": 0
+}
