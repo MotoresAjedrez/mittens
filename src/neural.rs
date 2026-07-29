@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 // correcto por construccion -- optimizarlo queda para despues si esta
 // arquitectura demuestra que vale la pena en h2h.
 pub const N_ENTRADA: usize = 5378;
-const N_OCULTA1: usize = 256;
+const N_OCULTA1: usize = 512;
 const N_OCULTA2: usize = 32;
 
 // Cuantizacion de la capa de entrada (W1/b1): esta es la capa que se

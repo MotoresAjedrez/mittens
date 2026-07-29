@@ -1488,7 +1488,17 @@ impl Searcher {
         // ~320 ELO en el torneo de referencia (18 partidas) pese a haber
         // dado bien en un mini-torneo de 4 partidas -- reducir desde mas
         // tarde en el orden, a mas profundidad, y nunca mas de 1 ply.
-        const LMR_MOVES_SIN_REDUCIR: usize = 5;
+        // CANDIDATO cand_lmr_move2 (h2h ambiguo, 51.00% +/- 2.40%, desplegado
+        // por decision explicita del usuario pese a no llegar al 55%): se
+        // baja el umbral de 5 a 2. Con idx >= 2 las dos primeras jugadas del
+        // orden (la de la TT y la segunda mejor) siguen buscandose a
+        // profundidad completa, y la reduccion empieza en la TERCERA jugada
+        // del orden. El monto NO se toca: la tabla logaritmica ya es
+        // auto-limitante en las jugadas recien incluidas (m = idx+1 = 3..5 da
+        // 1 ply hasta prof 6-8, 2 plies hasta prof ~24 y 3 plies solo mas
+        // alla). Siguen aplicandose los ajustes contextuales (-1 en PV, -1
+        // con historia positiva, +1 sin improving) y el clamp a [1, depth-2].
+        const LMR_MOVES_SIN_REDUCIR: usize = 2;
         const LMR_PROF_MIN: i32 = 3;
 
         // Futility pruning (frontera): cerca de las hojas, si la evaluacion
