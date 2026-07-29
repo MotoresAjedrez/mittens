@@ -25,3 +25,11 @@ rustflags = []
 linker = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android24-clang"
 ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
 rustflags = []
+
+# --- Cross-compilation a Windows x64 (para someter a CCRL) ---
+# +dotprod de [build] es exclusivo de ARM/NEON (M5 de la Mac); en x86_64
+# no existe esa instruccion, asi que aqui va vacio para no romper la build.
+[target.x86_64-pc-windows-gnu]
+linker = "/opt/homebrew/bin/x86_64-w64-mingw32-gcc"
+ar = "/opt/homebrew/bin/x86_64-w64-mingw32-ar"
+rustflags = []

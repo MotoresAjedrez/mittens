@@ -11,6 +11,10 @@ mod see;
 mod syzygy;
 mod types;
 mod zobrist;
+// Puente FFI para embeber el motor (iOS/macOS): usa pipes de Unix
+// (dup2/RawFd), no existe equivalente en Windows y no lo necesita el
+// binario UCI de consola. Se compila solo en plataformas Unix-like.
+#[cfg(unix)]
 pub mod ffi;
 // Puente JNI: solo en Android (necesita la dependencia `jni`).
 #[cfg(target_os = "android")]

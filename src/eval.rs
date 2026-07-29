@@ -64,7 +64,13 @@ const PESO_ATQ: [i32; 6] = [0, 2, 2, 3, 5, 0];
 // 1.15 mantiene la identidad agresiva (sigue por encima del 1.0 neutral de
 // Universal) sin el sesgo tan marcado. Verificado con torneo h2h antes de
 // aceptarlo (ver resultados_tal_calibrado_h2h.txt).
-const FACTOR_ATAQUE_TAL: f64 = 1.15;
+// v13: bajado de 1.15 a 1.0 (estilo "Mittens" -- menos especulativo, no
+// sobreestimar tanto el ataque al rey antes de comprobar si progresa de
+// verdad). Validado h2h 40 partidas, 600ms: +8=23-9, 48.8% +/-5.2%,
+// AMBIGUO (no gana ni pierde fuerza medible) -- desplegado por decision
+// explicita del usuario (cambio de estilo, no de fuerza), no por superar
+// el umbral de 55%.
+const FACTOR_ATAQUE_TAL: f64 = 1.0;
 const FACTOR_ATAQUE_UNIVERSAL: f64 = 1.0; // ataque al rey de peso normal, sin el bono no-lineal agresivo de Tal
 
 const TABLA_SEGURIDAD: [i32; 62] = [
@@ -1028,6 +1034,13 @@ fn evaluar_clasica(b: &Board, cache: Option<&ClassicalAccumulator>) -> i32 {
     // cuando hay iniciativa (identidad agresiva/sacrificial); Universal en
     // cambio busca pareja de alfiles y restringe al rival con puestos
     // avanzados seguros (profilaxis).
+    //
+    // Experimento "asfixia" (validado h2h 40 partidas, 600ms: +11=18-11,
+    // 50.0% +/-5.9%, AMBIGUO -- desplegado por decision explicita del
+    // usuario, no por superar 55%): Tal tambien recibe el bono de puestos
+    // avanzados seguros, ADEMAS del termino de ataque existente. Restringir
+    // el territorio del rival de forma permanente no contradice la
+    // identidad agresiva, la complementa.
     let mut extra = 0.0f64;
     if !es_universal {
         if ar.ataque_w - ar.ataque_b > 60.0 {
@@ -1044,6 +1057,19 @@ fn evaluar_clasica(b: &Board, cache: Option<&ClassicalAccumulator>) -> i32 {
             extra -= 8.0
                 * popcount(b.pieces[Color::Black as usize][PieceType::Rook as usize] & occ_b).min(2)
                     as f64;
+        }
+
+        for (color, signo, rivales) in [(Color::White, 1.0f64, pb), (Color::Black, -1.0f64, pw)] {
+            for pt in [PieceType::Knight, PieceType::Bishop] {
+                let mut bb = b.pieces[color as usize][pt as usize];
+                while bb != 0 {
+                    let sq = crate::bitboard::pop_lsb(&mut bb);
+                    if en_territorio_rival(color, sq) && puesto_avanzado_seguro(color, sq, rivales)
+                    {
+                        extra += signo * BONUS_PUESTO[pt as usize] as f64;
+                    }
+                }
+            }
         }
     } else {
         extra += pareja_alfiles_bonus(Color::White, b) - pareja_alfiles_bonus(Color::Black, b);
