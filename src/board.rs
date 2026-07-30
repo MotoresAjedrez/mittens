@@ -45,23 +45,39 @@ impl Board {
         Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap()
     }
 
+    /// Sin ramas: en vez de recorrer los 6 bitboards de tipo hasta encontrar
+    /// el que contiene la casilla (bucle con salto impredecible, promedio ~3
+    /// vueltas), el indice del tipo se ARMA bit a bit con tres pruebas fijas.
+    /// El orden de PieceType (0=Peon, 1=Caballo, 2=Alfil, 3=Torre, 4=Dama,
+    /// 5=Rey) permite exactamente esta descomposicion binaria:
+    ///   bit 0 (valor 1) = Caballo(1), Torre(3), Rey(5)
+    ///   bit 1 (valor 2) = Alfil(2), Torre(3)
+    ///   bit 2 (valor 4) = Dama(4), Rey(5)
+    /// Sumando: 0=Peon, 1=Caballo, 2=Alfil, 1+2=3=Torre, 4=Dama, 1+4=5=Rey.
+    /// Mismo resultado exacto que el bucle, sin saltos condicionales.
+    /// `piece_at` es de las funciones mas llamadas del motor (make_move la usa
+    /// dos veces por jugada, mas SEE, evaluacion y NNUE).
     #[inline]
     pub fn piece_at(&self, sq: Square) -> Option<(Color, PieceType)> {
         let b = bit(sq);
         if self.occupied & b == 0 {
             return None;
         }
-        let color = if self.occupied_co[Color::White as usize] & b != 0 {
-            Color::White
+        let (color, ci) = if self.occupied_co[Color::White as usize] & b != 0 {
+            (Color::White, Color::White as usize)
         } else {
-            Color::Black
+            (Color::Black, Color::Black as usize)
         };
-        for &pt in ALL_PIECE_TYPES.iter() {
-            if self.pieces[color as usize][pt as usize] & b != 0 {
-                return Some((color, pt));
-            }
-        }
-        unreachable!("casilla ocupada sin tipo de pieza -- estado inconsistente")
+        let p = &self.pieces[ci];
+        let b0 = ((p[PieceType::Knight as usize] | p[PieceType::Rook as usize]
+            | p[PieceType::King as usize])
+            & b
+            != 0) as usize;
+        let b1 = ((p[PieceType::Bishop as usize] | p[PieceType::Rook as usize]) & b != 0) as usize;
+        let b2 = ((p[PieceType::Queen as usize] | p[PieceType::King as usize]) & b != 0) as usize;
+        let idx = b0 | (b1 << 1) | (b2 << 2);
+        debug_assert!(idx < 6, "casilla ocupada sin tipo de pieza valido");
+        Some((color, ALL_PIECE_TYPES[idx]))
     }
 
     fn recompute_derived(&mut self) {
@@ -369,8 +385,32 @@ impl Board {
         attackers
     }
 
+    /// Igual que `attackers_to(...) & occupied_co[by_color] != 0` pero mirando
+    /// SOLO las piezas del color que ataca y cortando en cuanto encuentra un
+    /// atacante. La version anterior construia siempre el conjunto completo de
+    /// atacantes de AMBOS colores (uniones de alfil+dama y torre+dama de los
+    /// dos bandos) para despues descartar la mitad. Resultado booleano
+    /// identico. Se llama en cada verificacion de jaque, o sea muchisimo.
     pub fn is_square_attacked_by(&self, sq: Square, by_color: Color) -> bool {
-        self.attackers_to(sq, self.occupied) & self.occupied_co[by_color as usize] != 0
+        let p = &self.pieces[by_color as usize];
+        if pawn_attacks(by_color.opposite(), sq) & p[PieceType::Pawn as usize] != 0 {
+            return true;
+        }
+        if knight_attacks(sq) & p[PieceType::Knight as usize] != 0 {
+            return true;
+        }
+        if king_attacks(sq) & p[PieceType::King as usize] != 0 {
+            return true;
+        }
+        let alfil_dama = p[PieceType::Bishop as usize] | p[PieceType::Queen as usize];
+        if alfil_dama != 0 && bishop_attacks(sq, self.occupied) & alfil_dama != 0 {
+            return true;
+        }
+        let torre_dama = p[PieceType::Rook as usize] | p[PieceType::Queen as usize];
+        if torre_dama != 0 && rook_attacks(sq, self.occupied) & torre_dama != 0 {
+            return true;
+        }
+        false
     }
 
     pub fn king_square(&self, color: Color) -> Square {

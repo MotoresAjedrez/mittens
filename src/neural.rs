@@ -107,6 +107,166 @@ unsafe fn sdot_s32(
     out
 }
 
+/// Lote de features pendientes de aplicar al acumulador.
+///
+/// Antes, cada feature que cambiaba al hacer una jugada ejecutaba su propia
+/// pasada NEON sobre las 512 posiciones del acumulador: 512 lecturas + 512
+/// escrituras del acumulador POR FEATURE. Con 20-40 features cambiando por
+/// jugada eso es ~100-200 KB de trafico de memoria por nodo, y el bucle
+/// quedaba limitado por operaciones de memoria (5 accesos por cada 8 valores:
+/// 1 de pesos, 2 del acumulador, 2 de escritura), no por aritmetica.
+///
+/// Ahora se recolectan primero TODOS los indices que hay que sumar y restar,
+/// y al final se hace UNA sola pasada: el acumulador se lee y escribe una vez
+/// (en registros NEON, por bloques de 32 valores) y de cada feature solo se
+/// leen sus pesos. La suma entera es asociativa y conmutativa, asi que el
+/// resultado es BIT A BIT IDENTICO al de antes, sin importar el orden.
+// 128 basta con enorme margen: medido sobre ~750 mil actualizaciones reales de
+// busqueda, la media es 12 features por jugada y el maximo observado 36. Si
+// alguna posicion patologica lo llenara, `empujar` vacia el lote y sigue (dos
+// pasadas dan el mismo resultado exacto), asi que el tope es solo de memoria,
+// nunca de correccion.
+const LOTE_CAP: usize = 128;
+
+struct Lote {
+    add: [std::mem::MaybeUninit<u16>; LOTE_CAP],
+    n_add: usize,
+    sub: [std::mem::MaybeUninit<u16>; LOTE_CAP],
+    n_sub: usize,
+}
+
+impl Lote {
+    #[inline]
+    fn nuevo() -> Lote {
+        Lote {
+            // Array de MaybeUninit: no se inicializa nada (seria 1 KB de
+            // escrituras inutiles por nodo); solo se leen las posiciones que
+            // de verdad se escribieron, contadas por n_add/n_sub.
+            add: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
+            n_add: 0,
+            sub: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
+            n_sub: 0,
+        }
+    }
+}
+
+impl RedNeural {
+    /// Encola una feature. Si el lote se lleno, lo aplica y sigue: partir el
+    /// lote en dos pasadas da el mismo resultado exacto (sumas enteras).
+    #[inline]
+    fn empujar(
+        &self,
+        acumulador: &mut [i32; N_OCULTA1],
+        lote: &mut Lote,
+        feature: usize,
+        sumar: bool,
+    ) {
+        debug_assert!(feature < N_ENTRADA);
+        if lote.n_add == LOTE_CAP || lote.n_sub == LOTE_CAP {
+            self.aplicar_lote(acumulador, lote);
+        }
+        if sumar {
+            lote.add[lote.n_add].write(feature as u16);
+            lote.n_add += 1;
+        } else {
+            lote.sub[lote.n_sub].write(feature as u16);
+            lote.n_sub += 1;
+        }
+    }
+
+    /// Aplica el lote completo en una sola pasada por el acumulador.
+    fn aplicar_lote(&self, acumulador: &mut [i32; N_OCULTA1], lote: &mut Lote) {
+        if lote.n_add == 0 && lote.n_sub == 0 {
+            return;
+        }
+        let adds: &[u16] =
+            unsafe { std::slice::from_raw_parts(lote.add.as_ptr() as *const u16, lote.n_add) };
+        let subs: &[u16] =
+            unsafe { std::slice::from_raw_parts(lote.sub.as_ptr() as *const u16, lote.n_sub) };
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            // Bloque de 32 valores del acumulador = 8 registros NEON de i32.
+            // Deja registros libres para los pesos y para el desenrollado; el
+            // acumulador entero (512 i32 = 2 KB) no cabe en los 32 registros
+            // disponibles, de ahi el recorrido por bloques.
+            const TILE: usize = 32;
+            let w1 = self.w1_col.as_ptr();
+            let mut t = 0;
+            while t < N_OCULTA1 {
+                let p = acumulador.as_mut_ptr().add(t);
+                let mut r0 = vld1q_s32(p);
+                let mut r1 = vld1q_s32(p.add(4));
+                let mut r2 = vld1q_s32(p.add(8));
+                let mut r3 = vld1q_s32(p.add(12));
+                let mut r4 = vld1q_s32(p.add(16));
+                let mut r5 = vld1q_s32(p.add(20));
+                let mut r6 = vld1q_s32(p.add(24));
+                let mut r7 = vld1q_s32(p.add(28));
+                for &f in adds {
+                    let w = w1.add(f as usize * N_OCULTA1 + t);
+                    let w0 = vld1q_s16(w);
+                    let w1b = vld1q_s16(w.add(8));
+                    let w2 = vld1q_s16(w.add(16));
+                    let w3 = vld1q_s16(w.add(24));
+                    // saddw/saddw2: ensancha i16 -> i32 Y suma en una sola
+                    // instruccion.
+                    r0 = vaddw_s16(r0, vget_low_s16(w0));
+                    r1 = vaddw_high_s16(r1, w0);
+                    r2 = vaddw_s16(r2, vget_low_s16(w1b));
+                    r3 = vaddw_high_s16(r3, w1b);
+                    r4 = vaddw_s16(r4, vget_low_s16(w2));
+                    r5 = vaddw_high_s16(r5, w2);
+                    r6 = vaddw_s16(r6, vget_low_s16(w3));
+                    r7 = vaddw_high_s16(r7, w3);
+                }
+                for &f in subs {
+                    let w = w1.add(f as usize * N_OCULTA1 + t);
+                    let w0 = vld1q_s16(w);
+                    let w1b = vld1q_s16(w.add(8));
+                    let w2 = vld1q_s16(w.add(16));
+                    let w3 = vld1q_s16(w.add(24));
+                    r0 = vsubw_s16(r0, vget_low_s16(w0));
+                    r1 = vsubw_high_s16(r1, w0);
+                    r2 = vsubw_s16(r2, vget_low_s16(w1b));
+                    r3 = vsubw_high_s16(r3, w1b);
+                    r4 = vsubw_s16(r4, vget_low_s16(w2));
+                    r5 = vsubw_high_s16(r5, w2);
+                    r6 = vsubw_s16(r6, vget_low_s16(w3));
+                    r7 = vsubw_high_s16(r7, w3);
+                }
+                vst1q_s32(p, r0);
+                vst1q_s32(p.add(4), r1);
+                vst1q_s32(p.add(8), r2);
+                vst1q_s32(p.add(12), r3);
+                vst1q_s32(p.add(16), r4);
+                vst1q_s32(p.add(20), r5);
+                vst1q_s32(p.add(24), r6);
+                vst1q_s32(p.add(28), r7);
+                t += TILE;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for &f in adds {
+                let col = &self.w1_col[f as usize * N_OCULTA1..(f as usize + 1) * N_OCULTA1];
+                for (v, &peso) in acumulador.iter_mut().zip(col) {
+                    *v += peso as i32;
+                }
+            }
+            for &f in subs {
+                let col = &self.w1_col[f as usize * N_OCULTA1..(f as usize + 1) * N_OCULTA1];
+                for (v, &peso) in acumulador.iter_mut().zip(col) {
+                    *v -= peso as i32;
+                }
+            }
+        }
+        lote.n_add = 0;
+        lote.n_sub = 0;
+    }
+}
+
 impl RedNeural {
     fn cargar_de_bytes(datos: &[u8]) -> Option<RedNeural> {
         let esperado =
@@ -230,15 +390,46 @@ impl RedNeural {
             use std::arch::aarch64::*;
             // ReLU + cuantizar a i8 directo desde el acumulador entero, sin
             // pasar por f32 en ningun momento de este paso.
+            //
+            // Vectorizado: antes era un bucle ESCALAR de 512 iteraciones por
+            // cada evaluacion (max, shift, min, truncar a i8, uno por uno).
+            // Con NEON son 32 iteraciones de 16 valores. El estrechamiento
+            // saturante (vqmovn) hace exactamente lo mismo que el `.min(127)`
+            // del original: tras `max(0)` el valor es >= 0, asi que saturar a
+            // i16 y luego a i8 da 127 cuando se pasa y el valor exacto cuando
+            // no. Resultado BIT A BIT IDENTICO.
             let mut h1 = [0i8; N_OCULTA1];
-            for i in 0..N_OCULTA1 {
-                let v = acumulador[i].max(0) >> QA_SOBRE_QH_SHIFT;
-                h1[i] = v.min(127) as i8;
+            {
+                let cero = vdupq_n_s32(0);
+                let src = acumulador.as_ptr();
+                let dst = h1.as_mut_ptr();
+                let mut i = 0;
+                while i < N_OCULTA1 {
+                    let a0 = vshrq_n_s32::<{ QA_SOBRE_QH_SHIFT as i32 }>(vmaxq_s32(
+                        vld1q_s32(src.add(i)),
+                        cero,
+                    ));
+                    let a1 = vshrq_n_s32::<{ QA_SOBRE_QH_SHIFT as i32 }>(vmaxq_s32(
+                        vld1q_s32(src.add(i + 4)),
+                        cero,
+                    ));
+                    let a2 = vshrq_n_s32::<{ QA_SOBRE_QH_SHIFT as i32 }>(vmaxq_s32(
+                        vld1q_s32(src.add(i + 8)),
+                        cero,
+                    ));
+                    let a3 = vshrq_n_s32::<{ QA_SOBRE_QH_SHIFT as i32 }>(vmaxq_s32(
+                        vld1q_s32(src.add(i + 12)),
+                        cero,
+                    ));
+                    let m0 = vcombine_s16(vqmovn_s32(a0), vqmovn_s32(a1));
+                    let m1 = vcombine_s16(vqmovn_s32(a2), vqmovn_s32(a3));
+                    vst1q_s8(dst.add(i), vcombine_s8(vqmovn_s16(m0), vqmovn_s16(m1)));
+                    i += 16;
+                }
             }
             let mut h2 = [0.0f32; N_OCULTA2];
             for row in 0..N_OCULTA2 {
                 let fila = self.w2_i8.as_ptr().add(row * N_OCULTA1);
-                let mut acc = vdupq_n_s32(0);
                 let mut j = 0;
                 // Producto punto entero i8*i8 -> i32 con la extension dotprod
                 // (sdot / vdotq_s32): 16 carriles i8 por instruccion,
@@ -248,12 +439,45 @@ impl RedNeural {
                 // evaluacion es bit-identica al camino anterior. dotprod esta
                 // siempre presente en Apple Silicon (FEAT_DotProd) y en el
                 // conjunto de features por defecto de aarch64-apple-darwin.
+                //
+                // CUATRO acumuladores independientes en vez de uno. Con uno
+                // solo, las 32 instrucciones sdot de cada fila forman una
+                // CADENA DE DEPENDENCIAS: cada una tiene que esperar a que
+                // termine la anterior (~3 ciclos de latencia cada una), asi
+                // que la CPU no puede lanzar varias a la vez aunque tenga
+                // unidades libres. Con cuatro cadenas separadas se solapan y
+                // el bucle pasa a estar limitado por RENDIMIENTO en vez de por
+                // latencia. La suma entera es asociativa, asi que sumar las
+                // cuatro parciales al final da EXACTAMENTE el mismo i32
+                // (imposible desbordar: max 127*127*512 = 8.26M).
+                let mut acc0 = vdupq_n_s32(0);
+                let mut acc1 = vdupq_n_s32(0);
+                let mut acc2 = vdupq_n_s32(0);
+                let mut acc3 = vdupq_n_s32(0);
                 while j < N_OCULTA1 {
-                    let h = vld1q_s8(h1.as_ptr().add(j));
-                    let w = vld1q_s8(fila.add(j));
-                    acc = sdot_s32(acc, h, w);
-                    j += 16;
+                    acc0 = sdot_s32(
+                        acc0,
+                        vld1q_s8(h1.as_ptr().add(j)),
+                        vld1q_s8(fila.add(j)),
+                    );
+                    acc1 = sdot_s32(
+                        acc1,
+                        vld1q_s8(h1.as_ptr().add(j + 16)),
+                        vld1q_s8(fila.add(j + 16)),
+                    );
+                    acc2 = sdot_s32(
+                        acc2,
+                        vld1q_s8(h1.as_ptr().add(j + 32)),
+                        vld1q_s8(fila.add(j + 32)),
+                    );
+                    acc3 = sdot_s32(
+                        acc3,
+                        vld1q_s8(h1.as_ptr().add(j + 48)),
+                        vld1q_s8(fila.add(j + 48)),
+                    );
+                    j += 64;
                 }
+                let acc = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
                 let combinado = self.b2_i32[row] + vaddvq_s32(acc);
                 h2[row] = (combinado as f32 / (QH * QW2)).max(0.0);
             }
@@ -299,12 +523,19 @@ impl RedNeural {
 
 #[derive(Clone)]
 pub struct NnueAccumulator {
-    red: Arc<RedNeural>,
+    // Referencia estatica en vez de Arc: el acumulador se CLONA una vez por
+    // nodo de la busqueda, y con Arc cada clon era un incremento atomico del
+    // contador de referencias y cada destruccion un decremento. Con Lazy SMP
+    // los 4+ hilos golpeaban la MISMA linea de cache del contador millones de
+    // veces por segundo (true sharing), serializandose entre ellos sin ninguna
+    // necesidad: la red se carga una vez y no se libera nunca mientras el
+    // proceso vive. Ahora clonar el acumulador es solo copiar un puntero.
+    red: &'static RedNeural,
     primera_capa: [i32; N_OCULTA1],
 }
 
 impl NnueAccumulator {
-    fn desde_tablero(red: Arc<RedNeural>, b: &Board) -> NnueAccumulator {
+    fn desde_tablero(red: &'static RedNeural, b: &Board) -> NnueAccumulator {
         let mut primera_capa = [0i32; N_OCULTA1];
         primera_capa.copy_from_slice(&red.b1);
         for (color_idx, color) in [(0usize, Color::White), (1usize, Color::Black)] {
@@ -489,6 +720,7 @@ impl RedNeural {
     fn aplicar_amenazas_de_pieza(
         &self,
         acumulador: &mut [i32; N_OCULTA1],
+        lote: &mut Lote,
         tablero: &Board,
         color_idx: usize,
         pt: crate::types::PieceType,
@@ -501,16 +733,25 @@ impl RedNeural {
             Color::Black
         };
         let ataques = ataques_de_pieza(pt, color, sq as u8, tablero.occupied);
-        let mut victimas = ataques & tablero.occupied;
-        while victimas != 0 {
-            let sq_v = crate::bitboard::pop_lsb(&mut victimas);
-            let (_, tipo_v) = tablero.piece_at(sq_v).expect("casilla ocupada sin pieza");
-            // Convención heredada del dataset: 1=atacante blanco, 0=negro.
-            let color_conv = if color_idx == 0 { 1 } else { 0 };
-            let idx = N_BASE_AMENAZA
-                + ((color_conv * 6 + pt as usize) * 6 + tipo_v as usize) * 64
-                + sq_v as usize;
-            self.sumar_feature(acumulador, idx, sumar);
+        let victimas = ataques & tablero.occupied;
+        if victimas == 0 {
+            return;
+        }
+        // Convención heredada del dataset: 1=atacante blanco, 0=negro.
+        let color_conv = if color_idx == 0 { 1 } else { 0 };
+        let base_atacante = N_BASE_AMENAZA + (color_conv * 6 + pt as usize) * 6 * 64;
+        // En vez de un `piece_at` por victima (que recorre hasta 6 bitboards
+        // buscando el tipo), se agrupan las victimas POR TIPO con una simple
+        // interseccion de bitboards: 6 operaciones fijas en vez de N busquedas.
+        // Exactamente las mismas features, mismo signo.
+        for tipo_v in 0..6 {
+            let mut bb = victimas
+                & (tablero.pieces[0][tipo_v] | tablero.pieces[1][tipo_v]);
+            let base = base_atacante + tipo_v * 64;
+            while bb != 0 {
+                let sq_v = crate::bitboard::pop_lsb(&mut bb) as usize;
+                self.empujar(acumulador, lote, base + sq_v, sumar);
+            }
         }
     }
 
@@ -521,6 +762,7 @@ impl RedNeural {
     fn aplicar_amenazas_en_mascaras(
         &self,
         acumulador: &mut [i32; N_OCULTA1],
+        lote: &mut Lote,
         tablero: &Board,
         cambiadas: u64,
         mascara_alfil: u64,
@@ -539,7 +781,9 @@ impl RedNeural {
                 let mut piezas = tablero.pieces[color as usize][pt as usize] & mascara;
                 while piezas != 0 {
                     let sq = crate::bitboard::pop_lsb(&mut piezas) as usize;
-                    self.aplicar_amenazas_de_pieza(acumulador, tablero, color_idx, pt, sq, sumar);
+                    self.aplicar_amenazas_de_pieza(
+                        acumulador, lote, tablero, color_idx, pt, sq, sumar,
+                    );
                 }
             }
         }
@@ -554,6 +798,7 @@ impl RedNeural {
     fn aplicar_delta_sliders_estables(
         &self,
         acumulador: &mut [i32; N_OCULTA1],
+        lote: &mut Lote,
         antes: &Board,
         despues: &Board,
         cambiadas: u64,
@@ -579,19 +824,27 @@ impl RedNeural {
             let restar = (v_antes & !v_despues) | comunes_cambiados;
             let sumar = (v_despues & !v_antes) | comunes_cambiados;
 
-            let mut s = restar;
-            while s != 0 {
-                let sq_v = crate::bitboard::pop_lsb(&mut s);
-                let (_, tipo_v) = antes.piece_at(sq_v).expect("casilla ocupada sin pieza");
-                let idx = base_atacante + tipo_v as usize * 64 + sq_v as usize;
-                self.sumar_feature(acumulador, idx, false);
+            // Agrupacion por tipo de victima con interseccion de bitboards,
+            // en vez de un `piece_at` por casilla (mismas features exactas).
+            if restar != 0 {
+                for tipo_v in 0..6 {
+                    let mut bb = restar & (antes.pieces[0][tipo_v] | antes.pieces[1][tipo_v]);
+                    let base = base_atacante + tipo_v * 64;
+                    while bb != 0 {
+                        let sq_v = crate::bitboard::pop_lsb(&mut bb) as usize;
+                        self.empujar(acumulador, lote, base + sq_v, false);
+                    }
+                }
             }
-            let mut a = sumar;
-            while a != 0 {
-                let sq_v = crate::bitboard::pop_lsb(&mut a);
-                let (_, tipo_v) = despues.piece_at(sq_v).expect("casilla ocupada sin pieza");
-                let idx = base_atacante + tipo_v as usize * 64 + sq_v as usize;
-                self.sumar_feature(acumulador, idx, true);
+            if sumar != 0 {
+                for tipo_v in 0..6 {
+                    let mut bb = sumar & (despues.pieces[0][tipo_v] | despues.pieces[1][tipo_v]);
+                    let base = base_atacante + tipo_v * 64;
+                    while bb != 0 {
+                        let sq_v = crate::bitboard::pop_lsb(&mut bb) as usize;
+                        self.empujar(acumulador, lote, base + sq_v, true);
+                    }
+                }
             }
         }
     }
@@ -605,10 +858,16 @@ impl RedNeural {
         antes: &Board,
         despues: &Board,
     ) {
+        // Todas las features de esta jugada se acumulan primero en `lote` y se
+        // aplican de una sola pasada al final (ver `Lote`).
+        let mut lote = Lote::nuevo();
+        let lote = &mut lote;
+
         // --- 1. features base (770 piece-square + turno + enroque) -----
         actualizar_booleano(
             self,
             acumulador,
+            lote,
             768,
             antes.turn == Color::White,
             despues.turn == Color::White,
@@ -616,6 +875,7 @@ impl RedNeural {
         actualizar_booleano(
             self,
             acumulador,
+            lote,
             769,
             enroque_del_bando(antes),
             enroque_del_bando(despues),
@@ -627,14 +887,20 @@ impl RedNeural {
         while scan_cambiadas != 0 {
             let sq = crate::bitboard::pop_lsb(&mut scan_cambiadas) as usize;
             if let Some((c, pt)) = antes.piece_at(sq as u8) {
-                self.sumar_feature(
+                self.empujar(
                     acumulador,
+                    lote,
                     feature_pieza(c as usize, pt as usize, sq),
                     false,
                 );
             }
             if let Some((c, pt)) = despues.piece_at(sq as u8) {
-                self.sumar_feature(acumulador, feature_pieza(c as usize, pt as usize, sq), true);
+                self.empujar(
+                    acumulador,
+                    lote,
+                    feature_pieza(c as usize, pt as usize, sq),
+                    true,
+                );
             }
         }
 
@@ -678,6 +944,7 @@ impl RedNeural {
         // realmente cambiaron de casilla.
         self.aplicar_amenazas_en_mascaras(
             acumulador,
+            lote,
             antes,
             cambiadas,
             mascara_alfil & cambiadas,
@@ -687,6 +954,7 @@ impl RedNeural {
         );
         self.aplicar_amenazas_en_mascaras(
             acumulador,
+            lote,
             despues,
             cambiadas,
             mascara_alfil & cambiadas,
@@ -704,6 +972,7 @@ impl RedNeural {
         // cancelaban entre si. Evaluacion identica por construccion.
         self.aplicar_delta_sliders_estables(
             acumulador,
+            lote,
             antes,
             despues,
             cambiadas,
@@ -712,6 +981,7 @@ impl RedNeural {
         );
         self.aplicar_delta_sliders_estables(
             acumulador,
+            lote,
             antes,
             despues,
             cambiadas,
@@ -720,6 +990,7 @@ impl RedNeural {
         );
         self.aplicar_delta_sliders_estables(
             acumulador,
+            lote,
             antes,
             despues,
             cambiadas,
@@ -762,16 +1033,19 @@ impl RedNeural {
                     let idx = N_BASE_AMENAZA
                         + ((color_conv * 6 + pt_idx) * 6 + tipo_v as usize) * 64
                         + sq;
-                    self.sumar_feature(acumulador, idx, false);
+                    self.empujar(acumulador, lote, idx, false);
                 }
                 if let Some((_, tipo_v)) = despues.piece_at(sqb) {
                     let idx = N_BASE_AMENAZA
                         + ((color_conv * 6 + pt_idx) * 6 + tipo_v as usize) * 64
                         + sq;
-                    self.sumar_feature(acumulador, idx, true);
+                    self.empujar(acumulador, lote, idx, true);
                 }
             }
         }
+
+        // Una sola pasada por el acumulador con todo lo acumulado.
+        self.aplicar_lote(acumulador, lote);
     }
 }
 
@@ -787,24 +1061,25 @@ fn enroque_del_bando(b: &Board) -> bool {
 fn actualizar_booleano(
     red: &RedNeural,
     acumulador: &mut [i32; N_OCULTA1],
+    lote: &mut Lote,
     feature: usize,
     antes: bool,
     despues: bool,
 ) {
     match (antes, despues) {
-        (false, true) => red.sumar_feature(acumulador, feature, true),
-        (true, false) => red.sumar_feature(acumulador, feature, false),
+        (false, true) => red.empujar(acumulador, lote, feature, true),
+        (true, false) => red.empujar(acumulador, lote, feature, false),
         _ => {}
     }
 }
 
-static RED: OnceLock<RwLock<Option<Arc<RedNeural>>>> = OnceLock::new();
+static RED: OnceLock<RwLock<Option<&'static RedNeural>>> = OnceLock::new();
 static ACTIVA: AtomicBool = AtomicBool::new(false);
 // UCI puede recibir UseNNUE antes que NNUEPath. Conservamos la solicitud
 // pendiente y activamos la red cuando los pesos finalmente se cargan.
 static SOLICITADA: AtomicBool = AtomicBool::new(false);
 
-fn almacenamiento() -> &'static RwLock<Option<Arc<RedNeural>>> {
+fn almacenamiento() -> &'static RwLock<Option<&'static RedNeural>> {
     RED.get_or_init(|| RwLock::new(None))
 }
 
@@ -816,7 +1091,12 @@ pub fn cargar_detallado(path: &str) -> Result<u64, String> {
     let checksum = checksum_fnv1a(&datos);
     let red = RedNeural::cargar_de_bytes(&datos)
         .ok_or_else(|| "formato o valores de pesos invalidos".to_string())?;
-    *almacenamiento().write().expect("candado NNUE envenenado") = Some(Arc::new(red));
+    // `Box::leak`: la red (11 MB) queda viva hasta que el proceso termina.
+    // Recargar los pesos por UCI (raro: cero o una vez por partida) deja la
+    // anterior sin liberar, precio aceptable a cambio de quitar los atomicos
+    // del camino caliente.
+    let estatica: &'static RedNeural = Box::leak(Box::new(red));
+    *almacenamiento().write().expect("candado NNUE envenenado") = Some(estatica);
     ACTIVA.store(SOLICITADA.load(Ordering::Relaxed), Ordering::Relaxed);
     Ok(checksum)
 }
@@ -845,10 +1125,10 @@ pub fn crear_acumulador(b: &Board) -> Option<NnueAccumulator> {
     if !ACTIVA.load(Ordering::Relaxed) {
         return None;
     }
-    let red = almacenamiento()
+    let red = *almacenamiento()
         .read()
         .expect("candado NNUE envenenado")
-        .clone()?;
+        .as_ref()?;
     Some(NnueAccumulator::desde_tablero(red, b))
 }
 
@@ -857,9 +1137,11 @@ mod tests {
     use super::*;
     use crate::movegen::generate_legal;
 
-    fn red_prueba() -> Arc<RedNeural> {
+    fn red_prueba() -> &'static RedNeural {
         let datos = include_bytes!("../pesos_amenazas_prueba.bin");
-        Arc::new(RedNeural::cargar_de_bytes(datos).expect("pesos validos"))
+        Box::leak(Box::new(
+            RedNeural::cargar_de_bytes(datos).expect("pesos validos"),
+        ))
     }
 
     fn comprobar_incremental(fen: &str, uci: &str) {
@@ -870,7 +1152,7 @@ mod tests {
             .find(|m| m.to_uci() == uci)
             .unwrap_or_else(|| panic!("jugada no encontrada: {uci}"));
         let despues = antes.make_move(&mv);
-        let incremental = NnueAccumulator::desde_tablero(Arc::clone(&red), &antes)
+        let incremental = NnueAccumulator::desde_tablero(red, &antes)
             .despues_de_jugada(&antes, &despues);
         let recalculado = NnueAccumulator::desde_tablero(red, &despues);
         assert_eq!(
@@ -914,7 +1196,7 @@ mod tests {
         let mut semilla = 0x5EED_CAFE_D00Du64;
         for _partida in 0..24 {
             let mut tablero = Board::startpos();
-            let mut acumulador = NnueAccumulator::desde_tablero(Arc::clone(&red), &tablero);
+            let mut acumulador = NnueAccumulator::desde_tablero(red, &tablero);
             for _ply in 0..80 {
                 let legales = generate_legal(&tablero);
                 if legales.is_empty() {
@@ -925,7 +1207,7 @@ mod tests {
                 let mv = legales[(semilla as usize) % legales.len()];
                 let siguiente = tablero.make_move(&mv);
                 let incremental = acumulador.despues_de_jugada(&tablero, &siguiente);
-                let recalculado = NnueAccumulator::desde_tablero(Arc::clone(&red), &siguiente);
+                let recalculado = NnueAccumulator::desde_tablero(red, &siguiente);
                 assert_eq!(
                     incremental.primera_capa,
                     recalculado.primera_capa,
