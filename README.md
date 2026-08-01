@@ -1,4 +1,4 @@
-# Mittens (MiMotor Tal)
+# Mittens
 
 ![logo](logo.png)
 
