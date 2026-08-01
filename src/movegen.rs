@@ -4,8 +4,14 @@ use crate::bitboard::{
 };
 use crate::board::{Board, CASTLE_BK, CASTLE_BQ, CASTLE_WK, CASTLE_WQ};
 use crate::types::{Color, Move, MoveFlag, PieceType, Square, file_of, make_square, rank_of};
+use arrayvec::ArrayVec;
 
-pub type MoveList = Vec<Move>;
+/// En ajedrez estándar no existen más de 218 jugadas legales. Reservamos 256
+/// para cubrir también el conjunto pseudo-legal y evitar una asignación de
+/// heap en cada nodo de búsqueda. `ArrayVec::new()` no inicializa elementos:
+/// solo mantiene el contador y los movimientos realmente generados.
+pub const MAX_MOVES: usize = 256;
+pub type MoveList = ArrayVec<Move, MAX_MOVES>;
 
 const PROMO_PIECES: [PieceType; 4] = [
     PieceType::Queen,
@@ -16,7 +22,7 @@ const PROMO_PIECES: [PieceType; 4] = [
 
 /// Genera todas las jugadas pseudo-legales (no filtra jaques propios).
 pub fn generate_pseudo_legal(b: &Board) -> MoveList {
-    let mut moves = Vec::with_capacity(48);
+    let mut moves = MoveList::new();
     let us = b.turn;
     let them = us.opposite();
     let own = b.occupied_co[us as usize];
@@ -190,7 +196,7 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
 /// trabajo tirado -- la mayoria de objetivos de ataque de una pieza son
 /// casillas vacias, y ninguna cuesta legalizar solo para descartarla despues.
 pub fn generate_pseudo_legal_captures(b: &Board) -> MoveList {
-    let mut moves = Vec::with_capacity(16);
+    let mut moves = MoveList::new();
     let us = b.turn;
     let them = us.opposite();
     let enemy = b.occupied_co[them as usize];
@@ -287,10 +293,9 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
         // No deberia llamarse en jaque (quiescence usa generate_legal para
         // evasiones, que incluyen bloqueos silenciosos), pero se deja
         // correcto por si se reutiliza en otro contexto.
-        return generate_pseudo_legal_captures(b)
-            .into_iter()
-            .filter(camino_lento)
-            .collect();
+        let mut moves = generate_pseudo_legal_captures(b);
+        moves.retain(|mv| camino_lento(mv));
+        return moves;
     }
 
     let own = b.occupied_co[us as usize];
@@ -300,16 +305,15 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
         | b.pieces[them as usize][PieceType::Queen as usize];
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
 
-    generate_pseudo_legal_captures(b)
-        .into_iter()
-        .filter(|mv| {
-            if bit(mv.from) & pinned == 0 && mv.from != king_sq && mv.flag != MoveFlag::EnPassant {
-                true
-            } else {
-                camino_lento(mv)
-            }
-        })
-        .collect()
+    let mut moves = generate_pseudo_legal_captures(b);
+    moves.retain(|mv| {
+        if bit(mv.from) & pinned == 0 && mv.from != king_sq && mv.flag != MoveFlag::EnPassant {
+            true
+        } else {
+            camino_lento(mv)
+        }
+    });
+    moves
 }
 
 /// Filtra las jugadas pseudo-legales: descarta las que dejan al propio rey en jaque.
@@ -342,10 +346,9 @@ pub fn generate_legal(b: &Board) -> MoveList {
         // caso menos frecuente y mas delicado -- se deja el camino lento,
         // siempre correcto, sin ganancia medible de nps (pocas jugadas
         // pseudo-legales cuando el rey esta en jaque).
-        return generate_pseudo_legal(b)
-            .into_iter()
-            .filter(camino_lento)
-            .collect();
+        let mut moves = generate_pseudo_legal(b);
+        moves.retain(|mv| camino_lento(mv));
+        return moves;
     }
 
     let own = b.occupied_co[us as usize];
@@ -355,31 +358,25 @@ pub fn generate_legal(b: &Board) -> MoveList {
         | b.pieces[them as usize][PieceType::Queen as usize];
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
 
-    generate_pseudo_legal(b)
-        .into_iter()
-        .filter(|mv| {
-            if bit(mv.from) & pinned == 0
-                && mv.from != king_sq
-                && !matches!(
-                    mv.flag,
-                    MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
-                )
-            {
-                // Pieza no clavada, no es el rey, no es al paso/enroque:
-                // siempre legal (el rey no esta en jaque en esta rama, y
-                // mover una pieza no clavada no puede exponerlo). Este es
-                // el caso comun (la gran mayoria de jugadas por nodo) y
-                // evita por completo la copia del tablero.
-                true
-            } else {
-                // Casos poco comunes (pieza clavada, jugada de rey, al
-                // paso, enroque): camino lento siempre correcto, sin
-                // atajos -- no vale la pena el riesgo de un bug sutil por
-                // el poco volumen de jugadas que caen aqui.
-                camino_lento(mv)
-            }
-        })
-        .collect()
+    let mut moves = generate_pseudo_legal(b);
+    moves.retain(|mv| {
+        if bit(mv.from) & pinned == 0
+            && mv.from != king_sq
+            && !matches!(
+                mv.flag,
+                MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
+            )
+        {
+            // Pieza no clavada, no es el rey, no es al paso/enroque:
+            // siempre legal (el rey no esta en jaque en esta rama, y mover
+            // una pieza no clavada no puede exponerlo).
+            true
+        } else {
+            // Casos poco comunes: camino lento, siempre correcto.
+            camino_lento(mv)
+        }
+    });
+    moves
 }
 
 /// Referencia lenta (ray-casting puro, sin atajo de clavadas) usada SOLO en

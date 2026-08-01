@@ -7,8 +7,9 @@ use crate::board::Board;
 use crate::eval::{
     EvalState, crear_eval_state, evaluate_classical_with_state, evaluate_with_state,
 };
-use crate::movegen::{generate_captures_legal, generate_legal};
+use crate::movegen::{MAX_MOVES, generate_captures_legal, generate_legal};
 use crate::types::{Move, MoveFlag, PieceType};
+use arrayvec::ArrayVec;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -964,9 +965,9 @@ impl Searcher {
         prev: Option<(usize, usize)>,
         prev2: Option<(usize, usize)>,
     ) {
-        // `sort_by_key` recalculaba SEE varias veces por captura durante las
-        // comparaciones del ordenamiento. Cachear la clave conserva el mismo
-        // orden estable, pero calcula SEE una sola vez por jugada.
+        // Cachea SEE una vez por captura. El ordenamiento especializado de
+        // la biblioteca estándar gana al insertion-sort manual en M5, aun
+        // contando su almacenamiento temporal; conservarlo da mejor NPS.
         moves.sort_by_cached_key(|mv| {
             self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, None)
         });
@@ -1036,13 +1037,13 @@ impl Searcher {
         if capturas.is_empty() && generate_legal(b).is_empty() {
             return Ok(0); // ahogado
         }
-        let mut moves: Vec<(Move, Option<i32>)> = capturas
-            .into_iter()
-            .map(|m| {
-                let see = m.is_capture().then(|| crate::see::see(b, &m));
-                (m, see)
-            })
-            .collect();
+        // Igual que la lista principal: quiescence vive en las hojas y no
+        // debe asignar un Vec por nodo solo para conservar el SEE calculado.
+        let mut moves: ArrayVec<(Move, Option<i32>), MAX_MOVES> = ArrayVec::new();
+        for mv in capturas {
+            let see = mv.is_capture().then(|| crate::see::see(b, &mv));
+            moves.push((mv, see));
+        }
         // En quiescence la poda SEE se aplica despues del ordenamiento. Llevar
         // el resultado junto a la jugada evita calcular el mismo SEE dos veces.
         moves.sort_by_key(|(mv, see)| self.clave_orden_movimiento(b, mv, None, ply, None, None, *see));

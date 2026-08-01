@@ -10,6 +10,7 @@ crate-type = ["staticlib", "cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
+arrayvec = "0.7.8"
 rand = "0.10.2"
 shakmaty = "0.30.1"
 shakmaty-syzygy = "0.28.1"

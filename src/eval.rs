@@ -1136,7 +1136,7 @@ fn evaluar_clasica(b: &Board, cache: Option<&ClassicalAccumulator>) -> i32 {
 // solo 55.0%, peor que subir el peso manteniendo la clasica completa. La
 // clasica sigue aportando senal real (probablemente seguridad
 // tactica/material que la red, de solo ~1.4M parametros, no cubre sola).
-const PESO_RED: f64 = 1.5;
+pub const PESO_RED: f64 = 1.5;
 
 /// Ruta de referencia conservada para herramientas externas y tests. La
 /// búsqueda usa `evaluate_with_state`, que evita reescanear los componentes
@@ -1145,7 +1145,12 @@ const PESO_RED: f64 = 1.5;
 pub fn evaluate_with_nnue(b: &Board, nnue: Option<&crate::neural::NnueAccumulator>) -> i32 {
     let clasica = evaluar_clasica(b, None);
     match nnue {
-        Some(acumulador) => clasica + (PESO_RED * acumulador.evaluar() as f64).round() as i32,
+        Some(acumulador) => {
+            let red = (acumulador.peso() * acumulador.evaluar() as f64).round() as i32;
+            // En modo "red sola" la clasica se descarta por completo; se
+            // conserva TEMPO para no perder la nocion de quien mueve.
+            if acumulador.pura() { red + TEMPO } else { clasica + red }
+        }
         None => clasica,
     }
 }
@@ -1153,7 +1158,12 @@ pub fn evaluate_with_nnue(b: &Board, nnue: Option<&crate::neural::NnueAccumulato
 pub fn evaluate_with_state(b: &Board, state: &EvalState) -> i32 {
     let clasica = evaluar_clasica(b, Some(&state.classical));
     match state.nnue.as_ref() {
-        Some(acumulador) => clasica + (PESO_RED * acumulador.evaluar() as f64).round() as i32,
+        Some(acumulador) => {
+            let red = (acumulador.peso() * acumulador.evaluar() as f64).round() as i32;
+            // En modo "red sola" la clasica se descarta por completo; se
+            // conserva TEMPO para no perder la nocion de quien mueve.
+            if acumulador.pura() { red + TEMPO } else { clasica + red }
+        }
         None => clasica,
     }
 }

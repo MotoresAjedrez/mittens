@@ -521,8 +521,80 @@ impl RedNeural {
     }
 }
 
+/// Acumulador NNUE generico: envuelve la arquitectura que este cargada.
+/// El resto del motor (eval.rs, search.rs) solo usa `despues_de_jugada` y
+/// `evaluar`, asi que no necesita saber cual de las dos redes hay dentro.
 #[derive(Clone)]
-pub struct NnueAccumulator {
+pub enum NnueAccumulator {
+    Amenazas(AcumAmenazas),
+    Bullet(crate::bullet_net::AcumBullet),
+}
+
+impl NnueAccumulator {
+    pub fn despues_de_jugada(&self, antes: &Board, despues: &Board) -> NnueAccumulator {
+        match self {
+            NnueAccumulator::Amenazas(a) => {
+                NnueAccumulator::Amenazas(a.despues_de_jugada(antes, despues))
+            }
+            NnueAccumulator::Bullet(a) => {
+                NnueAccumulator::Bullet(a.despues_de_jugada(antes, despues))
+            }
+        }
+    }
+
+    pub fn evaluar(&self) -> f32 {
+        match self {
+            NnueAccumulator::Amenazas(a) => a.evaluar(),
+            NnueAccumulator::Bullet(a) => a.evaluar(),
+        }
+    }
+
+    /// Peso con el que la salida de la red se mezcla con la evaluacion
+    /// clasica. La red de amenazas se calibro con 1.5 (ver PESO_RED en
+    /// eval.rs); la de bullet ya devuelve centipeones "de verdad" en la
+    /// misma escala que la clasica, asi que su peso natural es 1.0 y no
+    /// tendria sentido heredar el 1.5 ajustado para la otra arquitectura.
+    /// Se puede sobreescribir con MIMOTOR_PESO_BULLET para experimentar.
+    pub fn peso(&self) -> f64 {
+        match self {
+            NnueAccumulator::Amenazas(_) => crate::eval::PESO_RED,
+            NnueAccumulator::Bullet(_) => peso_bullet(),
+        }
+    }
+
+    /// True si esta red debe evaluar SOLA, sin sumarle la evaluacion
+    /// clasica. Solo aplica a la arquitectura bullet, que a diferencia de la
+    /// de amenazas ya evalua la posicion COMPLETA por si misma; sumarle
+    /// encima la clasica puede estar contando dos veces lo mismo.
+    /// Se activa con MIMOTOR_BULLET_PURA=1.
+    pub fn pura(&self) -> bool {
+        matches!(self, NnueAccumulator::Bullet(_)) && bullet_pura()
+    }
+}
+
+fn bullet_pura() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("MIMOTOR_BULLET_PURA").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+fn peso_bullet() -> f64 {
+    static CACHE: OnceLock<f64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MIMOTOR_PESO_BULLET")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 8.0)
+            .unwrap_or(1.0)
+    })
+}
+
+#[derive(Clone)]
+pub struct AcumAmenazas {
     // Referencia estatica en vez de Arc: el acumulador se CLONA una vez por
     // nodo de la busqueda, y con Arc cada clon era un incremento atomico del
     // contador de referencias y cada destruccion un decremento. Con Lazy SMP
@@ -534,8 +606,8 @@ pub struct NnueAccumulator {
     primera_capa: [i32; N_OCULTA1],
 }
 
-impl NnueAccumulator {
-    fn desde_tablero(red: &'static RedNeural, b: &Board) -> NnueAccumulator {
+impl AcumAmenazas {
+    pub fn desde_tablero(red: &'static RedNeural, b: &Board) -> AcumAmenazas {
         let mut primera_capa = [0i32; N_OCULTA1];
         primera_capa.copy_from_slice(&red.b1);
         for (color_idx, color) in [(0usize, Color::White), (1usize, Color::Black)] {
@@ -560,7 +632,7 @@ impl NnueAccumulator {
         for idx in indices_amenaza(b) {
             red.sumar_feature(&mut primera_capa, idx, true);
         }
-        NnueAccumulator { red, primera_capa }
+        AcumAmenazas { red, primera_capa }
     }
 
     /// Incremental real. Idea: en vez de recalcular las 5378 features desde
@@ -589,7 +661,7 @@ impl NnueAccumulator {
     /// atacan ninguna casilla cambiada) queda exactamente igual -- no se
     /// toca. Verificado por test contra el recalculo completo en muchas
     /// posiciones/jugadas (ver tests, comprobar_incremental_amenazas).
-    pub fn despues_de_jugada(&self, antes: &Board, despues: &Board) -> NnueAccumulator {
+    pub fn despues_de_jugada(&self, antes: &Board, despues: &Board) -> AcumAmenazas {
         let mut nuevo = self.clone();
         self.red
             .actualizar_amenazas_incremental(&mut nuevo.primera_capa, antes, despues);
@@ -1073,13 +1145,29 @@ fn actualizar_booleano(
     }
 }
 
-static RED: OnceLock<RwLock<Option<&'static RedNeural>>> = OnceLock::new();
+/// Red cargada. El motor admite DOS arquitecturas distintas y elige segun el
+// Despliegue 2026-07-31: Bullet 512 entrenada con 56.5M posiciones y
+// etiquetas de Reckless, validada en H2H de 500 partidas contra producción:
+// 62.2% +/- 1.7% (intervalo 95%: 58.9%-65.5%, ~+87 Elo). Se conserva la
+// ruta legacy para poder comparar o revertir usando el backup correspondiente.
+/// archivo de pesos que se le pase por `NNUEPath`:
+///   * `Amenazas`: el formato casero historico (5378 features de amenaza,
+///     una sola perspectiva, pesos f32).
+///   * `Bullet`: (768 -> 256)x2 -> 1 con SCReLU, doble perspectiva, pesos
+///     i16 cuantizados, entrenada con la libreria `bullet`.
+#[derive(Clone, Copy)]
+pub enum RedCargada {
+    Amenazas(&'static RedNeural),
+    Bullet(&'static crate::bullet_net::RedBullet),
+}
+
+static RED: OnceLock<RwLock<Option<RedCargada>>> = OnceLock::new();
 static ACTIVA: AtomicBool = AtomicBool::new(false);
 // UCI puede recibir UseNNUE antes que NNUEPath. Conservamos la solicitud
 // pendiente y activamos la red cuando los pesos finalmente se cargan.
 static SOLICITADA: AtomicBool = AtomicBool::new(false);
 
-fn almacenamiento() -> &'static RwLock<Option<&'static RedNeural>> {
+fn almacenamiento() -> &'static RwLock<Option<RedCargada>> {
     RED.get_or_init(|| RwLock::new(None))
 }
 
@@ -1089,14 +1177,23 @@ fn almacenamiento() -> &'static RwLock<Option<&'static RedNeural>> {
 pub fn cargar_detallado(path: &str) -> Result<u64, String> {
     let datos = std::fs::read(path).map_err(|e| format!("no se pudo leer: {e}"))?;
     let checksum = checksum_fnv1a(&datos);
-    let red = RedNeural::cargar_de_bytes(&datos)
-        .ok_or_else(|| "formato o valores de pesos invalidos".to_string())?;
-    // `Box::leak`: la red (11 MB) queda viva hasta que el proceso termina.
-    // Recargar los pesos por UCI (raro: cero o una vez por partida) deja la
-    // anterior sin liberar, precio aceptable a cambio de quitar los atomicos
-    // del camino caliente.
-    let estatica: &'static RedNeural = Box::leak(Box::new(red));
-    *almacenamiento().write().expect("candado NNUE envenenado") = Some(estatica);
+    // El formato se detecta por el tamano del archivo: la red bullet mide
+    // 394754 bytes utiles + hasta 63 de relleno; la de amenazas, 11 MB.
+    let cargada = if crate::bullet_net::tamano_plausible(datos.len()) {
+        let red = crate::bullet_net::RedBullet::cargar_de_bytes(&datos)
+            .ok_or_else(|| "red bullet invalida".to_string())?;
+        eprintln!("info string NNUE: formato bullet (768->N)x2->1 SCReLU");
+        RedCargada::Bullet(Box::leak(Box::new(red)))
+    } else {
+        let red = RedNeural::cargar_de_bytes(&datos)
+            .ok_or_else(|| "formato o valores de pesos invalidos".to_string())?;
+        // `Box::leak`: la red (11 MB) queda viva hasta que el proceso
+        // termina. Recargar los pesos por UCI (raro: cero o una vez por
+        // partida) deja la anterior sin liberar, precio aceptable a cambio
+        // de quitar los atomicos del camino caliente.
+        RedCargada::Amenazas(Box::leak(Box::new(red)))
+    };
+    *almacenamiento().write().expect("candado NNUE envenenado") = Some(cargada);
     ACTIVA.store(SOLICITADA.load(Ordering::Relaxed), Ordering::Relaxed);
     Ok(checksum)
 }
@@ -1129,7 +1226,12 @@ pub fn crear_acumulador(b: &Board) -> Option<NnueAccumulator> {
         .read()
         .expect("candado NNUE envenenado")
         .as_ref()?;
-    Some(NnueAccumulator::desde_tablero(red, b))
+    Some(match red {
+        RedCargada::Amenazas(r) => NnueAccumulator::Amenazas(AcumAmenazas::desde_tablero(r, b)),
+        RedCargada::Bullet(r) => {
+            NnueAccumulator::Bullet(crate::bullet_net::AcumBullet::desde_tablero(r, b))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1138,7 +1240,12 @@ mod tests {
     use crate::movegen::generate_legal;
 
     fn red_prueba() -> &'static RedNeural {
-        let datos = include_bytes!("../pesos_amenazas_prueba.bin");
+        // Estos tests ejercitan exclusivamente el acumulador legacy de
+        // amenazas; producción usa ahora la red Bullet. Conservamos el
+        // checkpoint anterior como fixture para no mezclar formatos.
+        let datos = include_bytes!(
+            "../backups/pesos_amenazas_prueba.bak_pre_bullet_relabel_500h2h_20260731_121222.bin"
+        );
         Box::leak(Box::new(
             RedNeural::cargar_de_bytes(datos).expect("pesos validos"),
         ))
@@ -1152,9 +1259,9 @@ mod tests {
             .find(|m| m.to_uci() == uci)
             .unwrap_or_else(|| panic!("jugada no encontrada: {uci}"));
         let despues = antes.make_move(&mv);
-        let incremental = NnueAccumulator::desde_tablero(red, &antes)
+        let incremental = AcumAmenazas::desde_tablero(red, &antes)
             .despues_de_jugada(&antes, &despues);
-        let recalculado = NnueAccumulator::desde_tablero(red, &despues);
+        let recalculado = AcumAmenazas::desde_tablero(red, &despues);
         assert_eq!(
             incremental.primera_capa, recalculado.primera_capa,
             "acumulador distinto tras {} desde {}",
@@ -1196,7 +1303,7 @@ mod tests {
         let mut semilla = 0x5EED_CAFE_D00Du64;
         for _partida in 0..24 {
             let mut tablero = Board::startpos();
-            let mut acumulador = NnueAccumulator::desde_tablero(red, &tablero);
+            let mut acumulador = AcumAmenazas::desde_tablero(red, &tablero);
             for _ply in 0..80 {
                 let legales = generate_legal(&tablero);
                 if legales.is_empty() {
@@ -1207,7 +1314,7 @@ mod tests {
                 let mv = legales[(semilla as usize) % legales.len()];
                 let siguiente = tablero.make_move(&mv);
                 let incremental = acumulador.despues_de_jugada(&tablero, &siguiente);
-                let recalculado = NnueAccumulator::desde_tablero(red, &siguiente);
+                let recalculado = AcumAmenazas::desde_tablero(red, &siguiente);
                 assert_eq!(
                     incremental.primera_capa,
                     recalculado.primera_capa,

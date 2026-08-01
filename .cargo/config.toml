@@ -1,10 +1,10 @@
-# +dotprod: instruccion NEON que acelera los productos punto de la NNUE
-# (~5.4% mas rapido, confirmado con 4 corridas limpias, mismos nodos --
-# sin cambio de comportamiento). El M5 la soporta (FEAT_DotProd=1) pero sin
-# esto el compilador no la usaba. Sin este archivo es facil olvidarla en
-# el proximo build y perder la ganancia sin darse cuenta.
+# +dotprod: instruccion NEON que acelera los productos punto de la NNUE.
+# `target-cpu=apple-m5` permite al planificador del compilador ordenar ese
+# camino para el nucleo real de la Mac de entrenamiento. No cambia pesos ni
+# evaluaciones; solo genera codigo M5 mas eficiente. Las secciones Android y
+# Windows de abajo sobrescriben estos flags para conservar binarios portables.
 [build]
-rustflags = ["-C", "target-feature=+dotprod"]
+rustflags = ["-C", "target-cpu=apple-m5", "-C", "target-feature=+dotprod"]
 
 [target.aarch64-linux-android]
 linker = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android24-clang"
