@@ -199,7 +199,7 @@ fn cont_idx(prev_pt: usize, prev_to: usize, pt: usize, to: usize) -> usize {
 /// distinto de una hacia una casilla segura.
 #[inline]
 fn casilla_amenazada(b: &Board, sq: crate::types::Square) -> bool {
-    b.attackers_to(sq, b.occupied) & b.occupied_co[b.turn.opposite() as usize] != 0
+    b.is_square_attacked_by(sq, b.turn.opposite())
 }
 
 // TT compartida entre hilos (Lazy SMP): LOCKLESS de verdad, sin Mutex.
