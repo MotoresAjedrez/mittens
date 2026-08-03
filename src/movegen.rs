@@ -141,6 +141,13 @@ fn push_pawn_move(moves: &mut MoveList, from: Square, to: Square, is_promo: bool
 }
 
 fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
+    // El enroque SIEMPRE es ilegal con el rey en jaque (regla FIDE): si el
+    // rey esta en jaque, todos los chequeos de casillas atacadas de abajo son
+    // trabajo desperdiciado -- las jugadas generadas se descartarian igual en
+    // el filtro de legalidad. Saltar la generacion completa.
+    if b.in_check(us) {
+        return;
+    }
     let occ = b.occupied;
     match us {
         Color::White => {

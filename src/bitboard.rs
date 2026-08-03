@@ -419,20 +419,28 @@ pub fn pinned_pieces(
     // ambos (si hubiera una pieza enemiga o mas de una propia interpuesta,
     // no hay clavada real).
     let occ_sin_propias = occupied & !own;
-    let mut candidatos = rook_attacks(king_sq, occ_sin_propias) & enemy_rook_like;
-    while candidatos != 0 {
-        let atacante = pop_lsb(&mut candidatos);
-        let interpuestas = between(king_sq, atacante) & own;
-        if popcount(interpuestas) == 1 {
-            pinned |= interpuestas;
+    // Solo vale la pena el lookup magico si el rival tiene piezas deslizantes
+    // capaces de clavarlo en esa linea (si enemy_rook_like == 0, el resultado
+    // del lookup & 0 es cero de todos modos -- se ahorra el trabajo de
+    // antemano).
+    if enemy_rook_like != 0 {
+        let mut candidatos = rook_attacks(king_sq, occ_sin_propias) & enemy_rook_like;
+        while candidatos != 0 {
+            let atacante = pop_lsb(&mut candidatos);
+            let interpuestas = between(king_sq, atacante) & own;
+            if popcount(interpuestas) == 1 {
+                pinned |= interpuestas;
+            }
         }
     }
-    let mut candidatos = bishop_attacks(king_sq, occ_sin_propias) & enemy_bishop_like;
-    while candidatos != 0 {
-        let atacante = pop_lsb(&mut candidatos);
-        let interpuestas = between(king_sq, atacante) & own;
-        if popcount(interpuestas) == 1 {
-            pinned |= interpuestas;
+    if enemy_bishop_like != 0 {
+        let mut candidatos = bishop_attacks(king_sq, occ_sin_propias) & enemy_bishop_like;
+        while candidatos != 0 {
+            let atacante = pop_lsb(&mut candidatos);
+            let interpuestas = between(king_sq, atacante) & own;
+            if popcount(interpuestas) == 1 {
+                pinned |= interpuestas;
+            }
         }
     }
     pinned

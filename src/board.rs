@@ -451,11 +451,12 @@ impl Board {
             .piece_at(mv.from)
             .expect("make_move: no hay pieza en 'from'");
 
-        // Captura (normal o al paso)
+        // Captura (normal o al paso). El halfmove_clock se resetea UNA sola
+        // vez, en el bloque general de abajo (mv.is_capture() cubre tambien
+        // EnPassant) -- asignarlo aca y de nuevo alla era una duplicacion.
         if mv.flag == MoveFlag::EnPassant {
             let captured_sq = make_square(file_of(mv.to), rank_of(mv.from));
             b.remove_piece(them, PieceType::Pawn, captured_sq);
-            b.halfmove_clock = 0;
         } else if let Some((_, captured_pt)) = self.piece_at(mv.to) {
             if captured_pt == PieceType::King {
                 // Nunca deberia pasar en una partida legal (generate_legal ya
@@ -468,7 +469,6 @@ impl Board {
                 );
             }
             b.remove_piece(them, captured_pt, mv.to);
-            b.halfmove_clock = 0;
         }
 
         b.remove_piece(us, moving_pt, mv.from);

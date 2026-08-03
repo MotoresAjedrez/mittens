@@ -35,13 +35,25 @@ const CONTEMPT_UMBRAL: i32 = 500;
 const CONTEMPT_PENALIZACION: i32 = 200;
 
 fn draw_score(b: &Board, eval_state: &EvalState) -> i32 {
-    let se = evaluate_with_state(b, eval_state);
-    if se > CONTEMPT_UMBRAL {
+    // Para decidir el signo del contempt en tablas (repeticion/regla de 50)
+    // solo importa si la posicion esta CLARAMENTE ganada o perdida (fuera
+    // del umbral de 500cp). La evaluacion clasica es mucho mas barata que la
+    // NNUE completa, asi que se usa primero; solo si el resultado clasico
+    // cae en la zona ambigua cerca del umbral se confirma con la NNUE.
+    let se_clasico = evaluate_classical_with_state(b, eval_state);
+    if se_clasico > CONTEMPT_UMBRAL {
         -CONTEMPT_PENALIZACION
-    } else if se < -CONTEMPT_UMBRAL {
+    } else if se_clasico < -CONTEMPT_UMBRAL {
         CONTEMPT_PENALIZACION
     } else {
-        0
+        let se = evaluate_with_state(b, eval_state);
+        if se > CONTEMPT_UMBRAL {
+            -CONTEMPT_PENALIZACION
+        } else if se < -CONTEMPT_UMBRAL {
+            CONTEMPT_PENALIZACION
+        } else {
+            0
+        }
     }
 }
 
@@ -70,6 +82,10 @@ pub struct TTEntry {
     score: i32,
     flag: TTFlag,
     best: Option<Move>,
+    // Generacion de la busqueda que escribio esta entrada (aging): se
+    // incrementa al inicio de cada busqueda y permite que tt_store prefiera
+    // reemplazar entradas de busquedas ANTERIORES aunque sean mas profundas.
+    generation: u8,
 }
 
 #[inline]
@@ -218,7 +234,8 @@ fn casilla_amenazada(b: &Board, sq: crate::types::Square) -> bool {
 //   bits 18..34  (16): score, como i16 (ya normalizado a mate-por-ply)
 //   bits 34..41  ( 7): profundidad (0..127, de sobra: nunca llegamos ahi)
 //   bits 41..43  ( 2): flag de TT (Exact/Alpha/Beta)
-//   bits 43..48  ( 5): reservado para "aging" a futuro (sin usar por ahora)
+//   bits 43..48  ( 5): generacion de la busqueda que escribio la entrada
+//                       (aging: 0..31, se incrementa por busqueda)
 //   bit  48      ( 1): "ocupado" -- distingue un casillero vacio de una
 //                       entrada real con todos los demas bits en cero
 //   bits 49..64  (15): verificacion de clave (parte alta del zobrist, en
@@ -298,13 +315,14 @@ fn tt_flag_desde_u64(v: u64) -> TTFlag {
     }
 }
 
-fn tt_empaquetar(entry: &TTEntry, key: u64) -> u64 {
+fn tt_empaquetar(entry: &TTEntry, key: u64, generation: u8) -> u64 {
     let mv = tt_empaquetar_move(entry.best) & 0x3FFFF; // 18 bits
     let score = (entry.score as i16 as u16) as u64; // 16 bits, con signo preservado
     let depth = (entry.depth.clamp(0, 127) as u64) & 0x7F; // 7 bits
     let flag = (entry.flag as u64) & 0x3; // 2 bits
+    let generacion = (generation as u64) & 0x1F; // 5 bits
     let verif = (key >> (64 - 15)) & 0x7FFF; // 15 bits altos de la clave real
-    mv | (score << 18) | (depth << 34) | (flag << 41) | TT_OCUPADO | (verif << 49)
+    mv | (score << 18) | (depth << 34) | (flag << 41) | (generacion << 43) | TT_OCUPADO | (verif << 49)
 }
 
 fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
@@ -320,7 +338,8 @@ fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
     let score = ((paquete >> 18) & 0xFFFF) as u16 as i16 as i32;
     let depth = ((paquete >> 34) & 0x7F) as i32;
     let flag = tt_flag_desde_u64((paquete >> 41) & 0x3);
-    Some(TTEntry { key, depth, score, flag, best: mv })
+    let generation = ((paquete >> 43) & 0x1F) as u8;
+    Some(TTEntry { key, depth, score, flag, best: mv, generation })
 }
 
 /// Un solo hilo no necesita sincronización para su tabla de transposición.
@@ -368,6 +387,10 @@ pub struct Searcher {
     pub nodes: u64,
     deadline: Option<Instant>,
     stop: bool,
+    // Generacion de la busqueda actual para aging de la TT (0..31): se
+    // incrementa al inicio de cada busqueda y las entradas de la generacion
+    // anterior se prefieren para reemplazo en tt_store.
+    tt_generation: u8,
     // killers son validos solo dentro de esta busqueda (por ply del arbol
     // actual); history SI persiste entre jugadas de la partida, igual que la TT.
     killers: Vec<[Option<Move>; 2]>,
@@ -493,6 +516,7 @@ impl Searcher {
             nodes: 0,
             deadline: None,
             stop: false,
+            tt_generation: 0,
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
             history_amenaza: Box::new([[0i32; 64]; 64]),
@@ -543,6 +567,7 @@ impl Searcher {
             cont_history: vec![0i32; CONT_HIST_SIZE],
             cont_history_2: vec![0i32; CONT_HIST_SIZE],
             counter_moves: vec![None; 6 * 64],
+            tt_generation: 0,
             modo_lmr,
             modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
             modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() != Ok("0"),
@@ -815,7 +840,10 @@ impl Searcher {
 
     // Reemplazo por profundidad, pero una colision de OTRA clave siempre debe
     // poder ocupar el casillero. A igual profundidad se prefiere una entrada
-    // Exact sobre una cota Alpha/Beta.
+    // Exact sobre una cota Alpha/Beta. Con AGING, una entrada de una busqueda
+    // ANTERIOR (generacion distinta) se reemplaza de inmediato aunque sea mas
+    // profunda: su informacion ya no corresponde a la busqueda en curso y
+    // conservarla solo satura la TT con posiciones que ya no se visitaran.
     fn tt_store(
         &mut self,
         key: u64,
@@ -825,9 +853,14 @@ impl Searcher {
         flag: TTFlag,
         best: Option<Move>,
     ) {
+        // Copiar la generacion antes del closure: el closure se usa mientras
+        // `self.tt` esta prestado mutablemente, asi que no puede capturar
+        // `self` por referencia.
+        let generacion = self.tt_generation;
         let reemplazar = |slot: Option<TTEntry>| match slot {
             None => true,
             Some(existing) if existing.key != key => true,
+            Some(existing) if existing.generation != generacion => true,
             Some(existing) => {
                 depth > existing.depth
                     || (depth == existing.depth
@@ -841,6 +874,7 @@ impl Searcher {
             score: score_to_tt(score, ply),
             flag,
             best,
+            generation: generacion,
         };
         let idx = self.tt_index(key);
         match &mut self.tt {
@@ -859,7 +893,7 @@ impl Searcher {
                 // colision de otra posicion, igual que cualquier TT normal.
                 let actual = tt_desempaquetar(tt[idx].load(Ordering::Relaxed), key);
                 if reemplazar(actual) {
-                    tt[idx].store(tt_empaquetar(&entry, key), Ordering::Relaxed);
+                    tt[idx].store(tt_empaquetar(&entry, key, generacion), Ordering::Relaxed);
                 }
             }
         }
@@ -1097,7 +1131,7 @@ impl Searcher {
         eval_state: &EvalState,
         mut depth: i32,
         mut alpha: i32,
-        beta: i32,
+        mut beta: i32,
         ply: u32,
         prev: Option<(usize, usize)>,
         prev2: Option<(usize, usize)>,
@@ -1198,6 +1232,25 @@ impl Searcher {
         // define aca (antes de RFP) porque tanto razoring como la poda LMP
         // mas abajo la necesitan.
         let es_pv = beta - alpha > 1;
+
+        // Mate distance pruning: un mate no puede tardar menos de `ply` plies
+        // en aparecer desde la raiz (los plies ya caminados), asi que ninguna
+        // ventana mas alla de ese rango es alcanzable en esta rama. Ajustar
+        // la ventana a ese rango y cortar si queda vacia. 100% seguro: no
+        // cambia el resultado de ningun nodo, solo poda ramas sin esperanza.
+        if !es_pv {
+            let mated_in = -MATE + ply as i32; // peor mate posible en este ply
+            let mate_in = MATE - ply as i32 - 1; // mejor mate posible en este ply
+            if alpha < mated_in {
+                alpha = mated_in;
+            }
+            if beta > mate_in {
+                beta = mate_in;
+            }
+            if alpha >= beta {
+                return Ok(alpha);
+            }
+        }
 
         // Eval estatica por ply para la heuristica "improving": si la eval
         // estatica de este nodo es mejor que la de 2 plies atras EN LA
@@ -1621,7 +1674,11 @@ impl Searcher {
             // negativo rara vez compensa aunque se reduzca por LMR -- se
             // descarta directo sin bajar al hijo.
             const SEE_PRUNE_PROF_MAX: i32 = 7;
-            const SEE_PRUNE_MARGEN_POR_PLY2: i32 = -20;
+            // Margen LINEAL (estandar estilo Stockfish, ~-85*depth/3): el
+            // margen cuadratico anterior (-20*depth^2) daba -980 a depth 7,
+            // casi nunca podaba. Lineal: -85*7/3 ~= -198 a depth 7 -- poda
+            // capturas claramente perdedoras sin tocar las dudosas.
+            const SEE_PRUNE_MARGEN_POR_PLY: i32 = -85;
             if !es_pv
                 && !en_jaque
                 && depth <= SEE_PRUNE_PROF_MAX
@@ -1629,7 +1686,7 @@ impl Searcher {
                 && mv.is_capture()
                 && mv.promotion.is_none()
                 && beta.abs() < MATE - 1000
-                && crate::see::see(b, mv) < SEE_PRUNE_MARGEN_POR_PLY2 * depth * depth
+                && crate::see::see(b, mv) < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
             {
                 let next_probe = b.make_move(mv);
                 if !next_probe.in_check(next_probe.turn) {
@@ -1842,6 +1899,9 @@ impl Searcher {
         self.nodes = 0;
         self.deadline = None;
         self.stop = false;
+        // Nueva generacion: las entradas de la busqueda anterior quedan
+        // "viejas" y seran las primeras candidatas a reemplazo (aging).
+        self.tt_generation = (self.tt_generation + 1) & 0x1F;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         { let n = self.game_history.len().min(MAX_PATH); self.path[..n].copy_from_slice(&self.game_history[..n]); self.path_len = n; }
         let root_eval = crear_eval_state(b);
@@ -1967,6 +2027,8 @@ impl Searcher {
     ) -> (Option<Move>, i32, i32) {
         self.nodes = 0;
         self.stop = false;
+        // Nueva generacion para aging de la TT (ver tt_generation en Searcher).
+        self.tt_generation = (self.tt_generation + 1) & 0x1F;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.decaer_history();
         { let n = self.game_history.len().min(MAX_PATH); self.path[..n].copy_from_slice(&self.game_history[..n]); self.path_len = n; }
