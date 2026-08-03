@@ -463,6 +463,13 @@ pub struct Searcher {
     // largas + profundidad de busqueda; path_push nunca desborda (guarda).
     path: [u64; MAX_PATH],
     path_len: usize,
+    // Buffer FIJO (en pila dentro del Searcher) de claves de ordenamiento de
+    // jugadas, reutilizable entre nodos. Reemplaza el Vec<(clave, indice)>
+    // temporal que sort_by_cached_key asignaba en el heap por cada nodo de
+    // negamax (millones de veces por segundo con Lazy SMP). Cada Searcher
+    // pertenece a un solo hilo y order_moves_ply no es reentrante, asi que
+    // no hay contencion. Las claves se precomputan una sola vez por llamada.
+    claves_orden_movimiento: [i32; MAX_MOVES],
     pub lmr_intentos: u64,
     pub lmr_reintentos: u64,
     // Hindsight reductions: para el hijo alcanzado mediante una busqueda
@@ -546,6 +553,7 @@ impl Searcher {
             game_history: Vec::new(),
             path: [0u64; MAX_PATH],
             path_len: 0,
+            claves_orden_movimiento: [0; MAX_MOVES],
             lmr_intentos: 0,
             lmr_reintentos: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -588,6 +596,7 @@ impl Searcher {
             game_history: Vec::new(),
             path: [0u64; MAX_PATH],
             path_len: 0,
+            claves_orden_movimiento: [0; MAX_MOVES],
             lmr_intentos: 0,
             lmr_reintentos: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -991,7 +1000,7 @@ impl Searcher {
         if self.stop { Err(TimeUp) } else { Ok(()) }
     }
 
-    fn order_moves(&self, b: &Board, moves: &mut [Move], tt_move: Option<Move>) {
+    fn order_moves(&mut self, b: &Board, moves: &mut [Move], tt_move: Option<Move>) {
         self.order_moves_ply(b, moves, tt_move, MAX_KILLER_PLY as u32, None, None);
     }
 
@@ -1065,7 +1074,7 @@ impl Searcher {
     /// continuation history para las jugadas silenciosas. `prev2` es la
     /// jugada PROPIA de 2 plies atras -- alimenta el follow-up history.
     fn order_moves_ply(
-        &self,
+        &mut self,
         b: &Board,
         moves: &mut [Move],
         tt_move: Option<Move>,
@@ -1073,12 +1082,36 @@ impl Searcher {
         prev: Option<(usize, usize)>,
         prev2: Option<(usize, usize)>,
     ) {
-        // Cachea SEE una vez por captura. El ordenamiento especializado de
-        // la biblioteca estándar gana al insertion-sort manual en M5, aun
-        // contando su almacenamiento temporal; conservarlo da mejor NPS.
-        moves.sort_by_cached_key(|mv| {
-            self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, None)
-        });
+        // SIN asignacion de heap: sort_by_cached_key creaba un Vec<(clave,
+        // indice)> temporal por nodo. Aqui se precomputan las claves una sola
+        // vez en el buffer FIJO del Searcher (pila, reutilizable) y se ordena
+        // con insertion sort manual. El numero de jugadas suele ser <40 y el
+        // insertion sort ESTABLE conserva exactamente el mismo orden final
+        // que el sort estable de la std (claves iguales mantienen el orden
+        // relativo original).
+        let n = moves.len();
+        debug_assert!(n <= MAX_MOVES);
+        // Copia el buffer a la pila del frame para no tener un prestamo
+        // mutable de `self` vivo mientras se llama a `clave_orden_movimiento`
+        // (que toma `&self`); 1KB es despreciable frente al coste del orden.
+        let mut claves = self.claves_orden_movimiento;
+        for (mv, k) in moves.iter().zip(claves.iter_mut()) {
+            *k = self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, None);
+        }
+        // Insertion sort estable sobre (moves, claves) en paralelo.
+        for i in 1..n {
+            let mv = moves[i];
+            let k = claves[i];
+            let mut j = i;
+            while j > 0 && claves[j - 1] > k {
+                moves[j] = moves[j - 1];
+                claves[j] = claves[j - 1];
+                j -= 1;
+            }
+            moves[j] = mv;
+            claves[j] = k;
+        }
+        self.claves_orden_movimiento = claves;
     }
 
     fn quiescence(
