@@ -18,7 +18,7 @@ use search::Searcher;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use types::{Move, MoveFlag, PieceType};
 
@@ -143,7 +143,6 @@ fn run_smp_bench(movetime_ms: u64) {
     );
     for n in [1usize, 2, 4, 6, 8] {
         let (tt, tt_mask) = search::construir_tt(64);
-        let generacion = AtomicU8::new(0);
         let t0 = Instant::now();
         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
             &b,
@@ -151,7 +150,6 @@ fn run_smp_bench(movetime_ms: u64) {
             64,
             n,
             &tt,
-            &generacion,
             tt_mask,
             true,
             true,
@@ -977,14 +975,6 @@ fn uci_loop() {
     } else {
         (Arc::new(Vec::new()), 0)
     };
-    // Generacion de aging de la TT compartida: persiste entre jugadas JUNTO a
-    // smp_tt. El bug original: cada Searcher nuevo de buscar_lazy_smp
-    // arrancaba con tt_generation 0 y toda busqueda SMP quedaba en
-    // generacion 1, dejando el aging muerto aunque la TT compartida si
-    // persista. Avanza una vez por "go" dentro de buscar_lazy_smp; se
-    // resetea cuando la TT se reconstruye (ucinewgame / cambio de Hash o de
-    // evaluacion).
-    let smp_generacion = Arc::new(AtomicU8::new(0));
     let mut searcher_slot: Option<Searcher> = Some(if n_hilos > 1 {
         Searcher::new_con_tt_compartida(Arc::clone(&smp_tt), smp_tt_mask, modo_lmr_inicial)
     } else {
@@ -1170,8 +1160,6 @@ fn uci_loop() {
                     drop(searcher_slot.take());
                     let old_tt = std::mem::replace(&mut smp_tt, Arc::new(Vec::new()));
                     drop(old_tt);
-                    // TT nueva => contador de aging desde cero.
-                    smp_generacion.store(0, Ordering::Relaxed);
                     let modo_lmr = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
                     if n_hilos > 1 {
                         let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
@@ -1204,8 +1192,6 @@ fn uci_loop() {
                 drop(searcher_slot.take());
                 let old_tt = std::mem::replace(&mut smp_tt, Arc::new(Vec::new()));
                 drop(old_tt);
-                // TT nueva => contador de aging desde cero.
-                smp_generacion.store(0, Ordering::Relaxed);
                 let modo_lmr = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
                 if n_hilos > 1 {
                     let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
@@ -1414,7 +1400,6 @@ fn uci_loop() {
                     let nnue_classical_depth = searcher_slot.as_ref().unwrap().nnue_classical_depth;
                     let tt = Arc::clone(&smp_tt);
                     let mask = smp_tt_mask;
-                    let generacion = Arc::clone(&smp_generacion);
                     let flag = Arc::clone(&stop_flag);
                     let filtro = searchmoves_filtro.clone();
                     let handle = std::thread::spawn(move || {
@@ -1425,7 +1410,6 @@ fn uci_loop() {
                             64,
                             n_hilos,
                             &tt,
-                            &generacion,
                             mask,
                             modo_lmr,
                             qsearch_nnue,
