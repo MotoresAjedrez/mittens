@@ -2122,6 +2122,19 @@ impl Searcher {
 
     /// Busqueda con profundidad fija (para benchmarks/tests, sin limite de tiempo).
     pub fn search_fixed_depth(&mut self, b: &Board, depth: i32) -> (Option<Move>, i32, u64) {
+        // Red de seguridad (ver from_fen): si por cualquier via llega a la
+        // busqueda una posicion ilegal (el bando que acaba de mover dejo su
+        // rey en jaque), NO buscar -- devolver sin jugada en vez de dejar que
+        // generate_legal ofrezca la captura del rey rival y make_move aborte
+        // el proceso (panic=abort en release). En produccion la posicion se
+        // rechaza antes, en from_fen; esto es defensa en profundidad.
+        if b.in_check(b.turn.opposite()) {
+            eprintln!(
+                "MIMOTOR: posicion ilegal en la raiz de busqueda -- se devuelve sin jugada. FEN: {}",
+                b.to_fen()
+            );
+            return (None, 0, 0);
+        }
         self.nodes = 0;
         self.deadline = None;
         self.stop = false;
@@ -2276,6 +2289,16 @@ impl Searcher {
         max_depth: i32,
         mut on_info: impl FnMut(i32, i32, u64, u64),
     ) -> (Option<Move>, i32, i32) {
+        // Red de seguridad (ver from_fen y search_fixed_depth): nunca buscar
+        // una posicion ilegal; devolver sin jugada (bestmove 0000) en vez de
+        // abortar el proceso por la captura del rey rival.
+        if b.in_check(b.turn.opposite()) {
+            eprintln!(
+                "MIMOTOR: posicion ilegal en la raiz de busqueda -- se devuelve sin jugada. FEN: {}",
+                b.to_fen()
+            );
+            return (None, 0, 0);
+        }
         self.nodes = 0;
         self.stop = false;
         // Nueva generacion para aging de la TT (ver tt_generation en Searcher).
@@ -2745,7 +2768,10 @@ mod regression_tests {
 
     #[test]
     fn quiescence_respeta_regla_de_cincuenta() {
-        let b = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 100 1").unwrap();
+        // Posicion LEGAL (la anterior tenia el rey negro en jaque con blancas
+        // al turno -- misma clase de posicion ilegal que el bug de captura de
+        // rey, que ahora from_fen rechaza). Dama en d4: no ataca e8.
+        let b = Board::from_fen("4k3/8/8/8/3Q4/8/8/4K3 w - - 100 1").unwrap();
         let mut s = Searcher::new(1);
         let eval_state = crear_eval_state(&b);
         assert_eq!(
@@ -2915,5 +2941,94 @@ mod regression_tests {
         assert!(mv2.is_none(), "tabla en la raiz: no debe haber mejor jugada");
         assert_eq!(sc2, esperado, "score de tablas inmediato");
         assert_eq!(prof, 0, "debe reconocer la tabla sin profundizar");
+    }
+}
+
+#[cfg(test)]
+mod regresion_posicion_ilegal {
+    use super::*;
+
+    // FEN del bug reportado: rey negro en e7 bajo ataque directo de la torre
+    // blanca en h7, siendo el turno de BLANCAS. En una posicion legal el
+    // bando que NO mueve nunca puede estar en jaque (la jugada anterior fue
+    // ilegal). Antes del fix, generate_legal ofrecia "h7e7" (captura del
+    // rey negro, legal para blancas) y make_move panicaba -- fatal con
+    // panic=abort en release.
+    const FEN_ILEGAL: &str = "8/4k2R/3b4/5p2/5pr1/3N1K2/5P2/8 w - - 18 70";
+
+    #[test]
+    fn from_fen_rechaza_posicion_ilegal() {
+        assert!(
+            Board::from_fen(FEN_ILEGAL).is_err(),
+            "un FEN con el rey del bando que no mueve en jaque debe ser rechazado"
+        );
+    }
+
+    #[test]
+    fn from_fen_acepta_posicion_legal_equivalente() {
+        // Misma estructura pero rey negro en e8 (NO en jaque con blancas al turno).
+        let legal = Board::from_fen("4k3/7R/3b4/5p2/5pr1/3N1K2/5P2/8 w - - 18 70")
+            .expect("la variante legal debe aceptarse");
+        assert!(!legal.in_check(crate::types::Color::Black));
+    }
+
+    #[test]
+    fn busqueda_sobre_posicion_ilegal_no_aborta() {
+        // Defensa en profundidad: si una posicion ilegal llegara igual a la
+        // busqueda (p.ej. por una API que construye el Board a mano o que lo
+        // muta sin pasar por from_fen), debe devolver sin jugada en vez de
+        // abortar por la captura del rey. Se fabrica la ilegalidad volteando
+        // el turno sobre una posicion de jaque legal: con blancas al turno,
+        // el rey negro (bando que acaba de mover) queda en jaque => ilegal.
+        let mut ilegal = Board::from_fen("4k3/8/8/8/8/8/4R3/4K3 b - - 0 1")
+            .expect("jaque a negras con turno de negras es una posicion legal");
+        assert!(ilegal.in_check(crate::types::Color::Black));
+        ilegal.turn = crate::types::Color::White;
+        assert!(ilegal.in_check(ilegal.turn.opposite()));
+
+        let mut s = Searcher::new(64);
+        let (mv, sc, nodes) = s.search_fixed_depth(&ilegal, 8);
+        assert!(mv.is_none(), "posicion ilegal: no debe haber jugada");
+        assert_eq!(nodes, 0);
+        assert_eq!(sc, 0);
+        let (mv2, sc2, _) = s.search_time(&ilegal, None, 8, |_, _, _, _| {});
+        assert!(mv2.is_none());
+        assert_eq!(sc2, 0);
+    }
+}
+
+#[cfg(test)]
+mod verificacion_reproduccion {
+    use super::*;
+
+    const FEN_ILEGAL: &str = "8/4k2R/3b4/5p2/5pr1/3N1K2/5P2/8 w - - 18 70";
+    const FEN_LEGAL: &str = "4k3/7R/3b4/5p2/5pr1/3N1K2/5P2/8 w - - 18 70";
+
+    // Lento en perfil debug (depth 15 en codigo no optimizado): se corre
+    // explicitamente con `cargo test --release --lib verificacion_reproduccion`.
+    #[test]
+    #[ignore]
+    fn reproduccion_depth_8_10_12_15_no_crashea() {
+        // El FEN ilegal ahora es rechazado en from_fen: "position fen ..."
+        // del protocolo UCI imprime "info string error de FEN" y continua.
+        assert!(Board::from_fen(FEN_ILEGAL).is_err());
+
+        // La variante LEGAL equivalente debe producir bestmove razonable a
+        // las mismas profundidades sin abortar (verifica que el arbol de
+        // busqueda en si sigue limpio).
+        let b = Board::from_fen(FEN_LEGAL).unwrap();
+        let mut s = Searcher::new(64);
+        for d in [8, 10, 12, 15] {
+            let (mv, sc, nodes) = s.search_fixed_depth(&b, d);
+            assert!(mv.is_some(), "depth {}: debe haber bestmove", d);
+            let uci = mv.unwrap().to_uci();
+            println!("depth {}: bestmove {} score {} nodes {}", d, uci, sc, nodes);
+            assert!(
+                generate_legal(&b).iter().any(|m| m.to_uci() == uci),
+                "depth {}: bestmove {} no esta en los movimientos legales de la raiz",
+                d,
+                uci
+            );
+        }
     }
 }

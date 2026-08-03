@@ -296,6 +296,26 @@ impl Board {
             return Err("enroque negro largo sin torre en a8".to_string());
         }
 
+        // Invariante fundamental de una posicion legal: el bando que ACABA de
+        // mover (el que NO tiene el turno) nunca puede dejar su propio rey en
+        // jaque -- si lo hizo, la jugada anterior fue ilegal y la posicion es
+        // imposible en una partida real. Ejemplo concreto de la clase de bug:
+        //   "8/4k2R/3b4/5p2/5pr1/3N1K2/5P2/8 w - - 18 70"
+        // tiene al rey negro en e7 bajo ataque directo de la torre blanca en
+        // h7 siendo el turno de BLANCAS -- el ultimo movimiento de negras
+        // dejo su propio rey en jaque.
+        // Sin este chequeo, generate_legal/make_move (que asumen posiciones
+        // legales) aceptan la jugada blanca "h7e7" -- para blancas no deja su
+        // rey en jaque, asi que es "legal" -- y make_move intenta capturar el
+        // REY rival, panic que en release (panic=abort) TUMBA el proceso a
+        // media partida. Rechazar la posicion en el borde es la causa raiz.
+        if b.in_check(b.turn.opposite()) {
+            return Err(
+                "el bando que acabo de mover dejo su propio rey en jaque (posicion ilegal)"
+                    .to_string(),
+            );
+        }
+
         b.recompute_zobrist();
         Ok(b)
     }
@@ -459,14 +479,24 @@ impl Board {
             b.remove_piece(them, PieceType::Pawn, captured_sq);
         } else if let Some((_, captured_pt)) = self.piece_at(mv.to) {
             if captured_pt == PieceType::King {
-                // Nunca deberia pasar en una partida legal (generate_legal ya
-                // filtra jugadas que dejan al propio rey en jaque) -- si esto
-                // se dispara, la posicion de entrada es ilegal o hay un bug real.
-                panic!(
-                    "intento de capturar un REY -- posicion ilegal o bug real. FEN antes de la jugada: {}  jugada: {}",
+                // Red de seguridad contra posiciones ilegales (NUNCA debe
+                // dispararse en una partida real: from_fen ya rechaza FENs
+                // donde el bando que acaba de mover dejo su rey en jaque, y
+                // generate_legal filtra las jugadas que dejan el propio rey
+                // en jaque). El panic! historico aqui era fatal en produccion:
+                // el perfil release usa panic=abort, asi que una posicion
+                // ilegal recibida del GUI tumbaba el proceso entero a media
+                // partida. Ahora se registra el diagnostico, se retira el rey
+                // (comportamiento de una captura normal) y se sigue, en vez
+                // de abortar. debug_assert! mantiene la deteccion en tests
+                // (cargo test, perfil debug) sin coste en release.
+                eprintln!(
+                    "MIMOTOR: posicion ilegal en make_move (captura de rey en {}). FEN antes de la jugada: {}  jugada: {}",
+                    square_name(mv.to),
                     self.to_fen(),
                     mv.to_uci()
                 );
+                debug_assert!(false, "intento de capturar un REY -- posicion ilegal o bug real");
             }
             b.remove_piece(them, captured_pt, mv.to);
         }
