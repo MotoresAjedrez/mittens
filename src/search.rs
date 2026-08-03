@@ -2799,4 +2799,41 @@ mod regression_tests {
             "la generacion 2 no debe existir tras la primera llamada"
         );
     }
+
+    // BUG 2 (fix): la posicion RAIZ nunca se revisaba por tablas reclamables
+    // (repeticion o regla de 50) antes de arrancar la profundizacion
+    // iterativa. Si la raiz YA era tablas, la busqueda reportaba un
+    // score/PV incorrecto (no-cero). Ahora search_fixed_depth y search_time
+    // la detectan de inmediato y retornan el score de tablas sin expandir
+    // ningun nodo.
+    #[test]
+    fn raiz_ya_tablas_por_repeticion_retorna_draw_sin_buscar() {
+        let b =
+            Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 10 1").unwrap();
+        let root_eval = crear_eval_state(&b);
+
+        // Referencia: el score de tablas que el propio motor usaria dentro
+        // de la busqueda (draw_score). En una posicion balanceada debe ser 0.
+        let mut s_ref = Searcher::new(16);
+        s_ref.reiniciar_nnue(&b);
+        let esperado = draw_score(&b, &root_eval, s_ref.nnue_de(&root_eval));
+        assert_eq!(esperado, 0, "startpos balanceada: tablas deben puntuar 0");
+
+        // La posicion actual ya aparecio UNA vez antes en la partida real
+        // (2da aparicion => reclamable, mismo criterio que negamax).
+        let mut s = Searcher::new(16);
+        s.set_game_history(vec![b.zobrist]);
+
+        let (mv, sc, nodos) = s.search_fixed_depth(&b, 6);
+        assert!(mv.is_none(), "tabla en la raiz: no debe haber mejor jugada");
+        assert_eq!(sc, esperado, "score de tablas inmediato");
+        assert_eq!(nodos, 0, "debe reconocer la tabla sin expandir nodos");
+
+        let mut s2 = Searcher::new(16);
+        s2.set_game_history(vec![b.zobrist]);
+        let (mv2, sc2, prof) = s2.search_time(&b, None, 6, |_, _, _, _| {});
+        assert!(mv2.is_none(), "tabla en la raiz: no debe haber mejor jugada");
+        assert_eq!(sc2, esperado, "score de tablas inmediato");
+        assert_eq!(prof, 0, "debe reconocer la tabla sin profundizar");
+    }
 }
