@@ -1327,6 +1327,60 @@ mod tests {
         comprobar_incremental("4k3/8/8/8/3n4/8/3Q4/4K3 w - - 0 1", "d2d4");
     }
 
+    /// La busqueda usa `aplicar_jugada` in-place con undo en vez de clonar
+    /// el acumulador por nodo. Esto verifica la propiedad de la que depende
+    /// esa optimizacion: bajar por una linea aplicando la jugada y volver
+    /// deshaciendola (mismos tableros, argumentos invertidos) restaura el
+    /// acumulador BIT A BIT, a cualquier profundidad.
+    #[test]
+    fn aplicar_jugada_se_deshace_bit_a_bit() {
+        let red = red_prueba();
+        let mut semilla = 0xD00D_F00D_1234u64;
+        for _partida in 0..12 {
+            let raiz = Board::startpos();
+            let mut acumulador = AcumAmenazas::desde_tablero(red, &raiz);
+            let original = acumulador.primera_capa;
+            // Bajar por una linea aleatoria de hasta 24 plies, guardando los
+            // tableros para poder desandarla igual que hace la recursion.
+            let mut pila: Vec<(Board, Board)> = Vec::new();
+            let mut tablero = raiz;
+            for _ply in 0..24 {
+                let legales = generate_legal(&tablero);
+                if legales.is_empty() {
+                    break;
+                }
+                semilla ^= semilla << 7;
+                semilla ^= semilla >> 9;
+                let mv = legales[(semilla as usize) % legales.len()];
+                let siguiente = tablero.make_move(&mv);
+                acumulador.aplicar_jugada(&tablero, &siguiente);
+                // En cada nivel el estado in-place debe coincidir con el
+                // recalculo completo desde el tablero.
+                assert_eq!(
+                    acumulador.primera_capa,
+                    AcumAmenazas::desde_tablero(red, &siguiente).primera_capa,
+                    "estado in-place difiere del recalculo tras {}",
+                    mv.to_uci()
+                );
+                pila.push((tablero, siguiente));
+                tablero = siguiente;
+            }
+            // Desandar en orden inverso, invirtiendo los argumentos.
+            while let Some((antes, despues)) = pila.pop() {
+                acumulador.aplicar_jugada(&despues, &antes);
+                assert_eq!(
+                    acumulador.primera_capa,
+                    AcumAmenazas::desde_tablero(red, &antes).primera_capa,
+                    "undo no restauro el estado del padre"
+                );
+            }
+            assert_eq!(
+                acumulador.primera_capa, original,
+                "tras deshacer toda la linea el acumulador no volvio a la raiz"
+            );
+        }
+    }
+
     #[test]
     fn acumulador_incremental_amenazas_fuzz_determinista() {
         let red = red_prueba();

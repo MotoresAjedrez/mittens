@@ -320,6 +320,51 @@ mod tests {
         }
     }
 
+    /// Misma propiedad que en `neural.rs`: la busqueda muta el acumulador
+    /// in-place y lo deshace invirtiendo los argumentos. Aqui ademas se
+    /// comprueba `negras_mueven`, que tambien tiene que volver a su valor.
+    #[test]
+    fn aplicar_jugada_se_deshace_bit_a_bit() {
+        let Some(red) = red() else {
+            eprintln!("sin MIMOTOR_RED_BULLET: test omitido");
+            return;
+        };
+        let raiz = crate::board::Board::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let mut acumulador = AcumBullet::desde_tablero(red, &raiz);
+        let original = acumulador.persp;
+        let original_turno = acumulador.negras_mueven;
+        let mut semilla = 0xBEEF_1234_5678u64;
+        let mut pila: Vec<(crate::board::Board, crate::board::Board)> = Vec::new();
+        let mut tablero = raiz;
+        for _ply in 0..24 {
+            let legales = generate_legal(&tablero);
+            if legales.is_empty() {
+                break;
+            }
+            semilla ^= semilla << 7;
+            semilla ^= semilla >> 9;
+            let mv = legales[(semilla as usize) % legales.len()];
+            let siguiente = tablero.make_move(&mv);
+            acumulador.aplicar_jugada(&tablero, &siguiente);
+            let re = AcumBullet::desde_tablero(red, &siguiente);
+            assert_eq!(acumulador.persp, re.persp, "in-place difiere tras {}", mv.to_uci());
+            assert_eq!(acumulador.negras_mueven, re.negras_mueven);
+            pila.push((tablero, siguiente));
+            tablero = siguiente;
+        }
+        while let Some((antes, despues)) = pila.pop() {
+            acumulador.aplicar_jugada(&despues, &antes);
+            let re = AcumBullet::desde_tablero(red, &antes);
+            assert_eq!(acumulador.persp, re.persp, "undo no restauro el padre");
+            assert_eq!(acumulador.negras_mueven, re.negras_mueven);
+        }
+        assert_eq!(acumulador.persp, original);
+        assert_eq!(acumulador.negras_mueven, original_turno);
+    }
+
     #[test]
     fn simetria_de_colores() {
         let Some(red) = red() else { return };
