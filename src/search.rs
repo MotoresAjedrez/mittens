@@ -1221,12 +1221,13 @@ impl Searcher {
 
         const RFP_PROF_MAX: i32 = 8;
         const RFP_MARGEN_POR_PLY: i32 = 120;
-        if !en_jaque && depth <= RFP_PROF_MAX && beta.abs() < MATE - 1000 {
+        if !en_jaque && !es_pv && depth <= RFP_PROF_MAX && beta.abs() < MATE - 1000 {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
             let static_eval = self.eval_corregida(b, raw, prev);
-            // improving: sin mejora, el margen se achica (poda mas agresivo).
-            let margen_ply = if improving { RFP_MARGEN_POR_PLY } else { RFP_MARGEN_POR_PLY * 3 / 5 };
+            // improving: con mejora el margen se achica (poda mas agresivo);
+            // sin mejora se agranda (mas conservador, poda menos).
+            let margen_ply = if improving { RFP_MARGEN_POR_PLY * 3 / 5 } else { RFP_MARGEN_POR_PLY };
             if static_eval - margen_ply * depth >= beta {
                 return Ok(static_eval - margen_ply * depth);
             }
@@ -1246,8 +1247,9 @@ impl Searcher {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
             let static_eval = self.eval_corregida(b, raw, prev);
-            // improving: sin mejora, el margen se achica.
-            let margen_base = if improving { RAZOR_MARGEN_BASE } else { RAZOR_MARGEN_BASE * 3 / 5 };
+            // improving: con mejora el margen se achica; sin mejora se agranda
+            // (mas conservador, se razorea menos).
+            let margen_base = if improving { RAZOR_MARGEN_BASE * 3 / 5 } else { RAZOR_MARGEN_BASE };
             let margen = margen_base + RAZOR_MARGEN_POR_PLY * depth;
             if static_eval + margen <= alpha {
                 let sc = self.quiescence(b, eval_state, alpha, alpha + 1, ply)?;
@@ -1295,6 +1297,7 @@ impl Searcher {
         const NULL_MOVE_EVAL_MAX: i32 = 2;
         const NULL_MOVE_PROF_MIN: i32 = 3;
         if !en_jaque
+            && !es_pv
             && depth >= NULL_MOVE_PROF_MIN
             && beta < MATE - 1000
             && alpha > -(MATE - 1000)
@@ -1310,6 +1313,12 @@ impl Searcher {
                 let r = r.min(depth - 1).max(1);
                 let next = b.make_null_move();
                 let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, depth - 1 - r);
+                // El hijo NO llega por LMR: limpiar el estado hindsight del
+                // ply hijo para que no lea la reduccion de otro subarbol.
+                let child_ply = (ply + 1) as usize;
+                if child_ply < MAX_KILLER_PLY {
+                    self.hindsight_reduction[child_ply] = 0;
+                }
                 let sc_null = -self.negamax(
                     &next,
                     &next_eval,
@@ -1359,6 +1368,12 @@ impl Searcher {
                     continue;
                 }
                 let pt_mv2 = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+                // El hijo NO llega por LMR: limpiar el estado hindsight del
+                // ply hijo para que no lea la reduccion de otro subarbol.
+                let child_ply = (ply + 1) as usize;
+                if child_ply < MAX_KILLER_PLY {
+                    self.hindsight_reduction[child_ply] = 0;
+                }
                 let sc_confirmado = -self.negamax(
                     &next,
                     &next_eval,
@@ -1446,6 +1461,13 @@ impl Searcher {
                         let next = b.make_move(mv);
                         let next_eval =
                             self.siguiente_estado_busqueda(eval_state, b, &next, sdepth);
+                        // El hijo NO llega por LMR: limpiar el estado hindsight
+                        // del ply hijo para que no lea la reduccion de otro
+                        // subarbol.
+                        let child_ply = (ply + 1) as usize;
+                        if child_ply < MAX_KILLER_PLY {
+                            self.hindsight_reduction[child_ply] = 0;
+                        }
                         match self.negamax(
                             &next,
                             &next_eval,
@@ -1548,12 +1570,13 @@ impl Searcher {
                         *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
                     self.eval_corregida(b, raw, prev)
                 });
-                // improving: sin mejora el margen de futilidad se achica --
-                // se descartan mas jugadas silenciosas tardias.
+                // improving: con mejora el margen de futilidad se achica -- se
+                // descartan mas jugadas silenciosas tardias; sin mejora el
+                // margen crece y se poda menos (mas conservador).
                 let margen_ply = if improving {
-                    FUT_MARGEN_POR_PLY
-                } else {
                     FUT_MARGEN_POR_PLY * 3 / 5
+                } else {
+                    FUT_MARGEN_POR_PLY
                 };
                 if ev + FUT_MARGEN_BASE + margen_ply * depth <= alpha {
                     let next_probe = b.make_move(mv);
