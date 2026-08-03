@@ -542,6 +542,20 @@ impl NnueAccumulator {
         }
     }
 
+    /// Aplica el delta de una jugada MUTANDO el acumulador (sin clonar).
+    /// Es su propia inversa al intercambiar los argumentos: para deshacer
+    /// `aplicar_jugada(antes, despues)` basta llamar
+    /// `aplicar_jugada(despues, antes)`. Ver la justificacion en cada
+    /// arquitectura (`AcumAmenazas::aplicar_jugada`,
+    /// `AcumBullet::aplicar_jugada`).
+    #[inline]
+    pub fn aplicar_jugada(&mut self, antes: &Board, despues: &Board) {
+        match self {
+            NnueAccumulator::Amenazas(a) => a.aplicar_jugada(antes, despues),
+            NnueAccumulator::Bullet(a) => a.aplicar_jugada(antes, despues),
+        }
+    }
+
     pub fn evaluar(&self) -> f32 {
         match self {
             NnueAccumulator::Amenazas(a) => a.evaluar(),
@@ -666,6 +680,22 @@ impl AcumAmenazas {
         self.red
             .actualizar_amenazas_incremental(&mut nuevo.primera_capa, antes, despues);
         nuevo
+    }
+
+    /// Igual que `despues_de_jugada` pero MUTANDO este acumulador, sin
+    /// copiar los 512 i32. La operacion es exactamente inversa consigo
+    /// misma: `aplicar_jugada(a, d)` seguido de `aplicar_jugada(d, a)`
+    /// devuelve el acumulador a su estado original, porque la actualizacion
+    /// incremental es simetrica respecto al intercambio antes/despues (lo
+    /// que se sumo con el tablero de "despues" se resta con el de "antes" y
+    /// viceversa). Eso permite usar mutacion in-place con undo en la
+    /// busqueda en vez de un clon por nodo hijo.
+    #[inline]
+    pub fn aplicar_jugada(&mut self, antes: &Board, despues: &Board) {
+        // `red` es &'static: copiarlo fuera evita el prestamo simultaneo de
+        // self mientras se muta primera_capa.
+        let red = self.red;
+        red.actualizar_amenazas_incremental(&mut self.primera_capa, antes, despues);
     }
 
     pub fn evaluar(&self) -> f32 {

@@ -214,6 +214,22 @@ impl AcumBullet {
     /// promocion sin necesitar el tipo de jugada.
     pub fn despues_de_jugada(&self, antes: &Board, despues: &Board) -> AcumBullet {
         let mut nuevo = self.clone();
+        nuevo.aplicar_jugada(antes, despues);
+        nuevo
+    }
+
+    /// Version in-place de `despues_de_jugada`. Es su propia inversa al
+    /// intercambiar los argumentos: `aplicar_jugada(d, a)` deshace
+    /// exactamente `aplicar_jugada(a, d)`, porque (1) las casillas que se
+    /// ocuparon pasan a ser las que se liberaron y viceversa, de modo que
+    /// cada `sumar` se compensa con su `restar` sobre la misma feature, y
+    /// (2) `negras_mueven` se recalcula desde el tablero destino. La
+    /// aritmetica es wrapping sobre i16, asi que sumar y restar son
+    /// inversos exactos incluso si hubiera desbordamiento.
+    #[inline]
+    pub fn aplicar_jugada(&mut self, antes: &Board, despues: &Board) {
+        let red = self.red;
+        let nuevo = self;
         nuevo.negras_mueven = despues.turn == Color::Black;
         for color in 0..2usize {
             for (pt_idx, &pt) in ALL_PIECE_TYPES.iter().enumerate() {
@@ -225,22 +241,17 @@ impl AcumBullet {
                 let mut anadidas = d & !a;
                 while anadidas != 0 {
                     let sq = crate::bitboard::pop_lsb(&mut anadidas) as usize;
-                    self.red
-                        .sumar(&mut nuevo.persp[0], feature(0, color, pt_idx, sq));
-                    self.red
-                        .sumar(&mut nuevo.persp[1], feature(1, color, pt_idx, sq));
+                    red.sumar(&mut nuevo.persp[0], feature(0, color, pt_idx, sq));
+                    red.sumar(&mut nuevo.persp[1], feature(1, color, pt_idx, sq));
                 }
                 let mut quitadas = a & !d;
                 while quitadas != 0 {
                     let sq = crate::bitboard::pop_lsb(&mut quitadas) as usize;
-                    self.red
-                        .restar(&mut nuevo.persp[0], feature(0, color, pt_idx, sq));
-                    self.red
-                        .restar(&mut nuevo.persp[1], feature(1, color, pt_idx, sq));
+                    red.restar(&mut nuevo.persp[0], feature(0, color, pt_idx, sq));
+                    red.restar(&mut nuevo.persp[1], feature(1, color, pt_idx, sq));
                 }
             }
         }
-        nuevo
     }
 
     /// Salida en centipeones desde la perspectiva del lado que mueve

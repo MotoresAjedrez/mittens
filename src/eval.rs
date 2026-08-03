@@ -815,27 +815,43 @@ impl ClassicalAccumulator {
     }
 }
 
+/// Estado incremental de evaluación que viaja por la recursión de la
+/// búsqueda (una copia por nodo).
+///
+/// El acumulador NNUE ya NO vive aquí: pesa 2-4 KB y copiarlo por nodo era
+/// el grueso del costo de crear un estado hijo. Ahora vive en el `Searcher`
+/// (buffer mutable propio del hilo) y se actualiza in-place con
+/// hacer/deshacer. Lo único que queda aquí de la NNUE es la bandera
+/// `nnue_activo`, que dice si ESTE nodo debe consultarla: cuando un nodo la
+/// desactiva, todos sus descendientes la heredan desactivada, así que en
+/// ese subárbol nadie lee ni toca el acumulador del Searcher.
 #[derive(Clone)]
 pub struct EvalState {
     classical: ClassicalAccumulator,
-    nnue: Option<crate::neural::NnueAccumulator>,
+    nnue_activo: bool,
 }
 
 pub fn crear_eval_state(b: &Board) -> EvalState {
     EvalState {
         classical: ClassicalAccumulator::desde_tablero(b),
-        nnue: crate::neural::crear_acumulador(b),
+        nnue_activo: true,
     }
 }
 
 impl EvalState {
+    /// True si este nodo consulta la NNUE. Invariante clave: si un nodo lo
+    /// tiene en false, todos sus descendientes también (ver
+    /// `despues_de_jugada`, que propaga la bandera, y
+    /// `despues_de_jugada_solo_clasica`, que solo puede apagarla).
+    #[inline]
+    pub fn nnue_activo(&self) -> bool {
+        self.nnue_activo
+    }
+
     pub fn despues_de_jugada(&self, antes: &Board, despues: &Board) -> EvalState {
         EvalState {
             classical: self.classical.despues_de_jugada(antes, despues),
-            nnue: self
-                .nnue
-                .as_ref()
-                .map(|acumulador| acumulador.despues_de_jugada(antes, despues)),
+            nnue_activo: self.nnue_activo,
         }
     }
 
@@ -846,7 +862,7 @@ impl EvalState {
     pub fn despues_de_jugada_solo_clasica(&self, antes: &Board, despues: &Board) -> EvalState {
         EvalState {
             classical: self.classical.despues_de_jugada(antes, despues),
-            nnue: None,
+            nnue_activo: false,
         }
     }
 }
@@ -1155,9 +1171,16 @@ pub fn evaluate_with_nnue(b: &Board, nnue: Option<&crate::neural::NnueAccumulato
     }
 }
 
-pub fn evaluate_with_state(b: &Board, state: &EvalState) -> i32 {
+/// `nnue` es el acumulador del `Searcher`, ya posicionado en `b`. Se ignora
+/// si este nodo tiene la NNUE desactivada (`state.nnue_activo == false`),
+/// porque en ese caso el acumulador no corresponde a `b`.
+pub fn evaluate_with_state(
+    b: &Board,
+    state: &EvalState,
+    nnue: Option<&crate::neural::NnueAccumulator>,
+) -> i32 {
     let clasica = evaluar_clasica(b, Some(&state.classical));
-    match state.nnue.as_ref() {
+    match nnue.filter(|_| state.nnue_activo) {
         Some(acumulador) => {
             let red = (acumulador.peso() * acumulador.evaluar() as f64).round() as i32;
             // En modo "red sola" la clasica se descarta por completo; se
@@ -1199,17 +1222,17 @@ mod incremental_tests {
             incremental.classical,
             ClassicalAccumulator::desde_tablero(&despues)
         );
-        assert!(solo_clasico.nnue.is_none());
+        assert!(!solo_clasico.nnue_activo());
         for personalidad in [Personalidad::Tal, Personalidad::Universal] {
             set_personalidad(personalidad);
             assert_eq!(
-                evaluate_with_state(&despues, &incremental),
+                evaluate_with_state(&despues, &incremental, None),
                 evaluate_with_nnue(&despues, None),
                 "cache clasico difiere de referencia para {uci} con {:?}",
                 personalidad
             );
             assert_eq!(
-                evaluate_with_state(&despues, &solo_clasico),
+                evaluate_with_state(&despues, &solo_clasico, None),
                 evaluate_with_nnue(&despues, None),
                 "estado solo clasico difiere de referencia para {uci} con {:?}",
                 personalidad
@@ -1278,7 +1301,7 @@ mod incremental_tests {
         let estado_null = estado_padre.despues_de_jugada(&padre, &null);
         assert_eq!(estado_null.classical, estado_padre.classical);
         assert_eq!(
-            evaluate_with_state(&null, &estado_null),
+            evaluate_with_state(&null, &estado_null, None),
             evaluate_with_nnue(&null, None)
         );
     }
@@ -1307,7 +1330,7 @@ mod incremental_tests {
                     mv.to_uci()
                 );
                 assert_eq!(
-                    evaluate_with_state(&siguiente, &estado_siguiente),
+                    evaluate_with_state(&siguiente, &estado_siguiente, None),
                     evaluate_with_nnue(&siguiente, None),
                     "score clasico difiere tras {}",
                     mv.to_uci()

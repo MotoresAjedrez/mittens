@@ -34,7 +34,11 @@ const MAX_PATH: usize = 512;
 const CONTEMPT_UMBRAL: i32 = 500;
 const CONTEMPT_PENALIZACION: i32 = 200;
 
-fn draw_score(b: &Board, eval_state: &EvalState) -> i32 {
+fn draw_score(
+    b: &Board,
+    eval_state: &EvalState,
+    nnue: Option<&crate::neural::NnueAccumulator>,
+) -> i32 {
     // Para decidir el signo del contempt en tablas (repeticion/regla de 50)
     // solo importa si la posicion esta CLARAMENTE ganada o perdida (fuera
     // del umbral de 500cp). La evaluacion clasica es mucho mas barata que la
@@ -46,7 +50,7 @@ fn draw_score(b: &Board, eval_state: &EvalState) -> i32 {
     } else if se_clasico < -CONTEMPT_UMBRAL {
         CONTEMPT_PENALIZACION
     } else {
-        let se = evaluate_with_state(b, eval_state);
+        let se = evaluate_with_state(b, eval_state, nnue);
         if se > CONTEMPT_UMBRAL {
             -CONTEMPT_PENALIZACION
         } else if se < -CONTEMPT_UMBRAL {
@@ -436,6 +440,12 @@ pub struct Searcher {
     // árbol conserva la mezcla completa; esta bandera solo existe para medir
     // si el coste del horizonte a relojes ultracortos devuelve Elo real.
     pub qsearch_nnue: bool,
+    // Acumulador NNUE del hilo. NO viaja dentro de EvalState (copiarlo por
+    // nodo hijo costaba 2-4 KB de memcpy por nodo): es un buffer mutable
+    // propio de este Searcher que se actualiza in-place al bajar a un hijo
+    // (`siguiente_estado_*`) y se deshace al volver (`salir_hijo`). Cada
+    // Searcher pertenece a un solo hilo, asi que no hay contencion.
+    nnue: Option<crate::neural::NnueAccumulator>,
     // Profundidad máxima en la que los hijos usan solo ClassicalAccumulator.
     // Cero conserva el comportamiento previo bit a bit. Es una puerta de
     // rendimiento experimental: evita construir deltas NNUE que ningún nodo
@@ -531,6 +541,7 @@ impl Searcher {
             modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
             modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() != Ok("0"),
             qsearch_nnue: true,
+            nnue: None,
             nnue_classical_depth: 0,
             game_history: Vec::new(),
             path: [0u64; MAX_PATH],
@@ -572,6 +583,7 @@ impl Searcher {
             modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
             modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() != Ok("0"),
             qsearch_nnue: true,
+            nnue: None,
             nnue_classical_depth: 0,
             game_history: Vec::new(),
             path: [0u64; MAX_PATH],
@@ -605,32 +617,93 @@ impl Searcher {
         self.nnue_classical_depth = depth.clamp(0, 4);
     }
 
+    /// Reinicia el acumulador NNUE del hilo a la posicion `b`. Se llama en
+    /// la raiz de cada iteracion de profundizacion: cuesta O(piezas) una vez
+    /// por iteracion y garantiza que un `TimeUp` que desenrolle la recursion
+    /// sin pasar por los `salir_hijo` no deje el buffer desincronizado.
+    #[inline]
+    fn reiniciar_nnue(&mut self, b: &Board) {
+        self.nnue = crate::neural::crear_acumulador(b);
+    }
+
+    /// Acumulador a consultar para `eval_state`. Devuelve None si este nodo
+    /// tiene la NNUE apagada: en ese caso el buffer del Searcher quedo
+    /// congelado en un ancestro y no corresponde al tablero actual.
+    #[inline]
+    fn nnue_de(&self, eval_state: &EvalState) -> Option<&crate::neural::NnueAccumulator> {
+        if eval_state.nnue_activo() {
+            self.nnue.as_ref()
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn evaluar_completo(&self, b: &Board, eval_state: &EvalState) -> i32 {
+        evaluate_with_state(b, eval_state, self.nnue_de(eval_state))
+    }
+
     #[inline]
     fn evaluar_quiescence(&self, b: &Board, eval_state: &EvalState) -> i32 {
         if self.qsearch_nnue {
-            evaluate_with_state(b, eval_state)
+            self.evaluar_completo(b, eval_state)
         } else {
             evaluate_classical_with_state(b, eval_state)
         }
     }
 
+    /// Baja al hijo: construye su EvalState y, si el hijo conserva la NNUE,
+    /// APLICA el delta in-place sobre el acumulador del Searcher. Todo
+    /// llamador DEBE emparejarlo con `salir_hijo` (mismos argumentos) antes
+    /// de volver o de romper el bucle.
     #[inline]
-    fn siguiente_estado_quiescence(
-        &self,
-        eval_state: &EvalState,
+    fn entrar_hijo(
+        &mut self,
+        hijo: EvalState,
         antes: &Board,
         despues: &Board,
     ) -> EvalState {
-        if self.qsearch_nnue {
-            eval_state.despues_de_jugada(antes, despues)
-        } else {
-            eval_state.despues_de_jugada_solo_clasica(antes, despues)
+        // Si el hijo apaga la NNUE, no se toca el acumulador: nadie en ese
+        // subarbol lo va a leer (la bandera se hereda apagada), y asi el
+        // undo tampoco tiene nada que hacer.
+        if hijo.nnue_activo() {
+            if let Some(acum) = self.nnue.as_mut() {
+                acum.aplicar_jugada(antes, despues);
+            }
+        }
+        hijo
+    }
+
+    /// Deshace exactamente lo que hizo `entrar_hijo`, invirtiendo los
+    /// argumentos (la actualizacion incremental es simetrica: aplicarla con
+    /// antes/despues intercambiados es su operacion inversa).
+    #[inline]
+    fn salir_hijo(&mut self, hijo: &EvalState, antes: &Board, despues: &Board) {
+        if hijo.nnue_activo() {
+            if let Some(acum) = self.nnue.as_mut() {
+                acum.aplicar_jugada(despues, antes);
+            }
         }
     }
 
     #[inline]
+    fn siguiente_estado_quiescence(
+        &mut self,
+        eval_state: &EvalState,
+        antes: &Board,
+        despues: &Board,
+    ) -> EvalState {
+        let hijo = if self.qsearch_nnue {
+            eval_state.despues_de_jugada(antes, despues)
+        } else {
+            eval_state.despues_de_jugada_solo_clasica(antes, despues)
+        };
+        self.entrar_hijo(hijo, antes, despues)
+    }
+
+    #[inline]
     fn siguiente_estado_busqueda(
-        &self,
+        &mut self,
         eval_state: &EvalState,
         antes: &Board,
         despues: &Board,
@@ -639,14 +712,15 @@ impl Searcher {
         // No soltar NNUE si la jugada deja al rival en jaque: negamax le
         // concede una extensión, por lo que ya no es realmente un nodo
         // superficial. Esto conserva la táctica forzada en el borde.
-        if self.nnue_classical_depth > 0
+        let hijo = if self.nnue_classical_depth > 0
             && profundidad_hijo <= self.nnue_classical_depth
             && !despues.in_check(despues.turn)
         {
             eval_state.despues_de_jugada_solo_clasica(antes, despues)
         } else {
             eval_state.despues_de_jugada(antes, despues)
-        }
+        };
+        self.entrar_hijo(hijo, antes, despues)
     }
 
     pub fn clear_hash(&mut self) {
@@ -1019,7 +1093,7 @@ impl Searcher {
         // Quiescence también puede cruzar una secuencia de 50 plies sin
         // captura ni peón. No usar el stand-pat allí: por regla es tablas.
         if b.halfmove_clock >= 100 {
-            return Ok(draw_score(b, eval_state));
+            return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
         }
         let en_jaque = b.in_check(b.turn);
 
@@ -1041,7 +1115,12 @@ impl Searcher {
             for mv in evasiones {
                 let next = b.make_move(&mv);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
-                let sc = -self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1)?;
+                // Ligar el resultado ANTES de deshacer, y recien despues
+                // aplicar el `?`: asi ningun retorno temprano se salta el
+                // undo del acumulador NNUE.
+                let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1);
+                self.salir_hijo(&next_eval, b, &next);
+                let sc = -res?;
                 best = best.max(sc);
                 alpha = alpha.max(sc);
                 if alpha >= beta {
@@ -1105,7 +1184,9 @@ impl Searcher {
             }
 
             let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
-            let sc = -self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1)?;
+            let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1);
+            self.salir_hijo(&next_eval, b, &next);
+            let sc = -res?;
             best = best.max(sc);
             alpha = alpha.max(sc);
             if alpha >= beta {
@@ -1140,7 +1221,7 @@ impl Searcher {
         self.check_time()?;
 
         if b.halfmove_clock >= 100 {
-            return Ok(draw_score(b, eval_state));
+            return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
         }
 
         // Repeticion: si esta posicion ya aparecio entre los ancestros
@@ -1155,7 +1236,7 @@ impl Searcher {
         if hc > 0 {
             let start = self.path_len.saturating_sub(hc);
             if self.path[start..self.path_len].contains(&b.zobrist) {
-                return Ok(draw_score(b, eval_state));
+                return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
             }
         }
 
@@ -1191,7 +1272,7 @@ impl Searcher {
         let p = ply as usize;
         if !en_jaque && p > 0 && p < MAX_KILLER_PLY && self.hindsight_reduction[p] > 0 {
             let eval_actual =
-                *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
+                *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let eval_delta = eval_actual + self.hindsight_parent_eval[p - 1];
             if eval_delta < 0 {
                 depth += 1;
@@ -1264,7 +1345,7 @@ impl Searcher {
             self.eval_stack[p] = if en_jaque {
                 EVAL_INVALIDA
             } else {
-                *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state))
+                *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state))
             };
         }
         let improving = !en_jaque && p >= 2 && p < MAX_KILLER_PLY && {
@@ -1276,7 +1357,7 @@ impl Searcher {
         const RFP_MARGEN_POR_PLY: i32 = 120;
         if !en_jaque && !es_pv && depth <= RFP_PROF_MAX && beta.abs() < MATE - 1000 {
             let raw =
-                *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
+                *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let static_eval = self.eval_corregida(b, raw, prev);
             // improving: con mejora el margen se achica (poda mas agresivo);
             // sin mejora se agranda (mas conservador, poda menos).
@@ -1298,7 +1379,7 @@ impl Searcher {
         const RAZOR_MARGEN_POR_PLY: i32 = 180;
         if !en_jaque && !es_pv && depth <= RAZOR_PROF_MAX && alpha.abs() < MATE - 1000 {
             let raw =
-                *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
+                *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let static_eval = self.eval_corregida(b, raw, prev);
             // improving: con mejora el margen se achica; sin mejora se agranda
             // (mas conservador, se razorea menos).
@@ -1357,7 +1438,7 @@ impl Searcher {
             && !solo_peones_y_rey(b, b.turn)
         {
             let raw =
-                *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
+                *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let eval_nmp = self.eval_corregida(b, raw, prev);
             if eval_nmp >= beta {
                 let r_eval = ((eval_nmp - beta) / NULL_MOVE_EVAL_DIV).min(NULL_MOVE_EVAL_MAX);
@@ -1372,7 +1453,7 @@ impl Searcher {
                 if child_ply < MAX_KILLER_PLY {
                     self.hindsight_reduction[child_ply] = 0;
                 }
-                let sc_null = -self.negamax(
+                let res_null = self.negamax(
                     &next,
                     &next_eval,
                     depth - 1 - r,
@@ -1382,7 +1463,9 @@ impl Searcher {
                     None,
                     None,
                     en_sondeo_se,
-                )?;
+                );
+                self.salir_hijo(&next_eval, b, &next);
+                let sc_null = -res_null?;
                 if sc_null >= beta {
                     return Ok(if sc_null >= MATE - 1000 { beta } else { sc_null });
                 }
@@ -1415,9 +1498,18 @@ impl Searcher {
                     continue;
                 }
                 let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, sdepth);
-                let sc_rapido =
-                    -self.quiescence(&next, &next_eval, -probcut_beta, -probcut_beta + 1, ply + 1)?;
+                let res_rapido =
+                    self.quiescence(&next, &next_eval, -probcut_beta, -probcut_beta + 1, ply + 1);
+                let sc_rapido = match res_rapido {
+                    Ok(v) => -v,
+                    Err(e) => {
+                        self.salir_hijo(&next_eval, b, &next);
+                        return Err(e);
+                    }
+                };
                 if sc_rapido < probcut_beta {
+                    // `continue` tambien sale del hijo: hay que deshacer.
+                    self.salir_hijo(&next_eval, b, &next);
                     continue;
                 }
                 let pt_mv2 = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
@@ -1427,7 +1519,7 @@ impl Searcher {
                 if child_ply < MAX_KILLER_PLY {
                     self.hindsight_reduction[child_ply] = 0;
                 }
-                let sc_confirmado = -self.negamax(
+                let res_confirmado = self.negamax(
                     &next,
                     &next_eval,
                     sdepth,
@@ -1437,7 +1529,9 @@ impl Searcher {
                     Some((pt_mv2, mv.to as usize)),
                     prev,
                     en_sondeo_se,
-                )?;
+                );
+                self.salir_hijo(&next_eval, b, &next);
+                let sc_confirmado = -res_confirmado?;
                 if sc_confirmado >= probcut_beta {
                     probcut_corto = true;
                     probcut_score = sc_confirmado;
@@ -1521,7 +1615,7 @@ impl Searcher {
                         if child_ply < MAX_KILLER_PLY {
                             self.hindsight_reduction[child_ply] = 0;
                         }
-                        match self.negamax(
+                        let res_se = self.negamax(
                             &next,
                             &next_eval,
                             sdepth,
@@ -1531,7 +1625,11 @@ impl Searcher {
                             None,
                             None,
                             true,
-                        ) {
+                        );
+                        // Deshacer ANTES del match: los dos brazos pueden
+                        // romper el bucle.
+                        self.salir_hijo(&next_eval, b, &next);
+                        match res_se {
                             Ok(v) => {
                                 let sc = -v;
                                 if sc > mejor_otra {
@@ -1620,7 +1718,7 @@ impl Searcher {
             {
                 let ev = *fut_eval.get_or_insert_with(|| {
                     let raw =
-                        *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state));
+                        *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
                     self.eval_corregida(b, raw, prev)
                 });
                 // improving: con mejora el margen de futilidad se achica -- se
@@ -1711,7 +1809,10 @@ impl Searcher {
             // completa, no la reducida: si falla alto no debe heredar una
             // evaluación clásica donde aún se requiere la NNUE.
             let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, depth - 1 + ext);
-            let sc = if es_reducible && !next.in_check(next.turn) {
+            // Se calcula el resultado como Result SIN aplicar `?` todavia:
+            // el undo del acumulador NNUE tiene que correr en todos los
+            // caminos, incluido el corte por tiempo.
+            let sc_res: Result<i32, TimeUp> = if es_reducible && !next.in_check(next.turn) {
                 self.lmr_intentos += 1;
                 // Reduccion tablada + ajustes contextuales (PV / historia /
                 // improving / capturas con SEE malo). Nunca menos de 1 ply
@@ -1739,7 +1840,7 @@ impl Searcher {
                 let child_ply = (ply + 1) as usize;
                 if child_ply < MAX_KILLER_PLY {
                     self.hindsight_parent_eval[ply as usize] = *fut_eval.get_or_insert_with(|| {
-                        *static_eval_cache.get_or_insert_with(|| evaluate_with_state(b, eval_state))
+                        *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state))
                     });
                     self.hindsight_reduction[child_ply] = r;
                 }
@@ -1748,7 +1849,7 @@ impl Searcher {
                 // cuanto mejor. Es un bound, no un valor exacto: si supera
                 // alfa, no se confia en el numero, se re-busca a profundidad
                 // Y ventana completas para obtener el valor real.
-                let sondeo = -self.negamax(
+                match self.negamax(
                     &next,
                     &next_eval,
                     depth - 1 + ext - r,
@@ -1758,25 +1859,31 @@ impl Searcher {
                     child_prev,
                     child_prev2,
                     en_sondeo_se,
-                )?;
-                if sondeo > alpha {
-                    self.lmr_reintentos += 1;
-                    if child_ply < MAX_KILLER_PLY {
-                        self.hindsight_reduction[child_ply] = 0;
+                ) {
+                    Err(e) => Err(e),
+                    Ok(v) => {
+                        let sondeo = -v;
+                        if sondeo > alpha {
+                            self.lmr_reintentos += 1;
+                            if child_ply < MAX_KILLER_PLY {
+                                self.hindsight_reduction[child_ply] = 0;
+                            }
+                            self.negamax(
+                                &next,
+                                &next_eval,
+                                depth - 1 + ext,
+                                -beta,
+                                -alpha,
+                                ply + 1,
+                                child_prev,
+                                child_prev2,
+                                en_sondeo_se,
+                            )
+                            .map(|v2| -v2)
+                        } else {
+                            Ok(sondeo)
+                        }
                     }
-                    -self.negamax(
-                        &next,
-                        &next_eval,
-                        depth - 1 + ext,
-                        -beta,
-                        -alpha,
-                        ply + 1,
-                        child_prev,
-                        child_prev2,
-                        en_sondeo_se,
-                    )?
-                } else {
-                    sondeo
                 }
             } else {
                 let child_ply = (ply + 1) as usize;
@@ -1789,7 +1896,7 @@ impl Searcher {
                 // un cutoff beta. Esto conserva el resultado de alfa-beta y
                 // reduce nodos en posiciones con buen ordenamiento.
                 if idx == 0 {
-                    -self.negamax(
+                    self.negamax(
                         &next,
                         &next_eval,
                         depth - 1 + ext,
@@ -1799,9 +1906,10 @@ impl Searcher {
                         child_prev,
                         child_prev2,
                         en_sondeo_se,
-                    )?
+                    )
+                    .map(|v| -v)
                 } else {
-                    let sondeo = -self.negamax(
+                    match self.negamax(
                         &next,
                         &next_eval,
                         depth - 1 + ext,
@@ -1811,24 +1919,32 @@ impl Searcher {
                         child_prev,
                         child_prev2,
                         en_sondeo_se,
-                    )?;
-                    if sondeo > alpha && sondeo < beta {
-                        -self.negamax(
-                            &next,
-                            &next_eval,
-                            depth - 1 + ext,
-                            -beta,
-                            -alpha,
-                            ply + 1,
-                            child_prev,
-                            child_prev2,
-                            en_sondeo_se,
-                        )?
-                    } else {
-                        sondeo
+                    ) {
+                        Err(e) => Err(e),
+                        Ok(v) => {
+                            let sondeo = -v;
+                            if sondeo > alpha && sondeo < beta {
+                                self.negamax(
+                                    &next,
+                                    &next_eval,
+                                    depth - 1 + ext,
+                                    -beta,
+                                    -alpha,
+                                    ply + 1,
+                                    child_prev,
+                                    child_prev2,
+                                    en_sondeo_se,
+                                )
+                                .map(|v2| -v2)
+                            } else {
+                                Ok(sondeo)
+                            }
+                        }
                     }
                 }
             };
+            self.salir_hijo(&next_eval, b, &next);
+            let sc = sc_res?;
 
             if sc > best_score {
                 best_score = sc;
@@ -1880,7 +1996,7 @@ impl Searcher {
         // lejos de mates, donde la eval estatica no es comparable.
         if !en_jaque && best_score.abs() < MATE - 1000 && best_move.is_some() {
             let se = *static_eval_cache
-                .get_or_insert_with(|| evaluate_with_state(b, eval_state));
+                .get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let coherente = match flag {
                 TTFlag::Exact => true,
                 TTFlag::Beta => best_score > se,
@@ -1905,9 +2021,16 @@ impl Searcher {
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         { let n = self.game_history.len().min(MAX_PATH); self.path[..n].copy_from_slice(&self.game_history[..n]); self.path_len = n; }
         let root_eval = crear_eval_state(b);
+        // El acumulador NNUE del hilo se ancla a la raiz. Dentro del arbol
+        // se muta in-place y se deshace al volver; ademas se re-ancla en
+        // cada iteracion de profundizacion (ver reiniciar_nnue mas abajo)
+        // para que un corte por tiempo que desenrolle la recursion no pueda
+        // dejarlo desincronizado en la iteracion siguiente.
+        self.reiniciar_nnue(b);
         let mut mejor_mv = None;
         let mut mejor_sc: i32 = -INFINITO;
         for d in 1..=depth {
+            self.reiniciar_nnue(b);
             let mut moves = generate_legal(b);
             if moves.is_empty() {
                 break;
@@ -1943,7 +2066,7 @@ impl Searcher {
                     let next_eval = self.siguiente_estado_busqueda(&root_eval, b, &next, d - 1);
                     let sondeo_alpha = if idx == 0 { -vent_beta } else { -alpha - 1 };
                     let sondeo_beta = -alpha;
-                    let sondeo = match self.negamax(
+                    let res_sondeo = self.negamax(
                         &next,
                         &next_eval,
                         d - 1,
@@ -1953,15 +2076,17 @@ impl Searcher {
                         Some((pt_mv, mv.to as usize)),
                         None,
                         false,
-                    ) {
+                    );
+                    let sondeo = match res_sondeo {
                         Ok(v) => -v,
                         Err(_) => {
+                            self.salir_hijo(&next_eval, b, &next);
                             interrumpido = true;
                             break;
                         }
                     };
                     let sc = if idx > 0 && sondeo > alpha && sondeo < vent_beta {
-                        match self.negamax(
+                        let res_full = self.negamax(
                             &next,
                             &next_eval,
                             d - 1,
@@ -1971,9 +2096,11 @@ impl Searcher {
                             Some((pt_mv, mv.to as usize)),
                             None,
                             false,
-                        ) {
+                        );
+                        match res_full {
                             Ok(v) => -v,
                             Err(_) => {
+                                self.salir_hijo(&next_eval, b, &next);
                                 interrumpido = true;
                                 break;
                             }
@@ -1981,6 +2108,7 @@ impl Searcher {
                     } else {
                         sondeo
                     };
+                    self.salir_hijo(&next_eval, b, &next);
                     if sc > actual_sc {
                         actual_sc = sc;
                         actual_mv = *mv;
@@ -2033,6 +2161,12 @@ impl Searcher {
         self.decaer_history();
         { let n = self.game_history.len().min(MAX_PATH); self.path[..n].copy_from_slice(&self.game_history[..n]); self.path_len = n; }
         let root_eval = crear_eval_state(b);
+        // El acumulador NNUE del hilo se ancla a la raiz. Dentro del arbol
+        // se muta in-place y se deshace al volver; ademas se re-ancla en
+        // cada iteracion de profundizacion (ver reiniciar_nnue mas abajo)
+        // para que un corte por tiempo que desenrolle la recursion no pueda
+        // dejarlo desincronizado en la iteracion siguiente.
+        self.reiniciar_nnue(b);
 
         // Libro de aperturas: se consulta para CUALQUIER turno (blancas o
         // negras -- la clave Polyglot ya codifica de quien es el turno), no
@@ -2081,7 +2215,7 @@ impl Searcher {
             None => generate_legal(b).into_iter().next(),
         };
         let mut mejor_mv: Option<Move> = fallback;
-        let mut mejor_sc: i32 = evaluate_with_state(b, &root_eval);
+        let mut mejor_sc: i32 = self.evaluar_completo(b, &root_eval);
         let mut mejor_prof = 0;
         // Time management avanzado: cuantas iteraciones SEGUIDAS la mejor
         // jugada de la raiz no cambio. Un PV estable es senal de que la
@@ -2091,6 +2225,7 @@ impl Searcher {
         let mut pv_estable: u32 = 0;
 
         for d in 1..=max_depth {
+            self.reiniciar_nnue(b);
             let mut moves = generate_legal(b);
             if let Some(filtro) = &self.root_moves_filtro {
                 moves.retain(|m| filtro.contains(m));
@@ -2137,7 +2272,7 @@ impl Searcher {
                     let next_eval = self.siguiente_estado_busqueda(&root_eval, b, &next, d - 1);
                     let sondeo_alpha = if idx == 0 { -vent_beta } else { -alpha - 1 };
                     let sondeo_beta = -alpha;
-                    let sondeo = match self.negamax(
+                    let res_sondeo = self.negamax(
                         &next,
                         &next_eval,
                         d - 1,
@@ -2147,15 +2282,17 @@ impl Searcher {
                         Some((pt_mv, mv.to as usize)),
                         None,
                         false,
-                    ) {
+                    );
+                    let sondeo = match res_sondeo {
                         Ok(v) => -v,
                         Err(_) => {
+                            self.salir_hijo(&next_eval, b, &next);
                             timed_out = true;
                             break;
                         }
                     };
                     let sc = if idx > 0 && sondeo > alpha && sondeo < vent_beta {
-                        match self.negamax(
+                        let res_full = self.negamax(
                             &next,
                             &next_eval,
                             d - 1,
@@ -2165,9 +2302,11 @@ impl Searcher {
                             Some((pt_mv, mv.to as usize)),
                             None,
                             false,
-                        ) {
+                        );
+                        match res_full {
                             Ok(v) => -v,
                             Err(_) => {
+                                self.salir_hijo(&next_eval, b, &next);
                                 timed_out = true;
                                 break;
                             }
@@ -2175,6 +2314,7 @@ impl Searcher {
                     } else {
                         sondeo
                     };
+                    self.salir_hijo(&next_eval, b, &next);
                     if sc > actual_sc {
                         actual_sc = sc;
                         actual_mv = *mv;
@@ -2465,7 +2605,7 @@ mod regression_tests {
         assert_eq!(
             s.quiescence(&b, &eval_state, -INFINITO, INFINITO, 0)
                 .unwrap(),
-            draw_score(&b, &eval_state)
+            draw_score(&b, &eval_state, None)
         );
     }
 
