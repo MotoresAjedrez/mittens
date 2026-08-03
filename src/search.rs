@@ -222,6 +222,75 @@ fn casilla_amenazada(b: &Board, sq: crate::types::Square) -> bool {
     b.is_square_attacked_by(sq, b.turn.opposite())
 }
 
+/// ¿La jugada `mv` da jaque al rey rival? Equivalente exacto a
+/// `b.make_move(mv).in_check(b.turn.opposite())`, pero SIN copiar el tablero
+/// completo (~144 bytes): solo se arma la ocupacion post-jugada (u64) y el
+/// arreglo de piezas propias (48 bytes) que necesitan los lookups de ataque,
+/// y se replica `is_square_attacked_by` sobre esa posicion virtual. En la
+/// busqueda negamax los guardas de poda (futility, LMP, SEE-prune) solo
+/// quieren saber si la jugada da jaque ANTES de descartarla; antes cada uno
+/// hacía su propio `b.make_move(mv)` para consultar eso (hasta 3 copias de
+/// 144 bytes por jugada en los nodos poco profundos, que son la mayoria del
+/// arbol). Maneja capturas, al paso, enroque y promociones.
+#[inline]
+fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
+    use crate::bitboard::{
+        bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, rook_attacks,
+    };
+    use crate::types::{Color, file_of, make_square, rank_of};
+
+    let us = b.turn;
+    let them = us.opposite();
+    let ksq = b.king_square(them);
+    let (_, pt) = b
+        .piece_at(mv.from)
+        .expect("da_jaque_sin_copiar: no hay pieza en 'from'");
+    let pieza_final = mv.promotion.unwrap_or(pt);
+
+    // Posicion virtual post-jugada: ocupacion + piezas propias ajustadas.
+    let mut occ = (b.occupied & !bit(mv.from)) | bit(mv.to);
+    let mut piezas = b.pieces[us as usize];
+    piezas[pt as usize] &= !bit(mv.from);
+    piezas[pieza_final as usize] |= bit(mv.to);
+    if mv.flag == MoveFlag::EnPassant {
+        let ep = make_square(file_of(mv.to), rank_of(mv.from));
+        occ &= !bit(ep);
+        piezas[PieceType::Pawn as usize] &= !bit(ep);
+    }
+    let (rf, rt) = match (mv.flag, us) {
+        (MoveFlag::CastleKing, Color::White) => (make_square(7, 0), make_square(5, 0)),
+        (MoveFlag::CastleKing, Color::Black) => (make_square(7, 7), make_square(5, 7)),
+        (MoveFlag::CastleQueen, Color::White) => (make_square(0, 0), make_square(3, 0)),
+        (MoveFlag::CastleQueen, Color::Black) => (make_square(0, 7), make_square(3, 7)),
+        _ => (0, 0),
+    };
+    if mv.flag == MoveFlag::CastleKing || mv.flag == MoveFlag::CastleQueen {
+        occ = (occ & !bit(rf)) | bit(rt);
+        piezas[PieceType::Rook as usize] &= !bit(rf);
+        piezas[PieceType::Rook as usize] |= bit(rt);
+    }
+
+    // Misma logica que Board::is_square_attacked_by(ksq, us).
+    if pawn_attacks(them, ksq) & piezas[PieceType::Pawn as usize] != 0 {
+        return true;
+    }
+    if knight_attacks(ksq) & piezas[PieceType::Knight as usize] != 0 {
+        return true;
+    }
+    if king_attacks(ksq) & piezas[PieceType::King as usize] != 0 {
+        return true;
+    }
+    let alfil_dama = piezas[PieceType::Bishop as usize] | piezas[PieceType::Queen as usize];
+    if alfil_dama != 0 && bishop_attacks(ksq, occ) & alfil_dama != 0 {
+        return true;
+    }
+    let torre_dama = piezas[PieceType::Rook as usize] | piezas[PieceType::Queen as usize];
+    if torre_dama != 0 && rook_attacks(ksq, occ) & torre_dama != 0 {
+        return true;
+    }
+    false
+}
+
 // TT compartida entre hilos (Lazy SMP): LOCKLESS de verdad, sin Mutex.
 // Motivacion (analisis comparativo contra Reckless, motor top-3 CCRL): su TT
 // son clusters lockless de pocos bytes por entrada; la nuestra era un
@@ -1741,6 +1810,15 @@ impl Searcher {
                 && !mv.is_capture()
                 && mv.promotion.is_none();
 
+            // Cache de "¿la jugada da jaque?" para los 3 guardas de poda de
+            // abajo (futility, LMP, SEE-prune): se calcula UNA sola vez por
+            // jugada (la primera guarda que lo necesita) con una funcion que
+            // NO copia el tablero completo, y se reutiliza en las otras dos.
+            // Antes cada guarda hacia su propio `b.make_move(mv)` solo para
+            // consultar el jaque: hasta 3 copias de 144 bytes por jugada en
+            // los nodos poco profundos, que son la mayoria del arbol.
+            let mut da_jaque: Option<bool> = None;
+
             if !en_jaque
                 && depth <= FUT_PROF_MAX
                 && idx > 0
@@ -1763,8 +1841,7 @@ impl Searcher {
                     FUT_MARGEN_POR_PLY
                 };
                 if ev + FUT_MARGEN_BASE + margen_ply * depth <= alpha {
-                    let next_probe = b.make_move(mv);
-                    if !next_probe.in_check(next_probe.turn) {
+                    if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
                         continue;
                     }
                 }
@@ -1794,8 +1871,7 @@ impl Searcher {
                 && beta.abs() < MATE - 1000
                 && idx >= lmp_umbral
             {
-                let next_probe = b.make_move(mv);
-                if !next_probe.in_check(next_probe.turn) {
+                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
                     continue;
                 }
             }
@@ -1819,8 +1895,7 @@ impl Searcher {
                 && beta.abs() < MATE - 1000
                 && crate::see::see(b, mv) < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
             {
-                let next_probe = b.make_move(mv);
-                if !next_probe.in_check(next_probe.turn) {
+                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
                     continue;
                 }
             }
