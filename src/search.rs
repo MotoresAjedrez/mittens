@@ -10,7 +10,7 @@ use crate::eval::{
 use crate::movegen::{MAX_MOVES, generate_captures_legal, generate_legal};
 use crate::types::{Move, MoveFlag, PieceType};
 use arrayvec::ArrayVec;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -615,6 +615,18 @@ impl Searcher {
 
     pub fn set_nnue_classical_depth(&mut self, depth: i32) {
         self.nnue_classical_depth = depth.clamp(0, 4);
+    }
+
+    /// Siembra la generacion de aging de la TT (camino Lazy SMP). Todos los
+    /// hilos de una misma llamada a `buscar_lazy_smp` usan la MISMA
+    /// generacion compartida, que avanza UNA vez por llamada -- sin esto cada
+    /// Searcher arrancaba en 0 y `search_time` la subia a 1 siempre, dejando
+    /// TODA busqueda SMP en generacion 1 y matando el aging de la TT
+    /// compartida (que si persiste entre jugadas). El camino single-thread
+    /// (Searcher persistente) no la necesita: `search_time` ya la incrementa
+    /// en cada "go".
+    pub fn set_tt_generacion(&mut self, generacion: u8) {
+        self.tt_generation = generacion & 0x1F;
     }
 
     /// Reinicia el acumulador NNUE del hilo a la posicion `b`. Se llama en
@@ -2010,6 +2022,24 @@ impl Searcher {
         Ok(best_score)
     }
 
+    /// Detecta si la posicion raiz YA es tablas reclamables ANTES de buscar
+    /// (BUG 2): repeticion (la posicion actual ya aparecio entre los ancestros
+    /// de la partida real dentro de la ventana de halfmove, mismo criterio que
+    /// negamax) o regla de 50 jugadas. Requiere que `path` ya este poblado
+    /// desde `game_history` (lo hacen search_fixed_depth y search_time justo
+    /// antes de llamar).
+    fn posicion_raiz_tablas(&self, b: &Board) -> bool {
+        if b.halfmove_clock >= 100 {
+            return true;
+        }
+        let hc = b.halfmove_clock as usize;
+        if hc > 0 {
+            let start = self.path_len.saturating_sub(hc);
+            return self.path[start..self.path_len].contains(&b.zobrist);
+        }
+        false
+    }
+
     /// Busqueda con profundidad fija (para benchmarks/tests, sin limite de tiempo).
     pub fn search_fixed_depth(&mut self, b: &Board, depth: i32) -> (Option<Move>, i32, u64) {
         self.nodes = 0;
@@ -2019,7 +2049,13 @@ impl Searcher {
         // "viejas" y seran las primeras candidatas a reemplazo (aging).
         self.tt_generation = (self.tt_generation + 1) & 0x1F;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
-        { let n = self.game_history.len().min(MAX_PATH); self.path[..n].copy_from_slice(&self.game_history[..n]); self.path_len = n; }
+        // Truncamiento del historial de la partida (BUG 1): conservar los
+        // ULTIMOS MAX_PATH elementos (los mas recientes), no los primeros --
+        // en partidas largas (>512 jugadas) los recientes son los unicos
+        // relevantes para la deteccion de repeticion. Los indices de path
+        // son relativos al segmento copiado, asi que path_push y la ventana
+        // de halfmove de negamax siguen funcionando igual.
+        { let n = self.game_history.len().min(MAX_PATH); let ini = self.game_history.len() - n; self.path[..n].copy_from_slice(&self.game_history[ini..]); self.path_len = n; }
         let root_eval = crear_eval_state(b);
         // El acumulador NNUE del hilo se ancla a la raiz. Dentro del arbol
         // se muta in-place y se deshace al volver; ademas se re-ancla en
@@ -2027,6 +2063,13 @@ impl Searcher {
         // para que un corte por tiempo que desenrolle la recursion no pueda
         // dejarlo desincronizado en la iteracion siguiente.
         self.reiniciar_nnue(b);
+        // BUG 2 (fix): si la posicion raiz YA es tablas reclamables
+        // (repeticion o regla de 50), reportarla de inmediato con el score
+        // de tablas en vez de dejar que la profundizacion iterativa devuelva
+        // un score/PV no-cero incorrecto. Mismo criterio que negamax.
+        if self.posicion_raiz_tablas(b) {
+            return (None, draw_score(b, &root_eval, self.nnue_de(&root_eval)), 0);
+        }
         let mut mejor_mv = None;
         let mut mejor_sc: i32 = -INFINITO;
         for d in 1..=depth {
@@ -2159,7 +2202,11 @@ impl Searcher {
         self.tt_generation = (self.tt_generation + 1) & 0x1F;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.decaer_history();
-        { let n = self.game_history.len().min(MAX_PATH); self.path[..n].copy_from_slice(&self.game_history[..n]); self.path_len = n; }
+        // Truncamiento del historial de la partida (BUG 1): conservar los
+        // ULTIMOS MAX_PATH elementos (los mas recientes), no los primeros --
+        // solo ellos importan para la deteccion de repeticion en partidas
+        // largas. Los indices de path son relativos al segmento copiado.
+        { let n = self.game_history.len().min(MAX_PATH); let ini = self.game_history.len() - n; self.path[..n].copy_from_slice(&self.game_history[ini..]); self.path_len = n; }
         let root_eval = crear_eval_state(b);
         // El acumulador NNUE del hilo se ancla a la raiz. Dentro del arbol
         // se muta in-place y se deshace al volver; ademas se re-ancla en
@@ -2167,6 +2214,15 @@ impl Searcher {
         // para que un corte por tiempo que desenrolle la recursion no pueda
         // dejarlo desincronizado en la iteracion siguiente.
         self.reiniciar_nnue(b);
+        // BUG 2 (fix): si la posicion raiz YA es tablas reclamables
+        // (repeticion o regla de 50), reportarla de inmediato con el score
+        // de tablas en vez de dejar que la busqueda devuelva un score/PV
+        // incorrecto. Va ANTES del libro y de la tabla de finales: un
+        // reclamo de tablas por repeticion es un hecho de la partida, no
+        // una decision de apertura/final.
+        if self.posicion_raiz_tablas(b) {
+            return (None, draw_score(b, &root_eval, self.nnue_de(&root_eval)), 0);
+        }
 
         // Libro de aperturas: se consulta para CUALQUIER turno (blancas o
         // negras -- la clave Polyglot ya codifica de quien es el turno), no
@@ -2431,6 +2487,7 @@ pub fn buscar_lazy_smp(
     max_depth: i32,
     n_hilos: usize,
     tt: &Arc<SharedTT>,
+    generacion_compartida: &AtomicU8,
     tt_mask: usize,
     modo_lmr: bool,
     qsearch_nnue: bool,
@@ -2439,8 +2496,16 @@ pub fn buscar_lazy_smp(
     external_stop: Arc<AtomicBool>,
     root_moves_filtro: Option<Vec<Move>>,
 ) -> (Option<Move>, i32, u64, Vec<ResultadoHilo>) {
+    // Aging compartido de la TT (ver set_tt_generacion): el contador vive en
+    // el llamador (junto a smp_tt, que persiste entre jugadas) y avanza UNA
+    // vez por llamada. Todos los hilos de esta llamada se siembran con el
+    // MISMO valor, asi que las entradas que escriben llevan una generacion
+    // DISTINTA a la de jugadas anteriores y la regla de reemplazo de tt_store
+    // puede expulsarlas de inmediato (aging vivo en Lazy SMP).
+    let generacion = generacion_compartida.fetch_add(1, Ordering::Relaxed) & 0x1F;
     if n_hilos <= 1 {
         let mut s = Searcher::new_con_tt_compartida(Arc::clone(tt), tt_mask, modo_lmr);
+        s.set_tt_generacion(generacion);
         s.set_qsearch_nnue(qsearch_nnue);
         s.set_nnue_classical_depth(nnue_classical_depth);
         s.set_external_stop(Some(external_stop));
@@ -2471,6 +2536,7 @@ pub fn buscar_lazy_smp(
             let root_moves_filtro = root_moves_filtro.clone();
             std::thread::spawn(move || {
                 let mut s = Searcher::new_con_tt_compartida(tt, tt_mask, modo_lmr);
+                s.set_tt_generacion(generacion);
                 s.set_qsearch_nnue(qsearch_nnue);
                 s.set_nnue_classical_depth(nnue_classical_depth);
                 s.root_moves_filtro = root_moves_filtro;
@@ -2642,5 +2708,95 @@ mod regression_tests {
             score
         );
         assert!(nodes > 0, "Debe visitar algun nodo");
+    }
+
+    // BUG confirmado de aging en Lazy SMP: cada llamada a buscar_lazy_smp
+    // creaba Searchers NUEVOS con tt_generation 0 y search_time la subia UNA
+    // sola vez a 1. Como la TT compartida persiste entre jugadas pero el
+    // contador no, TODA busqueda SMP quedaba en generacion 1 y el aging
+    // jamas expulsaba entradas de jugadas anteriores. El fix pasa un contador
+    // COMPARTIDO (AtomicU8 que vive junto a smp_tt en el llamador) que avanza
+    // una vez por llamada y siembra todos los hilos con el mismo valor: dos
+    // llamadas sucesivas deben escribir entradas con generaciones DISTINTAS.
+    #[test]
+    fn smp_tt_generacion_compartida_avanza_entre_llamadas() {
+        let (tt, mask) = construir_tt(8);
+        let generacion = AtomicU8::new(0);
+        let b = Board::from_fen(
+            "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6",
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Generaciones realmente escritas en la TT compartida (bits 43..48
+        // del paquete crudo, el mismo layout de tt_empaquetar).
+        let generaciones_presentes = |tt: &SharedTT| -> Vec<u8> {
+            let mut gens: Vec<u8> = tt
+                .iter()
+                .filter_map(|slot| {
+                    let raw = slot.load(Ordering::Relaxed);
+                    if raw & TT_OCUPADO == 0 {
+                        None
+                    } else {
+                        Some(((raw >> 43) & 0x1F) as u8)
+                    }
+                })
+                .collect();
+            gens.sort_unstable();
+            gens.dedup();
+            gens
+        };
+
+        // Llamada 1 (2 hilos): todos los Searchers siembran generacion 0 y
+        // search_time la sube a 1 -- las entradas nuevas llevan generacion 1.
+        buscar_lazy_smp(
+            &b,
+            None,
+            3,
+            2,
+            &tt,
+            &generacion,
+            mask,
+            true,
+            true,
+            0,
+            &[],
+            Arc::clone(&stop),
+            None,
+        );
+        let g1 = generaciones_presentes(&tt);
+        assert!(
+            g1.contains(&1),
+            "la 1a llamada debe escribir entradas de generacion 1, vimos {:?}",
+            g1
+        );
+
+        // Llamada 2: el contador compartido avanza; los hilos de ESTA llamada
+        // deben escribir generacion 2, distinta de la llamada anterior.
+        buscar_lazy_smp(
+            &b,
+            None,
+            3,
+            2,
+            &tt,
+            &generacion,
+            mask,
+            true,
+            true,
+            0,
+            &[],
+            Arc::clone(&stop),
+            None,
+        );
+        let g2 = generaciones_presentes(&tt);
+        assert!(
+            g2.contains(&2),
+            "la 2a llamada debe escribir generacion 2 (aging vivo), vimos {:?}",
+            g2
+        );
+        assert!(
+            !g1.contains(&2),
+            "la generacion 2 no debe existir tras la primera llamada"
+        );
     }
 }
