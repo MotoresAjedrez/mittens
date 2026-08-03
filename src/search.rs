@@ -346,43 +346,6 @@ fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
     Some(TTEntry { key, depth, score, flag, best: mv, generation })
 }
 
-/// Emite una instruccion de prefetch (hint al hardware) para la linea de
-/// cache que contiene `p`. Es una optimizacion PURA de velocidad: no lee ni
-/// escribe memoria logicamente, solo avisa a la CPU que traiga la linea
-/// antes de que `tt_probe` la toque. No puede cambiar ningun resultado de
-/// busqueda (mismos nodos, mismo score, mismo bestmove).
-///
-/// Arquitecturas cubiertas con API ESTABLE de Rust (rustc estable,
-/// edition 2024), SIN std::intrinsics (que exigiria nightly):
-/// - aarch64 (Apple Silicon M5, Android ARM64): inline assembly `prfm
-///   pldl1keep` (estable desde Rust 1.59). La intrinsics nativa
-///   `core::arch::aarch64::_prefetch` SIGUE SIN ESTABILIZAR en este
-///   toolchain (requiere el feature nightly `stdarch_aarch64_prefetch`,
-///   tracking issue #117217), asi que aqui se usa la forma estable.
-/// - x86_64 (Windows, emulador Android x86_64): `_mm_prefetch`
-///   (PREFETCHT0), intrinsics estable.
-/// - Cualquier otra (p.ej. armv7): no-op seguro -- ni core::arch ni asm!
-///   ofrecen un prefetch estable para ARM de 32 bits y no vale la pena
-///   forzarlo.
-#[inline(always)]
-fn prefetch_ptr(p: *const u8) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        // PRFM PLDL1KEEP: prefetch para lectura, mantener la linea en L1.
-        // `asm!` es estable en Rust para aarch64 (desde 1.59); evita la
-        // intrinsics `_prefetch` que sigue tras el feature nightly.
-        core::arch::asm!("prfm pldl1keep, [{}]", in(reg) p);
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        // _MM_HINT_T0 = cachear en todos los niveles (equivalente a
-        // pldl1keep de ARM). Es el mismo hint que usa Stockfish.
-        core::arch::x86_64::_mm_prefetch(p.cast(), core::arch::x86_64::_MM_HINT_T0);
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = p; // no-op seguro: sin instruccion de prefetch estable disponible
-}
-
 /// Un solo hilo no necesita sincronización para su tabla de transposición.
 /// Lazy SMP conserva el backend compartido con `Mutex` por casillero.
 enum TablaTransposicion {
@@ -944,21 +907,6 @@ impl Searcher {
         (key as usize) & self.tt_mask
     }
 
-    /// Prefetch de la linea de cache de la TT para la clave `key`. Calcula
-    /// la MISMA direccion que usara `tt_probe` (indice = key & tt_mask,
-    /// sobre Local o Compartida) y emite el hint antes de que la lectura
-    /// real ocurra, para que la linea ya este en cache cuando `tt_probe` la
-    /// toque. Es solo un hint: no altera la memoria ni los resultados.
-    #[inline(always)]
-    fn tt_prefetch(&self, key: u64) {
-        let idx = self.tt_index(key);
-        let ptr: *const u8 = match &self.tt {
-            TablaTransposicion::Local(tt) => tt.as_ptr().wrapping_add(idx).cast(),
-            TablaTransposicion::Compartida(tt) => tt.as_ptr().wrapping_add(idx).cast(),
-        };
-        prefetch_ptr(ptr);
-    }
-
     fn tt_probe(&self, key: u64) -> Option<TTEntry> {
         let idx = self.tt_index(key);
         match &self.tt {
@@ -1282,12 +1230,6 @@ impl Searcher {
         prev2: Option<(usize, usize)>,
         en_sondeo_se: bool,
     ) -> Result<i32, TimeUp> {
-        // Prefetch anticipado del probe de TT de este nodo: la lectura real
-        // ocurre varias decenas de instrucciones mas abajo (check_time,
-        // deteccion de repeticion, probe de syzygy, extensiones, hindsight),
-        // tiempo de sobra para traer la linea de cache mientras tanto. Es
-        // un hint puro al hardware: no cambia ningun resultado de busqueda.
-        self.tt_prefetch(b.zobrist);
         self.check_time()?;
 
         if b.halfmove_clock >= 100 {
@@ -1554,19 +1496,13 @@ impl Searcher {
         const PROBCUT_MARGEN: i32 = 150;
         if !en_jaque && !es_pv && depth >= PROBCUT_PROF_MIN && beta.abs() < MATE - 1000 {
             let probcut_beta = beta + PROBCUT_MARGEN;
-            // Cachea SEE una vez por captura: el ordenamiento y el filtro
-            // see<0 del loop reusan el mismo valor en vez de recalcularlo.
-            let mut capturas: ArrayVec<(Move, i32), MAX_MOVES> = ArrayVec::new();
-            for mv in generate_captures_legal(b) {
-                let see = crate::see::see(b, &mv);
-                capturas.push((mv, see));
-            }
-            capturas.sort_by_key(|(_, see)| -*see);
+            let mut capturas = generate_captures_legal(b);
+            capturas.sort_by_cached_key(|mv| -crate::see::see(b, mv));
             let sdepth = (depth - 4).max(1);
             let mut probcut_corto = false;
             let mut probcut_score = 0;
-            for (mv, see) in &capturas {
-                if *see < 0 {
+            for mv in &capturas {
+                if crate::see::see(b, mv) < 0 {
                     continue;
                 }
                 let next = b.make_move(mv);
@@ -1634,20 +1570,11 @@ impl Searcher {
             depth -= 1;
         }
 
-        // Cachea SEE una vez por captura (mismo patron que quiescence): el
-        // ordenamiento y el SEE-prune del loop reusan el mismo valor en vez
-        // de calcular see() dos veces por la misma jugada.
-        let mut moves: ArrayVec<(Move, Option<i32>), MAX_MOVES> = ArrayVec::new();
-        for mv in generate_legal(b) {
-            let see = mv.is_capture().then(|| crate::see::see(b, &mv));
-            moves.push((mv, see));
-        }
+        let mut moves = generate_legal(b);
         if moves.is_empty() {
             return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
         }
-        moves.sort_by_key(|(mv, see)| {
-            self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, *see)
-        });
+        self.order_moves_ply(b, &mut moves, tt_move, ply, prev, prev2);
         if self.path_len < MAX_PATH { self.path[self.path_len] = b.zobrist; self.path_len += 1; }
 
         // Singular extensions: si la jugada de la TT es tan claramente
@@ -1679,14 +1606,14 @@ impl Searcher {
                 if entry.depth >= depth - 3
                     && entry.flag == TTFlag::Beta
                     && entry.score.abs() < MATE - 1000
-                    && moves.iter().any(|(m, _)| *m == tmv)
+                    && moves.contains(&tmv)
                 {
                     let margen = 2 * depth;
                     let sbeta = entry.score - margen;
                     let sdepth = (depth - 1) / 2;
                     let mut mejor_otra = -INFINITO;
                     let mut se_timed_out = false;
-                    for (mv, _see_se) in &moves {
+                    for mv in &moves {
                         if *mv == tmv {
                             continue;
                         }
@@ -1781,7 +1708,7 @@ impl Searcher {
         // el orden aprenda a probarlas mas tarde. Cota fija en la pila.
         let mut quiets_buscados: [(u8, u8, bool); 64] = [(0, 0, false); 64];
         let mut n_quiets_buscados = 0usize;
-        for (idx, (mv, see_pre)) in moves.iter().enumerate() {
+        for (idx, mv) in moves.iter().enumerate() {
             // LMR: candidatas a reducir son jugadas silenciosas, tarde en el
             // orden (ya viene de mejor a peor), sin jaque propio ni jaque
             // que dan -- justo donde el orden ya filtra la mayoria de
@@ -1869,9 +1796,7 @@ impl Searcher {
                 && mv.is_capture()
                 && mv.promotion.is_none()
                 && beta.abs() < MATE - 1000
-                // see_pre ya quedo cacheado durante el ordenamiento (la
-                // condicion mv.is_capture() garantiza que es Some).
-                && see_pre.unwrap() < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
+                && crate::see::see(b, mv) < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
             {
                 let next_probe = b.make_move(mv);
                 if !next_probe.in_check(next_probe.turn) {
@@ -1889,11 +1814,6 @@ impl Searcher {
 
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
-            // Prefetch de la TT del hijo: `next.zobrist` se probeara al
-            // entrar a la llamada recursiva de negamax de abajo, justo
-            // despues del trabajo de siguiente_estado_busqueda (delta NNUE)
-            // que se solapa con esta latencia. Hint puro al hardware.
-            self.tt_prefetch(next.zobrist);
             let child_prev = Some((pt_mv, mv.to as usize));
             let child_prev2 = prev;
             let ext = if jugada_singular == Some(*mv) { 1 } else { 0 };
