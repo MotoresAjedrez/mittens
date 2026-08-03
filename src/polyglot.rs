@@ -7,7 +7,7 @@
 // evitar errores de transcripcion).
 
 use crate::board::{Board, CASTLE_BK, CASTLE_BQ, CASTLE_WK, CASTLE_WQ};
-use crate::movegen::generate_legal;
+use crate::movegen::{generate_legal, MoveList};
 use crate::polyglot_random::POLYGLOT_RANDOM;
 use crate::types::{Color, Move, PieceType, file_of, make_square, rank_of};
 use std::sync::OnceLock;
@@ -125,7 +125,7 @@ fn polyglot_key(b: &Board) -> u64 {
 /// incluida la rareza historica del formato: el enroque se codifica como
 /// "el rey captura su propia torre" (ej. e1h1 para el enroque corto blanco),
 /// no con la casilla final real del rey.
-fn decodificar_jugada(b: &Board, raw: u16) -> Option<Move> {
+fn decodificar_jugada(b: &Board, legales: &MoveList, raw: u16) -> Option<Move> {
     let to_sq = (raw & 0x3f) as u8;
     let from_sq = ((raw >> 6) & 0x3f) as u8;
     let promo_part = (raw >> 12) & 0x7;
@@ -150,9 +150,10 @@ fn decodificar_jugada(b: &Board, raw: u16) -> Option<Move> {
         to_sq
     };
 
-    generate_legal(b)
-        .into_iter()
+    legales
+        .iter()
         .find(|m| m.from == from_sq && m.to == to_real && m.promotion == promotion)
+        .copied()
 }
 
 /// Jugada del libro para la posicion actual (blancas O negras, ambos colores
@@ -167,10 +168,15 @@ pub fn probe(b: &Board) -> Option<Move> {
     let libro = LIBRO.get()?;
     let key = polyglot_key(b);
     let inicio = libro.partition_point(|e| e.key < key);
+    // El conjunto de jugadas legales es identico para todas las entradas del
+    // libro con esta clave (misma posicion): se genera UNA sola vez y se
+    // reutiliza para validar cada entrada, en vez de llamar a generate_legal
+    // por entrada.
+    let legales = generate_legal(b);
     let mut candidatos: Vec<(Move, u32)> = Vec::new();
     let mut i = inicio;
     while i < libro.len() && libro[i].key == key {
-        if let Some(mv) = decodificar_jugada(b, libro[i].raw_move) {
+        if let Some(mv) = decodificar_jugada(b, &legales, libro[i].raw_move) {
             candidatos.push((mv, libro[i].weight as u32));
         }
         i += 1;
