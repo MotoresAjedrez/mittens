@@ -1,6 +1,7 @@
 mod bitboard;
 mod board;
 mod bullet_net;
+mod bullet_net_amenazas;
 mod eval;
 mod movegen;
 mod neural;

@@ -528,6 +528,12 @@ impl RedNeural {
 pub enum NnueAccumulator {
     Amenazas(AcumAmenazas),
     Bullet(crate::bullet_net::AcumBullet),
+    /// Red 5376->1024 (768 base + 4608 amenazas) con accumulator INCREMENTAL
+    /// de doble perspectiva: `aplicar_jugada` aplica solo el delta de la
+    /// jugada (base + amenazas afectadas) en vez de recalcular las 5376
+    /// features (ver bullet_net_amenazas.rs, validado bit-a-bit contra el
+    /// recalculo completo).
+    BulletAmenazas(crate::bullet_net_amenazas::AcumBulletAmenazas),
 }
 
 impl NnueAccumulator {
@@ -538,6 +544,9 @@ impl NnueAccumulator {
             }
             NnueAccumulator::Bullet(a) => {
                 NnueAccumulator::Bullet(a.despues_de_jugada(antes, despues))
+            }
+            NnueAccumulator::BulletAmenazas(a) => {
+                NnueAccumulator::BulletAmenazas(a.despues_de_jugada(antes, despues))
             }
         }
     }
@@ -553,6 +562,7 @@ impl NnueAccumulator {
         match self {
             NnueAccumulator::Amenazas(a) => a.aplicar_jugada(antes, despues),
             NnueAccumulator::Bullet(a) => a.aplicar_jugada(antes, despues),
+            NnueAccumulator::BulletAmenazas(a) => a.aplicar_jugada(antes, despues),
         }
     }
 
@@ -560,6 +570,7 @@ impl NnueAccumulator {
         match self {
             NnueAccumulator::Amenazas(a) => a.evaluar(),
             NnueAccumulator::Bullet(a) => a.evaluar(),
+            NnueAccumulator::BulletAmenazas(a) => a.evaluar(),
         }
     }
 
@@ -573,6 +584,9 @@ impl NnueAccumulator {
         match self {
             NnueAccumulator::Amenazas(_) => crate::eval::PESO_RED,
             NnueAccumulator::Bullet(_) => peso_bullet(),
+            // Igual que la bullet estandar: ya devuelve centipeones "de
+            // verdad" en la misma escala que la clasica.
+            NnueAccumulator::BulletAmenazas(_) => 1.0,
         }
     }
 
@@ -582,7 +596,13 @@ impl NnueAccumulator {
     /// encima la clasica puede estar contando dos veces lo mismo.
     /// Se activa con MIMOTOR_BULLET_PURA=1.
     pub fn pura(&self) -> bool {
-        matches!(self, NnueAccumulator::Bullet(_)) && bullet_pura()
+        match self {
+            // Las bullet (estandar y 5376) evaluan la posicion COMPLETA por
+            // si mismas; la de amenazas legacy se mezcla con la clasica.
+            NnueAccumulator::Bullet(_) => bullet_pura(),
+            NnueAccumulator::BulletAmenazas(_) => true,
+            NnueAccumulator::Amenazas(_) => false,
+        }
     }
 }
 
@@ -1189,6 +1209,10 @@ fn actualizar_booleano(
 pub enum RedCargada {
     Amenazas(&'static RedNeural),
     Bullet(&'static crate::bullet_net::RedBullet),
+    /// Bullet con feature-set enriquecido: (5376 -> 1024)x2 -> 1 SCReLU,
+    /// 768 base + 4608 amenazas. La extraccion de features replica
+    /// inputs.rs del trainer (ver bullet_net_amenazas.rs).
+    BulletAmenazas(&'static crate::bullet_net_amenazas::RedBulletAmenazas),
 }
 
 static RED: OnceLock<RwLock<Option<RedCargada>>> = OnceLock::new();
@@ -1214,6 +1238,16 @@ pub fn cargar_detallado(path: &str) -> Result<u64, String> {
             .ok_or_else(|| "red bullet invalida".to_string())?;
         eprintln!("info string NNUE: formato bullet (768->N)x2->1 SCReLU");
         RedCargada::Bullet(Box::leak(Box::new(red)))
+    } else if crate::bullet_net_amenazas::tamano_plausible(datos.len()) {
+        // Red bullet con feature-set enriquecido: 5376 (768 base + 4608
+        // amenazas) -> 1024, doble perspectiva. Se detecta por el tamano
+        // exacto del archivo (11016194 bytes utiles + hasta 63 de relleno).
+        let red = crate::bullet_net_amenazas::RedBulletAmenazas::cargar_de_bytes(&datos)
+            .ok_or_else(|| "red bullet 5376 invalida".to_string())?;
+        eprintln!(
+            "info string NNUE: formato bullet enriquecido (5376 amenazas -> 1024)x2->1 SCReLU"
+        );
+        RedCargada::BulletAmenazas(Box::leak(Box::new(red)))
     } else {
         let red = RedNeural::cargar_de_bytes(&datos)
             .ok_or_else(|| "formato o valores de pesos invalidos".to_string())?;
@@ -1261,6 +1295,9 @@ pub fn crear_acumulador(b: &Board) -> Option<NnueAccumulator> {
         RedCargada::Bullet(r) => {
             NnueAccumulator::Bullet(crate::bullet_net::AcumBullet::desde_tablero(r, b))
         }
+        RedCargada::BulletAmenazas(r) => NnueAccumulator::BulletAmenazas(
+            crate::bullet_net_amenazas::AcumBulletAmenazas::desde_tablero(r, b),
+        ),
     })
 }
 
@@ -1269,20 +1306,29 @@ mod tests {
     use super::*;
     use crate::movegen::generate_legal;
 
-    fn red_prueba() -> &'static RedNeural {
+    fn red_prueba() -> Option<&'static RedNeural> {
         // Estos tests ejercitan exclusivamente el acumulador legacy de
-        // amenazas; producción usa ahora la red Bullet. Conservamos el
-        // checkpoint anterior como fixture para no mezclar formatos.
-        let datos = include_bytes!(
-            "../backups/pesos_amenazas_prueba.bak_pre_bullet_relabel_500h2h_20260731_121222.bin"
-        );
-        Box::leak(Box::new(
-            RedNeural::cargar_de_bytes(datos).expect("pesos validos"),
-        ))
+        // amenazas; producción usa ahora la red Bullet. El fixture (11 MB)
+        // vivia en backups/ y no viaja con el checkout: se lee en runtime
+        // (override con MIMOTOR_RED_AMENAZAS) y los tests se omiten con
+        // aviso si no esta, igual que hacen los de bullet_net.
+        let ruta = std::env::var("MIMOTOR_RED_AMENAZAS").unwrap_or_else(|_| {
+            format!(
+                "{}/backups/pesos_amenazas_prueba.bak_pre_bullet_relabel_500h2h_20260731_121222.bin",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+        let datos = std::fs::read(&ruta).ok()?;
+        Some(Box::leak(Box::new(
+            RedNeural::cargar_de_bytes(&datos).expect("pesos validos"),
+        )))
     }
 
     fn comprobar_incremental(fen: &str, uci: &str) {
-        let red = red_prueba();
+        let Some(red) = red_prueba() else {
+            eprintln!("sin fixture legacy: test omitido");
+            return;
+        };
         let antes = Board::from_fen(fen).unwrap();
         let mv = generate_legal(&antes)
             .into_iter()
@@ -1334,7 +1380,10 @@ mod tests {
     /// acumulador BIT A BIT, a cualquier profundidad.
     #[test]
     fn aplicar_jugada_se_deshace_bit_a_bit() {
-        let red = red_prueba();
+        let Some(red) = red_prueba() else {
+            eprintln!("sin fixture legacy: test omitido");
+            return;
+        };
         let mut semilla = 0xD00D_F00D_1234u64;
         for _partida in 0..12 {
             let raiz = Board::startpos();
@@ -1383,7 +1432,10 @@ mod tests {
 
     #[test]
     fn acumulador_incremental_amenazas_fuzz_determinista() {
-        let red = red_prueba();
+        let Some(red) = red_prueba() else {
+            eprintln!("sin fixture legacy: test omitido");
+            return;
+        };
         let mut semilla = 0x5EED_CAFE_D00Du64;
         for _partida in 0..24 {
             let mut tablero = Board::startpos();
