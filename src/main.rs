@@ -1053,7 +1053,7 @@ fn uci_loop() {
 
         match partes[0] {
             "uci" => {
-                println!("id name MiMotor Tal v8 Reparado (Rust)");
+                println!("id name Mittens");
                 println!("id author Tavito y Claude");
                 println!("option name Hash type spin default 64 min 1 max 1024");
                 println!("option name Clear Hash type button");
