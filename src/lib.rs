@@ -31,6 +31,24 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 use types::{Move, MoveFlag, PieceType};
 
+/// Formatea el score para el campo "info score" del protocolo UCI: cerca del
+/// limite de mate (search::MATE) se reporta como "mate N" (N = jugadas hasta
+/// el mate, negativo si el que mueve va a ser matado), como exige el estandar
+/// UCI -- antes siempre se imprimia "cp X" incluso con X en la zona de mate
+/// (p.ej. 28987), que herramientas/GUIs no interpretan como mate inminente.
+fn formatear_score_uci(score: i32) -> String {
+    const UMBRAL: i32 = search::MATE - 1000;
+    if score > UMBRAL {
+        let plies = search::MATE - score;
+        format!("mate {}", (plies + 1) / 2)
+    } else if score < -UMBRAL {
+        let plies = search::MATE + score;
+        format!("mate -{}", (plies + 1) / 2)
+    } else {
+        format!("cp {}", score)
+    }
+}
+
 const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const KIWIPETE: &str = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
 const POSITION3: &str = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
@@ -1299,8 +1317,8 @@ pub fn uci_loop() {
                             s.search_time(&board_copy, None, depth, |depth, score, nodes, ms| {
                                 let nps = nodes.saturating_mul(1000) / ms.max(1);
                                 println!(
-                                    "info depth {} score cp {} nodes {} time {} nps {}",
-                                    depth, score, nodes, ms, nps
+                                    "info depth {} score {} nodes {} time {} nps {}",
+                                    depth, formatear_score_uci(score), nodes, ms, nps
                                 );
                                 io::stdout().flush().ok();
                             });
@@ -1403,8 +1421,8 @@ pub fn uci_loop() {
                     let (mv, _sc, _) =
                         s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
                             println!(
-                                "info depth {} score cp {} nodes {} time {}",
-                                depth, score, nodes, ms
+                                "info depth {} score {} nodes {} time {}",
+                                depth, formatear_score_uci(score), nodes, ms
                             );
                             io::stdout().flush().ok();
                         });
@@ -1448,8 +1466,8 @@ pub fn uci_loop() {
                         let ms = t0.elapsed().as_millis().max(1) as u64;
                         let nps = nodos.saturating_mul(1000) / ms;
                         println!(
-                            "info depth {} score cp {} nodes {} time {} nps {}",
-                            profundidad, sc, nodos, ms, nps
+                            "info depth {} score {} nodes {} time {} nps {}",
+                            profundidad, formatear_score_uci(sc), nodos, ms, nps
                         );
                         println!(
                             "bestmove {}",
@@ -1468,8 +1486,8 @@ pub fn uci_loop() {
                         let (mv, _sc, _) =
                             s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
                                 println!(
-                                    "info depth {} score cp {} nodes {} time {}",
-                                    depth, score, nodes, ms
+                                    "info depth {} score {} nodes {} time {}",
+                                    depth, formatear_score_uci(score), nodes, ms
                                 );
                                 io::stdout().flush().ok();
                             });
