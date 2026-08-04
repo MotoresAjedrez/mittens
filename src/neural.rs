@@ -585,8 +585,10 @@ impl NnueAccumulator {
             NnueAccumulator::Amenazas(_) => crate::eval::PESO_RED,
             NnueAccumulator::Bullet(_) => peso_bullet(),
             // Igual que la bullet estandar: ya devuelve centipeones "de
-            // verdad" en la misma escala que la clasica.
-            NnueAccumulator::BulletAmenazas(_) => 1.0,
+            // verdad" en la misma escala que la clasica. Pero es OTRA
+            // arquitectura (5376 features de amenaza), asi que tiene su
+            // propia perilla de calibracion: MIMOTOR_PESO_BULLET_AMENAZAS.
+            NnueAccumulator::BulletAmenazas(_) => peso_bullet_amenazas(),
         }
     }
 
@@ -600,7 +602,13 @@ impl NnueAccumulator {
             // Las bullet (estandar y 5376) evaluan la posicion COMPLETA por
             // si mismas; la de amenazas legacy se mezcla con la clasica.
             NnueAccumulator::Bullet(_) => bullet_pura(),
-            NnueAccumulator::BulletAmenazas(_) => true,
+            // Antes estaba forzada a `true` (modo puro). Era un error: la
+            // eval clasica se calcula igual en eval.rs (evaluar_clasica se
+            // llama ANTES del match, ver evaluate_with_state), asi que el
+            // modo puro no ahorra ni un nanosegundo, solo TIRA informacion.
+            // El hibrido es igual o mejor por construccion. Se puede forzar
+            // el modo puro con MIMOTOR_BULLET_AMENAZAS_PURA=1 para comparar.
+            NnueAccumulator::BulletAmenazas(_) => bullet_amenazas_pura(),
             NnueAccumulator::Amenazas(_) => false,
         }
     }
@@ -613,6 +621,33 @@ fn bullet_pura() -> bool {
             std::env::var("MIMOTOR_BULLET_PURA").as_deref(),
             Ok("1") | Ok("true")
         )
+    })
+}
+
+fn bullet_amenazas_pura() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("MIMOTOR_BULLET_AMENAZAS_PURA").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// Peso de mezcla especifico de la arquitectura bullet-amenazas (5376
+/// features). Es una red distinta a la bullet estandar de 768 features, con
+/// otra magnitud de salida y otro error residual, asi que merece su propia
+/// calibracion en vez de heredar el valor afinado para la otra. Por defecto
+/// cae en `peso_bullet()` (mismo comportamiento que antes) para que este
+/// cambio sea neutral hasta que se tune de verdad.
+fn peso_bullet_amenazas() -> f64 {
+    static CACHE: OnceLock<f64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MIMOTOR_PESO_BULLET_AMENAZAS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 8.0)
+            .unwrap_or_else(peso_bullet)
     })
 }
 
