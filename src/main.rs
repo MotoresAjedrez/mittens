@@ -942,6 +942,12 @@ fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead
 }
 
 fn uci_loop() {
+    // La NNUE embebida en el binario (ver neural::PESOS_EMBEBIDOS) queda
+    // activa desde el arranque -- un "setoption NNUEPath"/"UseNNUE"
+    // posterior del GUI/bot puede reemplazarla o desactivarla igual que
+    // antes, esto solo cambia el punto de partida de "sin red" a "con la
+    // mejor red validada hasta ahora".
+    neural::cargar_embebida_y_activar();
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
     let mut tt_mb: usize = 64;
