@@ -1225,38 +1225,12 @@ fn almacenamiento() -> &'static RwLock<Option<RedCargada>> {
     RED.get_or_init(|| RwLock::new(None))
 }
 
-/// Pesos de la red bullet 5376->1024 (amenazas, entrenada con etiquetas de
-/// Stockfish, validada 69.5% en h2h de 100 partidas contra la red anterior)
-/// EMBEBIDOS en el binario en tiempo de compilacion. Asi el motor trae una
-/// NNUE fuerte activa por defecto aunque el GUI/bot que lo invoque nunca
-/// mande "setoption name NNUEPath" -- antes, sin esa opcion explicita, caia
-/// de vuelta a la eval puramente clasica.
-static PESOS_EMBEBIDOS: &[u8] =
-    include_bytes!("../redes_desplegadas/bullet_1024_amenazas_sf_30.bin");
-
-/// Carga los pesos embebidos en el binario (ver `PESOS_EMBEBIDOS`) y activa
-/// la NNUE. Se llama una vez al arrancar el proceso, antes del loop UCI --
-/// un "setoption NNUEPath" posterior sigue pudiendo reemplazarla.
-pub fn cargar_embebida_y_activar() {
-    if cargar_detallado_bytes(PESOS_EMBEBIDOS).is_ok() {
-        set_activa(true);
-        SOLICITADA.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Carga o reemplaza los pesos desde una ruta de archivo. Si la ruta o el
-/// contenido son invalidos se conserva la red anterior, evitando que un
-/// error de escritura apague una NNUE que ya estaba funcionando. Devuelve
-/// el checksum FNV-1a del archivo.
+/// Carga o reemplaza los pesos. Si la ruta o el contenido son invalidos se
+/// conserva la red anterior, evitando que un error de escritura apague una
+/// NNUE que ya estaba funcionando. Devuelve el checksum FNV-1a del archivo.
 pub fn cargar_detallado(path: &str) -> Result<u64, String> {
     let datos = std::fs::read(path).map_err(|e| format!("no se pudo leer: {e}"))?;
-    cargar_detallado_bytes(&datos)
-}
-
-/// Nucleo compartido de carga (desde archivo o desde bytes embebidos):
-/// detecta el formato por tamano y activa la red correspondiente.
-fn cargar_detallado_bytes(datos: &[u8]) -> Result<u64, String> {
-    let checksum = checksum_fnv1a(datos);
+    let checksum = checksum_fnv1a(&datos);
     // El formato se detecta por el tamano del archivo: la red bullet mide
     // 394754 bytes utiles + hasta 63 de relleno; la de amenazas, 11 MB.
     let cargada = if crate::bullet_net::tamano_plausible(datos.len()) {
