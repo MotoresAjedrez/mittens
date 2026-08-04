@@ -1,6 +1,6 @@
 // Red NNUE bullet con feature-set ENRIQUECIDO de amenazas:
 //
-//     (5376 -> 1024)x2 -> 1, doble perspectiva, activacion SCReLU
+//     (5376 -> H)x2 -> 1, doble perspectiva, activacion SCReLU  (H=512)
 //
 // Las 5376 features = 768 base pieza-casilla (la misma codificacion
 // dual-perspectiva de Chess768) + 4608 de amenaza
@@ -14,16 +14,15 @@
 // White=0/Black=1) y despues corremos la MISMA logica de ataques.
 //
 // FORMATO DEL ARCHIVO (quantised.bin), identico al de bullet_net.rs pero con
-// N_ENTRADA=5376 y h=1024:
+// N_ENTRADA=5376 y h=H (=512):
 //   4 bloques consecutivos de i16 little-endian:
-//     1) l0w: 5376*1024 = 5505024 valores, dispuestos POR FEATURE
-//     2) l0b: 1024 valores
-//     3) l1w: 2048 valores (1024 para la perspectiva del que mueve, 1024
+//     1) l0w: 5376*512 = 2752512 valores, dispuestos POR FEATURE
+//     2) l0b: 512 valores
+//     3) l1w: 1024 valores (512 para la perspectiva del que mueve, 512
 //        para la del rival)
 //     4) l1b: 1 valor
-//   Total util = 5508097 * 2 = 11016194 bytes. El archivo mide 11016256,
-//   o sea 62 bytes MAS: relleno final "bullet" repetido hasta alinear a 64
-//   bytes (11016256 = 64 * 172129). Se valida, no se ignora.
+//   Total util = 2754049 * 2 = 5508098 bytes, mas relleno final "bullet"
+//   repetido hasta alinear a 64 bytes. Se valida, no se ignora.
 //
 // IMPLEMENTADO (esta sesion): actualizacion INCREMENTAL del accumulator con
 // doble perspectiva (ver AcumBulletAmenazas mas abajo). Las 768 features
@@ -49,7 +48,14 @@ use crate::types::{ALL_PIECE_TYPES, Color, PieceType};
 pub const N_BASE: usize = 768;
 pub const N_THREAT: usize = 2 * 6 * 6 * 64; // 4608
 pub const N_INPUTS: usize = N_BASE + N_THREAT; // 5376
-pub const H: usize = 1024;
+/// Neuronas de la capa oculta. Se baja de 1024 a 512: con 1024 la matriz l0
+/// pesa 11 MB y no cabe en L2, lo que costaba 3-5 plies de profundidad a
+/// igual tiempo por jugada (el mejor loss de entrenamiento no compensaba esa
+/// perdida de busqueda). Con 512 son 5.5 MB. Es una constante de compilacion
+/// porque los acumuladores son arrays de tamano fijo [i32; H]; el motor
+/// soporta UNA sola variante a la vez y el tamano del archivo de pesos debe
+/// coincidir (ver `bytes_utiles`/`tamano_plausible`).
+pub const H: usize = 512;
 /// Maximo de pares (stm, ntm) por posicion: 32 piezas base + amenazas.
 /// Mismo valor que el trainer (medido sobre el dataset real).
 pub const MAX_ACTIVE: usize = 256;
@@ -78,7 +84,7 @@ const fn bytes_utiles() -> usize {
 }
 
 /// True si el tamano del archivo corresponde a esta arquitectura
-/// (5376 -> 1024): util + hasta 63 bytes de relleno "bullet".
+/// (5376 -> H): util + hasta 63 bytes de relleno "bullet".
 pub fn tamano_plausible(n: usize) -> bool {
     let utiles = bytes_utiles();
     n >= utiles && n - utiles < ALINEACION
