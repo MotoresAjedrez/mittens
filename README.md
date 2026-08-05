@@ -37,6 +37,21 @@ Mittens no explica sus jugadas. No pide perdón por los sacrificios que no calcu
 
 Si te gusta el proyecto, una ⭐ ayuda mucho a que más gente lo descubra.
 
+## Soporte para Android
+
+Mittens corre en Android via un puente JNI (`src/jni_bridge.rs`), probado en
+un celular real (arm64-v8a, Android 16): handshake UCI, carga de la NNUE
+completa, búsqueda multi-hilo y `stop` funcionando dentro del runtime ART.
+
+Las librerías nativas ya compiladas para las 3 ABIs (`arm64-v8a`,
+`armeabi-v7a`, `x86_64`) estan en [`android-jnilibs/`](android-jnilibs/),
+listas para copiar a `app/src/main/jniLibs/` de cualquier proyecto Android
+(`minSdk 24+`).
+
+Guia completa de integracion (clase Kotlin exacta, como cargar los pesos
+NNUE, advertencias de threading, y que se verifico realmente):
+[`ANDROID_JNI_README.md`](ANDROID_JNI_README.md).
+
 ## Compilar en macOS
 
 Requiere Rust con soporte para edition 2024.
