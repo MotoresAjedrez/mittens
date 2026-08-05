@@ -1,10 +1,41 @@
-# Mittens
+# 🐱 Mittens
 
 ![logo](logo.png)
 
 **ELO: 1**
 
-Motor de ajedrez UCI escrito en Rust. Esta carpeta contiene el codigo fuente completo, los pesos neuronales proporcionados y una serie de reparaciones de correctitud, reloj y robustez.
+Un motor de ajedrez escrito en Rust, con red neuronal NNUE propia — nacido sin saber ni mover un peón en código, y ahora juega solo, piensa solo, y a veces sacrifica piezas sin avisar.
+
+No es Stockfish. No pretende serlo. Pero pelea.
+
+## ¿Qué trae por dentro?
+
+- 🧠 Evaluación híbrida: clásica + red neuronal NNUE
+- ⚡ Búsqueda negamax con poda alfa-beta, tabla de transposición, quiescence search
+- 🎮 Protocolo UCI — funciona con cualquier interfaz gráfica de ajedrez
+- 🤖 Juega en vivo en Lichess
+
+## Cómo usarlo
+
+1. Clona el repo.
+2. Compílalo:
+   ```bash
+   cargo build --release
+   ```
+3. Ábrelo con cualquier interfaz UCI (Arena, CuteChess, BanksiaGUI...) o directo por terminal:
+   ```bash
+   ./target/release/mi-motor-rust
+   uci
+   ```
+4. Escribe `go` y reza.
+
+Mittens no explica sus jugadas. No pide perdón por los sacrificios que no calculó bien. Simplemente juega — y a veces, sin querer, hace algo brillante.
+
+¿Le ganas? Cuéntanoslo. ¿Te gana? También cuéntanoslo, mejor con captura de pantalla.
+
+---
+
+Si te gusta el proyecto, una ⭐ ayuda mucho a que más gente lo descubra.
 
 ## Compilar en macOS
 
