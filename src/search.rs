@@ -3023,3 +3023,332 @@ mod verificacion_reproduccion {
         }
     }
 }
+
+#[cfg(test)]
+mod reproduccion_h5c5 {
+    use super::*;
+
+    // FEN reportado en el incidente real: negras al turno, dama negra en c5,
+    // h5 VACIO. El motor devolvio "bestmove h5c5" (origen inexistente). Ese
+    // FEN en si es ILEGAL (Board::from_fen lo rechaza, correctamente): el bug
+    // real es que el tablero interno del motor habia DIVERGIDO del real (dama
+    // en h5 en vez de c5) porque una jugada corrupta del stream UCI se habia
+    // descartado en silencio y la busqueda siguio sobre el tablero inventado.
+    // Por eso este modulo NO intenta construir ese FEN: reproduce el camino
+    // real (un stream de jugadas con una invalida en el medio) y verifica que
+    // con el parche la posicion se rechaza completa, en vez de producir una
+    // jugada ilegal despues.
+    const FEN_H5C5: &str = "8/3P1kp1/5p1p/2q5/8/8/1P1Q2P1/6K1 b - - 6 40";
+
+    // Secuencia TODA legal desde la posicion inicial (Ruy Lopez: 1.e4 e5
+    // 2.Nf3 Nc6 3.Bb5 a6 4.Bxc6 dxc6 5.Nxe5 Qd4). Termina con negras al
+    // turno: dama negra en d4, caballo negro b8 YA capturado.
+    const MOVES_LEGALES: &[&str] = &[
+        "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5c6", "d7c6", "f3e5", "d8d4",
+    ];
+
+    // La misma secuencia pero con una jugada corrupta en el MEDIO: en vez de
+    // "b5c6" (la captura blanca del caballo), el stream trae "b8d7" -- un
+    // movimiento NEGRO en el turno de BLANCAS, ademas desde una casilla b8
+    // ya vacia. Es justo el escenario del incidente: un driver rival o una
+    // condicion de carrera manda una jugada inaplicable en ese punto exacto.
+    // Con la logica vieja ese error se descartaba en silencio y TODO lo que
+    // venia despues (que dependia de la captura b5xc6) se descuadraba.
+    const MOVES_CORRUPTOS: &[&str] = &[
+        "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b8d7", "d7c6", "f3e5", "d8d4",
+    ];
+
+    fn legal_raiz(b: &Board) -> Vec<String> {
+        generate_legal(b).iter().map(|m| m.to_uci()).collect()
+    }
+
+    /// Documenta el comportamiento VIEJO (el bug): una jugada invalida se
+    /// descartaba EN SILENCIO y las siguientes se aplicaban sobre un tablero
+    /// ya divergente. Devuelve (tablero final, jugadas descartadas).
+    fn aplicar_viejo_descartando_invalidas(mut board: Board, moves_uci: &[&str]) -> (Board, usize) {
+        let mut descartadas = 0usize;
+        for uci in moves_uci {
+            match crate::parse_uci_move(&board, uci) {
+                Some(mv) => board = board.make_move(&mv),
+                None => descartadas += 1,
+            }
+        }
+        (board, descartadas)
+    }
+
+    #[test]
+    fn secuencia_legal_completa_aplica_y_bestmove_es_legal_1_hilo_y_smp() {
+        // Sanity del propio test: MOVES_LEGALES es una secuencia valida de
+        // principio a fin, y la busqueda (1 hilo y lazy_smp 4 hilos) sobre la
+        // posicion resultante devuelve siempre un bestmove legal.
+        let mut b = Board::from_fen(crate::STARTPOS).unwrap();
+        let mut hist: Vec<u64> = Vec::new();
+        assert!(
+            crate::aplicar_moves_position(&mut b, &mut hist, MOVES_LEGALES),
+            "la secuencia de referencia debe ser 100% legal"
+        );
+        assert_eq!(hist.len(), MOVES_LEGALES.len());
+        let legales = legal_raiz(&b);
+
+        let mut s = Searcher::new(64);
+        for movetime in [20u64, 100, 500] {
+            let (mv, _sc, _prof) = s.search_time(&b, Some(movetime), 64, |_, _, _, _| {});
+            let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
+            assert!(
+                legales.contains(&uci),
+                "1 hilo, movetime {}: bestmove {} NO esta en los movimientos legales",
+                movetime,
+                uci
+            );
+        }
+
+        let (tt, mask) = construir_tt(64);
+        let generacion = std::sync::atomic::AtomicU8::new(0);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for movetime in [20u64, 100, 500] {
+            let (mv, _sc, _nodos, _res) = buscar_lazy_smp(
+                &b,
+                Some(movetime),
+                64,
+                4,
+                &tt,
+                &generacion,
+                mask,
+                true,
+                true,
+                0,
+                &hist,
+                stop.clone(),
+                None,
+            );
+            let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
+            assert!(
+                legales.contains(&uci),
+                "lazy_smp, movetime {}: bestmove {} NO esta en los movimientos legales",
+                movetime,
+                uci
+            );
+        }
+    }
+
+    #[test]
+    fn stream_con_jugada_corrupta_en_medio_se_rechaza_y_conserva_ultima_valida() {
+        // CAMINO REAL del bug: un stream 'position startpos moves ...' con una
+        // jugada invalida en el medio. Con el parche, aplicar_moves_position
+        // debe rechazar la posicion COMPLETA (devuelve false) sin tocar board
+        // ni game_history -- nunca aplicar jugadas parciales en silencio.
+        let mut b = Board::from_fen(crate::STARTPOS).unwrap();
+        let mut hist: Vec<u64> = Vec::new();
+        let ok = crate::aplicar_moves_position(&mut b, &mut hist, MOVES_CORRUPTOS);
+        assert!(
+            !ok,
+            "una jugada invalida en el medio debe rechazar TODA la posicion (no aplicar parciales)"
+        );
+        let startpos = Board::from_fen(crate::STARTPOS).unwrap();
+        assert_eq!(
+            b.zobrist, startpos.zobrist,
+            "el tablero debe quedar intacto (se conserva la ultima posicion valida)"
+        );
+        assert!(hist.is_empty(), "el historial debe quedar intacto tras el rechazo");
+
+        // Control positivo: la misma secuencia SIN la jugada corrupta si aplica
+        // y produce un tablero distinto al inicial (el rechazo no es porque la
+        // secuencia entera sea basura, sino por la jugada corrupta puntual).
+        let mut b2 = Board::from_fen(crate::STARTPOS).unwrap();
+        let mut hist2: Vec<u64> = Vec::new();
+        assert!(crate::aplicar_moves_position(&mut b2, &mut hist2, MOVES_LEGALES));
+        assert_ne!(b2.zobrist, startpos.zobrist);
+    }
+
+    #[test]
+    fn comportamiento_viejo_descartaba_en_silencio_y_producia_bestmove_ilegal() {
+        // Demuestra que el test SIN el parche habria detectado el bug real:
+        // con la logica VIEJA (descartar la jugada invalida y seguir), el
+        // tablero interno divergia del real y ofrecia jugadas ILEGALES en la
+        // partida real -- exactamente la clase de 'bestmove h5c5' del
+        // incidente (mover desde una casilla vacia en el tablero real).
+        let (b_viejo, descartadas) =
+            aplicar_viejo_descartando_invalidas(Board::from_fen(crate::STARTPOS).unwrap(), MOVES_CORRUPTOS);
+        assert!(
+            descartadas >= 1,
+            "el flujo viejo descarta en silencio la jugada corrupta (y las que dependen de ella)"
+        );
+
+        let b_real = {
+            let mut br = Board::from_fen(crate::STARTPOS).unwrap();
+            let mut hr = Vec::new();
+            assert!(crate::aplicar_moves_position(&mut br, &mut hr, MOVES_LEGALES));
+            br
+        };
+        assert_ne!(
+            b_viejo.zobrist, b_real.zobrist,
+            "el tablero interno divergia del real tras descartar en silencio"
+        );
+
+        let legales_viejo = legal_raiz(&b_viejo);
+        let legales_real = legal_raiz(&b_real);
+        // En el tablero divergente la captura b5xc6 NUNCA ocurrio: el caballo
+        // negro sigue en c6. Por eso "c6d4" es legal ahi pero ILEGAL en el
+        // tablero real (ahi c6 lo ocupa un peon negro, no un caballo) -- igual
+        // que h5c5 era "legal" en el tablero interno corrupto del incidente y
+        // no existia en el tablero real.
+        assert!(
+            legales_viejo.contains(&"c6d4".to_string()),
+            "el tablero divergente debe ofrecer jugadas del caballo fantasma en c6 (c6d4)"
+        );
+        assert!(
+            !legales_real.contains(&"c6d4".to_string()),
+            "c6d4 debe ser ILEGAL en el tablero real (en c6 hay un peon, no un caballo)"
+        );
+    }
+
+    #[test]
+    fn tras_rechazo_la_busqueda_lazy_smp_usa_el_tablero_sano() {
+        // El rechazo ocurre en el parser de "position", comun a los caminos de
+        // 1 hilo y lazy_smp: un stream corrupto nunca llega a la busqueda.
+        // Aqui se verifica el contrato completo: tras un rechazo, el tablero
+        // vuelve a la ultima posicion valida y la busqueda multihilo posterior
+        // corre sobre ella y devuelve bestmove legal.
+        let mut b = Board::from_fen(crate::STARTPOS).unwrap();
+        let mut hist: Vec<u64> = Vec::new();
+        assert!(crate::aplicar_moves_position(&mut b, &mut hist, MOVES_LEGALES));
+        let b_previa = b;
+        let hist_previa = hist.clone();
+        let legales = legal_raiz(&b_previa);
+
+        // Un stream corrupto RELATIVO a esta posicion (empieza desde startpos,
+        // inaplicable aqui): debe rechazarse y restaurar el par completo.
+        assert!(!crate::aplicar_moves_position(&mut b, &mut hist, MOVES_CORRUPTOS));
+        assert_eq!(b.zobrist, b_previa.zobrist, "tablero restaurado tras rechazo");
+        assert_eq!(hist.len(), hist_previa.len(), "historial restaurado tras rechazo");
+
+        let (tt, mask) = construir_tt(64);
+        let generacion = std::sync::atomic::AtomicU8::new(0);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mv, _sc, _nodos, _res) = buscar_lazy_smp(
+            &b,
+            Some(100),
+            64,
+            4,
+            &tt,
+            &generacion,
+            mask,
+            true,
+            true,
+            0,
+            &hist,
+            stop.clone(),
+            None,
+        );
+        let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
+        assert!(
+            legales.contains(&uci),
+            "lazy_smp sobre la posicion restaurada: bestmove {} ilegal",
+            uci
+        );
+    }
+}
+
+#[cfg(test)]
+mod validacion_movegen_from_to {
+    use super::*;
+    use crate::types::{Color, PieceType, file_of, rank_of};
+
+    const FEN_H5C5: &str = "8/3P1kp1/5p1p/2q5/8/8/1P1Q2P1/6K1 b - - 6 40";
+
+    /// Para cada movimiento legal generado verifica el invariante basico:
+    /// hay una pieza del bando correcto en `from`, y la geometria del
+    /// movimiento coincide con esa pieza (fila/columna/diagonal de las
+    /// deslizantes, L del caballo, etc.). Un swap de from/to rompe este
+    /// invariante en el 100% de los casos (pieza ausente en 'from').
+    fn validar_geometria(b: &Board, mv: &Move) -> Option<String> {
+        let (color, pt) = b.piece_at(mv.from)?;
+        if color != b.turn {
+            return Some(format!("pieza de color equivocado en from={}", mv.to_uci()));
+        }
+        if mv.flag == MoveFlag::CastleKing || mv.flag == MoveFlag::CastleQueen {
+            // El enroque se valida con reyes/torres; solo chequeamos rey.
+            if pt != PieceType::King {
+                return Some(format!("enroque sin rey: {}", mv.to_uci()));
+            }
+            return None;
+        }
+        let (f1, r1) = (file_of(mv.from) as i32, rank_of(mv.from) as i32);
+        let (f2, r2) = (file_of(mv.to) as i32, rank_of(mv.to) as i32);
+        let df = (f2 - f1).abs();
+        let dr = (r2 - r1).abs();
+        let ok = match pt {
+            PieceType::Pawn => {
+                let dir = if b.turn == Color::White { 1 } else { -1 };
+                let avance = (r2 - r1) == dir && df == 0
+                    || (r2 - r1) == 2 * dir && df == 0
+                    || (r2 - r1) == dir && df == 1; // captura o al paso
+                let captura = df == 1 && (r2 - r1) == dir;
+                (avance && (df == 0 || captura)) || (captura && mv.flag == MoveFlag::Capture)
+                    || (mv.flag == MoveFlag::EnPassant && captura)
+            }
+            PieceType::Knight => (df == 1 && dr == 2) || (df == 2 && dr == 1),
+            PieceType::Bishop => df == dr && df != 0,
+            PieceType::Rook => (df == 0) != (dr == 0) && (df != 0 || dr != 0),
+            PieceType::Queen => (df == dr && df != 0) || ((df == 0) != (dr == 0) && (df != 0 || dr != 0)),
+            PieceType::King => df <= 1 && dr <= 1,
+        };
+        if !ok {
+            Some(format!(
+                "{}: geometria invalida para pieza {:?} (df={}, dr={})",
+                mv.to_uci(),
+                pt,
+                df,
+                dr
+            ))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn todo_movimiento_generado_tiene_pieza_en_from_y_geometria_valida() {
+        let fens = [
+            FEN_H5C5,
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 0 1",
+            "8/8/3k4/8/8/4K3/8/8 w - - 0 1",
+            "k7/8/8/8/8/8/8/K6Q w - - 0 1",
+            "8/8/8/3pP3/8/8/8/4K2k w - d6 0 1",
+        ];
+        for fen in fens {
+            let b = match Board::from_fen(fen) {
+                Ok(b) => b,
+                Err(_) => continue, // el FEN ilegal del incidente no se puede construir
+            };
+            for mv in generate_legal(&b) {
+                if let Some(err) = validar_geometria(&b, &mv) {
+                    panic!("FEN {} -> {}: {}", fen, mv.to_uci(), err);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_hay_pieza_en_from_nunca() {
+        // Sobre el FEN del incidente (que from_fen rechaza por ilegal), no
+        // podemos construir el tablero; pero la propiedad importante es que
+        // ningun movimiento generado apunte a una casilla vacia como origen.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "k7/8/8/8/8/8/8/K6Q b - - 0 1", // dama h1 clava al rey a8: turno negro (legal)
+        ] {
+            let b = Board::from_fen(fen).unwrap();
+            for mv in generate_legal(&b) {
+                assert!(
+                    b.piece_at(mv.from).is_some(),
+                    "{}: 'from' vacio (swap from/to?)",
+                    mv.to_uci()
+                );
+            }
+        }
+    }
+}
