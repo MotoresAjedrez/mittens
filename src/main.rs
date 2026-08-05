@@ -543,6 +543,48 @@ fn parse_uci_move(b: &Board, uci: &str) -> Option<Move> {
         .find(|m| m.from == from && m.to == to && m.promotion == promo)
 }
 
+/// Aplica la lista "moves ..." del comando UCI "position" de forma ESTRICTA:
+/// TODAS las jugadas deben ser legales en la posicion actual del motor. Si
+/// cualquiera falla, la posicion completa se rechaza (devuelve false SIN
+/// tocar `board` ni `game_history`) y el llamador restaura la ultima
+/// posicion valida (ver el handler de "position" en uci_loop, que hace
+/// snapshot de board + game_history antes de parsear).
+///
+/// POR QUE: antes cada jugada ilegal se saltaba en silencio y la busqueda
+/// seguia con un tablero interno DIVERGENTE del juego real -- el motor podia
+/// emitir jugadas perfectamente legales en su mundo pero ILEGALES en la
+/// partida real (clase de bug del incidente 'bestmove h5c5' con la dama en
+/// c5: la dama estaba en h5 en el tablero interno porque una jugada previa
+/// del stream se habia descartado en silencio). Un stream inconsistente es
+/// un error grave del GUI/driver; se reporta y se conserva la ultima
+/// posicion valida en vez de seguir jugando desde un tablero inventado.
+fn aplicar_moves_position(
+    board: &mut Board,
+    game_history: &mut Vec<u64>,
+    moves_uci: &[&str],
+) -> bool {
+    let mut b2 = *board;
+    let mut hist: Vec<u64> = Vec::with_capacity(moves_uci.len());
+    for uci in moves_uci {
+        match parse_uci_move(&b2, uci) {
+            Some(mv) => {
+                hist.push(b2.zobrist);
+                b2 = b2.make_move(&mv);
+            }
+            None => {
+                println!(
+                    "info string error de position: jugada ilegal o inaplicable en este tablero: {}",
+                    uci
+                );
+                return false;
+            }
+        }
+    }
+    *board = b2;
+    *game_history = hist;
+    true
+}
+
 /// Construye una jugada SIN validar legalidad real de movimiento (solo
 /// determina el flag -- Captura/AlPaso/Silenciosa -- a partir del estado
 /// del tablero). Necesario para los casos sinteticos de test de SEE, donde
@@ -1250,6 +1292,14 @@ fn uci_loop() {
                     .set_nnue_classical_depth(nnue_classical_depth);
             }
             "position" => {
+                // Snapshot del estado PREVIO (tablero + historial de repeticion):
+                // si el stream de jugadas resulta inconsistente, se restaura este
+                // par completo como "ultima posicion valida". Sin el snapshot, un
+                // rechazo dejaria el tablero NUEVO (startpos/fen sin moves) con el
+                // historial de la PARTIDA ANTERIOR -- un estado mixto que romperia
+                // la deteccion de repeticion en el siguiente "go".
+                let board_previo = board;
+                let hist_previo = game_history.clone();
                 let mut idx = 1;
                 if partes.get(1) == Some(&"startpos") {
                     board = Board::from_fen(STARTPOS).unwrap();
@@ -1275,14 +1325,19 @@ fn uci_loop() {
                 // Historial de claves Zobrist de la partida real (para deteccion
                 // de repeticion) -- clave de CADA posicion ancestro, sin incluir
                 // la posicion final/actual (esa la maneja negamax directamente).
-                game_history.clear();
+                // ESTRICTO: si alguna jugada del stream es ilegal, se rechaza la
+                // posicion completa y se RESTAURA la ultima posicion valida
+                // (tablero + historial; aplicar_moves_position imprime el error)
+                // -- nunca divergir en silencio ni dejar estado mixto.
                 if partes.get(idx) == Some(&"moves") {
-                    for uci in &partes[idx + 1..] {
-                        if let Some(mv) = parse_uci_move(&board, uci) {
-                            game_history.push(board.zobrist);
-                            board = board.make_move(&mv);
-                        }
+                    let moves_uci: Vec<&str> = partes[idx + 1..].to_vec();
+                    if !aplicar_moves_position(&mut board, &mut game_history, &moves_uci) {
+                        board = board_previo;
+                        game_history = hist_previo;
+                        continue;
                     }
+                } else {
+                    game_history.clear();
                 }
             }
             "go" => {
