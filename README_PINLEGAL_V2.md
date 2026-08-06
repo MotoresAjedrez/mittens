@@ -1,4 +1,4 @@
-# MiMotor Tal — pinlegal_v2 (fuente limpia)
+# Mittens — pinlegal_v2 (fuente limpia)
 
 Esta copia está preparada para experimentar con Razoring y SEE Pruning sin
 mezclar HalfKP ni Correction History.
