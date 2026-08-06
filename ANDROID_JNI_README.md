@@ -1,4 +1,4 @@
-# MiMotor Tal en Android — puente JNI (entrega para el agente de la app Kotlin)
+# Mittens en Android — puente JNI (entrega para el agente de la app Kotlin)
 
 Este documento explica cómo enchufar el motor de ajedrez (Rust) a una app
 Android. **Toda la parte nativa ya está compilada y probada**; del lado
