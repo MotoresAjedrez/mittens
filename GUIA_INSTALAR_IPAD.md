@@ -1,4 +1,4 @@
-# Guía: instalar MiMotorTal en tu iPhone o iPad
+# Guía: instalar Mittens en tu iPhone o iPad
 
 Esta guía es para instalar la app **MiMotorTal** (tu motor de ajedrez) en un
 iPhone o iPad **tuyo**, usando solo un **Apple ID gratuito**. No hace falta
