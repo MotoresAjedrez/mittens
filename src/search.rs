@@ -2188,9 +2188,13 @@ impl Searcher {
         // (repeticion o regla de 50), reportarla de inmediato con el score
         // de tablas en vez de dejar que la profundizacion iterativa devuelva
         // un score/PV no-cero incorrecto. Mismo criterio que negamax.
-        if self.posicion_raiz_tablas(b) {
-            return (None, draw_score(b, &root_eval, self.nnue_de(&root_eval)), 0);
-        }
+        // OJO (fix bestmove 0000): reportar el score de tablas NO debe
+        // significar quedarse sin jugada. Antes se hacia `return (None, ...)`
+        // y el UCI imprimia "bestmove 0000" en cualquier posicion repetida,
+        // perdiendo la partida. Ahora se busca normalmente y solo se
+        // SOBRESCRIBE el score al final.
+        let raiz_tablas = self.posicion_raiz_tablas(b);
+        let sc_tablas = draw_score(b, &root_eval, self.nnue_de(&root_eval));
         let mut mejor_mv = None;
         let mut mejor_sc: i32 = -INFINITO;
         for d in 1..=depth {
@@ -2286,7 +2290,8 @@ impl Searcher {
                 }
                 self.path_len = self.path_len.saturating_sub(1);
                 if interrumpido {
-                    return (mejor_mv.or(Some(actual_mv)), mejor_sc, self.nodes);
+                    let sc = if raiz_tablas { sc_tablas } else { mejor_sc };
+                    return (mejor_mv.or(Some(actual_mv)), sc, self.nodes);
                 }
                 if actual_sc <= vent_alpha && vent_alpha > -INFINITO {
                     ancho = ancho.saturating_mul(2);
@@ -2303,7 +2308,8 @@ impl Searcher {
             mejor_mv = Some(actual_mv);
             mejor_sc = actual_sc;
         }
-        (mejor_mv, mejor_sc, self.nodes)
+        let sc_final = if raiz_tablas { sc_tablas } else { mejor_sc };
+        (mejor_mv, sc_final, self.nodes)
     }
 
     /// Busqueda con presupuesto de tiempo (para UCI "go movetime").
@@ -2351,9 +2357,13 @@ impl Searcher {
         // incorrecto. Va ANTES del libro y de la tabla de finales: un
         // reclamo de tablas por repeticion es un hecho de la partida, no
         // una decision de apertura/final.
-        if self.posicion_raiz_tablas(b) {
-            return (None, draw_score(b, &root_eval, self.nnue_de(&root_eval)), 0);
-        }
+        // OJO (fix bestmove 0000): igual que en search_fixed_depth, tablas en
+        // la raiz NO puede devolver "sin jugada" -- el UCI lo imprimia como
+        // "bestmove 0000" (equivalente a abandonar) en cualquier posicion
+        // repetida o con la regla de 50 cumplida. Se sigue buscando una
+        // jugada normal y solo se sobrescribe el score reportado.
+        let raiz_tablas = self.posicion_raiz_tablas(b);
+        let sc_tablas = draw_score(b, &root_eval, self.nnue_de(&root_eval));
 
         // Libro de aperturas: se consulta para CUALQUIER turno (blancas o
         // negras -- la clave Polyglot ya codifica de quien es el turno), no
@@ -2579,7 +2589,8 @@ impl Searcher {
         if let Some(mv) = mejor_mv {
             self.tt_store(b.zobrist, mejor_prof, mejor_sc, 0, TTFlag::Exact, Some(mv));
         }
-        (mejor_mv, mejor_sc, mejor_prof)
+        let sc_final = if raiz_tablas { sc_tablas } else { mejor_sc };
+        (mejor_mv, sc_final, mejor_prof)
     }
 }
 
@@ -3199,6 +3210,42 @@ mod reproduccion_h5c5 {
         assert!(
             !legales_real.contains(&"c6d4".to_string()),
             "c6d4 debe ser ILEGAL en el tablero real (en c6 hay un peon, no un caballo)"
+        );
+    }
+
+    #[test]
+    fn repeticion_en_la_raiz_devuelve_jugada_legal_no_0000() {
+        // Regresion del bug "bestmove 0000": con la posicion de la raiz ya
+        // repetida (o con la regla de 50 cumplida) el motor devolvia None y
+        // el UCI imprimia "bestmove 0000", que en la practica es abandonar.
+        // Debe devolver una jugada legal y reportar score de tablas.
+        let mut b = Board::from_fen(crate::STARTPOS).unwrap();
+        let mut hist: Vec<u64> = Vec::new();
+        let repeticion = ["g1f3", "g8f6", "f3g1", "f6g8"];
+        assert!(crate::aplicar_moves_position(&mut b, &mut hist, &repeticion));
+        let legales = legal_raiz(&b);
+
+        let mut s = Searcher::new(16);
+        s.set_game_history(hist.clone());
+        let (mv, sc, _) = s.search_time(&b, Some(200), 64, |_, _, _, _| {});
+        let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
+        assert!(
+            legales.contains(&uci),
+            "repeticion en la raiz: bestmove {} no es legal",
+            uci
+        );
+        assert_eq!(sc, 0, "score de tablas esperado en posicion repetida");
+
+        // Regla de 50 jugadas cumplida: mismo contrato.
+        let b50 = Board::from_fen("8/8/4k3/8/8/4K3/6R1/8 w - - 100 120").unwrap();
+        let legales50 = legal_raiz(&b50);
+        let mut s50 = Searcher::new(16);
+        let (mv50, _sc50, _) = s50.search_time(&b50, Some(200), 64, |_, _, _, _| {});
+        let uci50 = mv50.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
+        assert!(
+            legales50.contains(&uci50),
+            "regla de 50 en la raiz: bestmove {} no es legal",
+            uci50
         );
     }
 
