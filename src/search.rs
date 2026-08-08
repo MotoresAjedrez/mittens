@@ -1095,6 +1095,11 @@ impl Searcher {
         prev: Option<(usize, usize)>,
         prev2: Option<(usize, usize)>,
         see_precalculado: Option<i32>,
+        // Mapa de casillas atacadas por el rival, construido perezosamente
+        // UNA vez por nodo y compartido entre todas las jugadas silenciosas
+        // (antes: is_square_attacked_by por cada jugada, ~5 lookups cada una).
+        // Equivalencia exacta garantizada por Board::attack_map.
+        amenazas: &mut Option<u64>,
     ) -> i32 {
         if Some(*mv) == tt_move {
             return -1_000_000;
@@ -1127,7 +1132,8 @@ impl Searcher {
                 return -2800;
             }
         }
-        let h = if casilla_amenazada(b, mv.to) {
+        let mapa = *amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
+        let h = if crate::bitboard::bit(mv.to) & mapa != 0 {
             self.history_amenaza[mv.from as usize][mv.to as usize]
         } else {
             self.history[mv.from as usize][mv.to as usize]
@@ -1176,8 +1182,9 @@ impl Searcher {
         // mutable de `self` vivo mientras se llama a `clave_orden_movimiento`
         // (que toma `&self`); 1KB es despreciable frente al coste del orden.
         let mut claves = self.claves_orden_movimiento;
+        let mut amenazas: Option<u64> = None;
         for (mv, k) in moves.iter().zip(claves.iter_mut()) {
-            *k = self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, None);
+            *k = self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, None, &mut amenazas);
         }
         // Insertion sort estable sobre (moves, claves) en paralelo.
         for i in 1..n {
@@ -1209,6 +1216,24 @@ impl Searcher {
         if b.halfmove_clock >= 100 {
             return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
         }
+
+        // TT en quiescence: cualquier entrada (todas tienen depth >= 0, y
+        // quiescence equivale a depth <= 0) sirve para cortar aqui con las
+        // mismas reglas de cota que en negamax. Ahorra la eval NNUE completa
+        // y toda la generacion/orden de capturas en posiciones ya resueltas.
+        let key = b.zobrist;
+        let alpha_orig = alpha;
+        let mut tt_mv: Option<Move> = None;
+        if let Some(mut entry) = self.tt_probe(key) {
+            entry.score = score_from_tt(entry.score, ply);
+            tt_mv = entry.best;
+            match entry.flag {
+                TTFlag::Exact => return Ok(entry.score),
+                TTFlag::Beta if entry.score >= beta => return Ok(entry.score),
+                TTFlag::Alpha if entry.score <= alpha => return Ok(entry.score),
+                _ => {}
+            }
+        }
         let en_jaque = b.in_check(b.turn);
 
         // En jaque no existe "stand pat": quedarse quieto es ilegal. Se deben
@@ -1218,7 +1243,7 @@ impl Searcher {
             if evasiones.is_empty() {
                 return Ok(-MATE + ply as i32);
             }
-            self.order_moves_ply(b, &mut evasiones, None, ply, None, None);
+            self.order_moves_ply(b, &mut evasiones, tt_mv, ply, None, None);
             if ply >= MAX_PLY {
                 // Tope defensivo contra secuencias patologicas de jaques. Aun
                 // detectamos mate arriba; para posiciones no terminales usamos
@@ -1226,6 +1251,7 @@ impl Searcher {
                 return Ok(self.evaluar_quiescence(b, eval_state));
             }
             let mut best = -INFINITO;
+            let mut best_mv: Option<Move> = None;
             for mv in evasiones {
                 let next = b.make_move(&mv);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
@@ -1235,12 +1261,23 @@ impl Searcher {
                 let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1);
                 self.salir_hijo(&next_eval, b, &next);
                 let sc = -res?;
-                best = best.max(sc);
+                if sc > best {
+                    best = sc;
+                    best_mv = Some(mv);
+                }
                 alpha = alpha.max(sc);
                 if alpha >= beta {
                     break;
                 }
             }
+            let flag = if best >= beta {
+                TTFlag::Beta
+            } else if best <= alpha_orig {
+                TTFlag::Alpha
+            } else {
+                TTFlag::Exact
+            };
+            self.tt_store(key, 0, best, ply, flag, best_mv);
             return Ok(best);
         }
 
@@ -1249,6 +1286,7 @@ impl Searcher {
             return Ok(stand_pat);
         }
         if stand_pat >= beta {
+            self.tt_store(key, 0, stand_pat, ply, TTFlag::Beta, None);
             return Ok(beta);
         }
         alpha = alpha.max(stand_pat);
@@ -1273,9 +1311,13 @@ impl Searcher {
         }
         // En quiescence la poda SEE se aplica despues del ordenamiento. Llevar
         // el resultado junto a la jugada evita calcular el mismo SEE dos veces.
-        moves.sort_by_key(|(mv, see)| self.clave_orden_movimiento(b, mv, None, ply, None, None, *see));
+        let mut amenazas_q: Option<u64> = None;
+        moves.sort_by_key(|(mv, see)| {
+            self.clave_orden_movimiento(b, mv, tt_mv, ply, None, None, *see, &mut amenazas_q)
+        });
 
         let mut best = stand_pat;
+        let mut best_mv: Option<Move> = None;
         for (mv, see) in moves {
             let next = b.make_move(&mv);
             let da_jaque = next.in_check(next.turn);
@@ -1301,12 +1343,23 @@ impl Searcher {
             let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1);
             self.salir_hijo(&next_eval, b, &next);
             let sc = -res?;
-            best = best.max(sc);
+            if sc > best {
+                best = sc;
+                best_mv = Some(mv);
+            }
             alpha = alpha.max(sc);
             if alpha >= beta {
                 break;
             }
         }
+        let flag = if best >= beta {
+            TTFlag::Beta
+        } else if best <= alpha_orig {
+            TTFlag::Alpha
+        } else {
+            TTFlag::Exact
+        };
+        self.tt_store(key, 0, best, ply, flag, best_mv);
         Ok(best)
     }
 

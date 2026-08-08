@@ -433,6 +433,38 @@ impl Board {
         false
     }
 
+    /// Mapa completo de casillas atacadas por `by_color` en la posicion
+    /// actual: la union de los ataques de TODAS sus piezas. Para cualquier
+    /// casilla sq, `attack_map(c) & bit(sq) != 0` es exactamente equivalente
+    /// a `is_square_attacked_by(sq, c)` (mismos generadores de ataque, misma
+    /// ocupacion). Se usa para amortizar: cuando hay que consultar la amenaza
+    /// de MUCHAS casillas en el mismo nodo (ordenamiento de jugadas
+    /// silenciosas), construir el mapa una vez (~O(piezas) lookups) es mas
+    /// barato que ~5 lookups por cada consulta individual.
+    pub fn attack_map(&self, by_color: Color) -> Bitboard {
+        let p = &self.pieces[by_color as usize];
+        let mut map: Bitboard = EMPTY;
+        // Peones: mismas tablas precalculadas que is_square_attacked_by.
+        let mut pawns = p[PieceType::Pawn as usize];
+        while pawns != 0 {
+            map |= pawn_attacks(by_color, pop_lsb(&mut pawns));
+        }
+        let mut knights = p[PieceType::Knight as usize];
+        while knights != 0 {
+            map |= knight_attacks(pop_lsb(&mut knights));
+        }
+        map |= king_attacks(crate::bitboard::lsb(p[PieceType::King as usize]));
+        let mut alfil_dama = p[PieceType::Bishop as usize] | p[PieceType::Queen as usize];
+        while alfil_dama != 0 {
+            map |= bishop_attacks(pop_lsb(&mut alfil_dama), self.occupied);
+        }
+        let mut torre_dama = p[PieceType::Rook as usize] | p[PieceType::Queen as usize];
+        while torre_dama != 0 {
+            map |= rook_attacks(pop_lsb(&mut torre_dama), self.occupied);
+        }
+        map
+    }
+
     pub fn king_square(&self, color: Color) -> Square {
         crate::bitboard::lsb(self.pieces[color as usize][PieceType::King as usize])
     }
