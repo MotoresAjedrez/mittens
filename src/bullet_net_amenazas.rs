@@ -392,13 +392,73 @@ impl RedBulletAmenazas {
     #[inline(always)]
     fn sumar(&self, acc: &mut [i32; H], feature: usize) {
         let col = self.columna(feature);
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut j = 0;
+            while j + 8 <= H {
+                let w16 = vld1q_s16(col.as_ptr().add(j));
+                let w_lo = vmovl_s16(vget_low_s16(w16));
+                let w_hi = vmovl_s16(vget_high_s16(w16));
+                let a_lo = vld1q_s32(acc.as_ptr().add(j));
+                let a_hi = vld1q_s32(acc.as_ptr().add(j + 4));
+                vst1q_s32(acc.as_mut_ptr().add(j), vaddq_s32(a_lo, w_lo));
+                vst1q_s32(acc.as_mut_ptr().add(j + 4), vaddq_s32(a_hi, w_hi));
+                j += 8;
+            }
+            for k in j..H {
+                acc[k] += col[k] as i32;
+            }
+            return;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.sumar_escalar(acc, feature);
+        }
+    }
+
+    #[inline(always)]
+    fn restar(&self, acc: &mut [i32; H], feature: usize) {
+        let col = self.columna(feature);
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            let mut j = 0;
+            while j + 8 <= H {
+                let w16 = vld1q_s16(col.as_ptr().add(j));
+                let w_lo = vmovl_s16(vget_low_s16(w16));
+                let w_hi = vmovl_s16(vget_high_s16(w16));
+                let a_lo = vld1q_s32(acc.as_ptr().add(j));
+                let a_hi = vld1q_s32(acc.as_ptr().add(j + 4));
+                vst1q_s32(acc.as_mut_ptr().add(j), vsubq_s32(a_lo, w_lo));
+                vst1q_s32(acc.as_mut_ptr().add(j + 4), vsubq_s32(a_hi, w_hi));
+                j += 8;
+            }
+            for k in j..H {
+                acc[k] -= col[k] as i32;
+            }
+            return;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.restar_escalar(acc, feature);
+        }
+    }
+
+    /// Camino escalar original de `sumar`/`restar`. Conservado como
+    /// referencia de correccion para el test `sumar_restar_neon_igual_que_escalar`.
+    #[inline(always)]
+    #[allow(dead_code)]
+    fn sumar_escalar(&self, acc: &mut [i32; H], feature: usize) {
+        let col = self.columna(feature);
         for (a, &w) in acc.iter_mut().zip(col) {
             *a += w as i32;
         }
     }
 
     #[inline(always)]
-    fn restar(&self, acc: &mut [i32; H], feature: usize) {
+    #[allow(dead_code)]
+    fn restar_escalar(&self, acc: &mut [i32; H], feature: usize) {
         let col = self.columna(feature);
         for (a, &w) in acc.iter_mut().zip(col) {
             *a -= w as i32;
@@ -415,6 +475,86 @@ impl RedBulletAmenazas {
         } else {
             (&acc[1], &acc[0])
         };
+        let suma = self.producto_punto(yo, rival);
+        let salida = suma / QA as i64 + self.l1b as i64;
+        (salida * scale() as i64) as f32 / (QA * QB) as f32
+    }
+
+    /// Capa de salida vectorizada con NEON: mismo patron que
+    /// `bullet_net.rs::producto_punto`, pero AQUI el acumulador ya es i32
+    /// (no i16 como alla), asi que no hace falta el paso de ensanchado
+    /// i16->i32 sobre el acumulador -- solo sobre los pesos `l1w` (i16).
+    #[inline(always)]
+    fn producto_punto(&self, yo: &[i32; H], rival: &[i32; H]) -> i64 {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            // RANGOS (identicos al razonamiento de bullet_net.rs):
+            //   v = clamp(acumulador, 0, 255)   ->  0..255
+            //   v*v                             ->  0..65025   (cabe en i32)
+            //   w es i16                        ->  -32768..32767
+            //   v*v*w                           ->  |.| <= 65025*32768 = 2.13e9
+            // Cabe justo en i32 (limite 2.147e9): cada termino se calcula en
+            // i32 con vmulq_s32 sin desbordar nunca. La suma de los 1024
+            // terminos SI desbordaria i32, por eso se ensancha a i64 con
+            // vpadalq_s32 (suma por pares de i32 -> i64). La suma entera es
+            // asociativa: el resultado es EXACTAMENTE el mismo que el bucle
+            // escalar.
+            //
+            // CUATRO acumuladores independientes por el mismo motivo que en
+            // bullet_net.rs: con uno solo las multiplicaciones formarian una
+            // cadena de dependencias y el bucle quedaria limitado por
+            // latencia en vez de throughput.
+            let cero = vdupq_n_s32(0);
+            let tope = vdupq_n_s32(QA);
+            let w = self.l1w.as_ptr();
+            let mut acc0 = vdupq_n_s64(0);
+            let mut acc1 = vdupq_n_s64(0);
+            let mut acc2 = vdupq_n_s64(0);
+            let mut acc3 = vdupq_n_s64(0);
+            // Cierre que procesa 4 neuronas (un vector de i32): clamp ->
+            // v*v -> ensanchar el peso i16 a i32 -> por el peso -> acumular
+            // ensanchando a i64.
+            macro_rules! bloque {
+                ($src:expr, $peso:expr, $a:expr) => {{
+                    let v32 = vminq_s32(vmaxq_s32(vld1q_s32($src), cero), tope);
+                    let w16 = vld1_s16($peso);
+                    let w32 = vmovl_s16(w16);
+                    let p = vmulq_s32(vmulq_s32(v32, v32), w32);
+                    $a = vpadalq_s32($a, p);
+                }};
+            }
+            let mut j = 0;
+            while j + 8 <= H {
+                bloque!(yo.as_ptr().add(j), w.add(j), acc0);
+                bloque!(yo.as_ptr().add(j + 4), w.add(j + 4), acc1);
+                bloque!(rival.as_ptr().add(j), w.add(H + j), acc2);
+                bloque!(rival.as_ptr().add(j + 4), w.add(H + j + 4), acc3);
+                j += 8;
+            }
+            let acc = vaddq_s64(vaddq_s64(acc0, acc1), vaddq_s64(acc2, acc3));
+            let mut suma = vgetq_lane_s64::<0>(acc) + vgetq_lane_s64::<1>(acc);
+            // Cola escalar por si H no fuera multiplo de 8 (hoy H=512, no
+            // se ejecuta nunca).
+            for k in j..H {
+                let v = yo[k].clamp(0, QA) as i64;
+                suma += v * v * self.l1w[k] as i64;
+                let u = rival[k].clamp(0, QA) as i64;
+                suma += u * u * self.l1w[H + k] as i64;
+            }
+            return suma;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.producto_punto_escalar(yo, rival)
+        }
+    }
+
+    /// Camino ESCALAR original de la capa de salida. Se conserva como
+    /// referencia de correccion: el test `salida_neon_igual_que_escalar`
+    /// compara termino a termino contra la version vectorizada.
+    #[inline(always)]
+    fn producto_punto_escalar(&self, yo: &[i32; H], rival: &[i32; H]) -> i64 {
         let mut suma: i64 = 0;
         // SCReLU: clamp(x, 0, QA)^2. Misma escala que bullet_net.rs.
         for j in 0..H {
@@ -423,6 +563,19 @@ impl RedBulletAmenazas {
             let u = rival[j].clamp(0, QA) as i64;
             suma += u * u * self.l1w[H + j] as i64;
         }
+        suma
+    }
+
+    /// Igual que `salida_desde_acumuladores` pero forzando el camino
+    /// escalar. Solo para tests.
+    #[cfg(test)]
+    fn salida_desde_acumuladores_escalar(&self, acc: &[[i32; H]; 2], turn: Color) -> f32 {
+        let (yo, rival) = if turn == Color::White {
+            (&acc[0], &acc[1])
+        } else {
+            (&acc[1], &acc[0])
+        };
+        let suma = self.producto_punto_escalar(yo, rival);
         let salida = suma / QA as i64 + self.l1b as i64;
         (salida * scale() as i64) as f32 / (QA * QB) as f32
     }
@@ -1340,5 +1493,154 @@ fn medir_speedup_acumulador() {
     );
     sink = black_box(sink);
     assert!(sink.is_finite(), "sink no finito");
+}
+
+/// EQUIVALENCIA NUMERICA del camino NEON (sumar/restar del acumulador y la
+/// capa de salida) contra el camino escalar original. Mismo criterio que
+/// `bullet_net.rs::salida_neon_igual_que_escalar`: igualdad EXACTA, no
+/// aproximada. Recorre >100 posiciones: 8 aperturas/finales/tacticas de
+/// `fens_regresion` mas partidas aleatorias legales de hasta 14 plies cada
+/// una, con pesos sinteticos (no depende del archivo de pesos real).
+#[test]
+fn neon_igual_que_escalar_100_posiciones() {
+    let red = red_sintetica();
+    let mut comprobadas = 0usize;
+    let mut semilla = 0xD00D_FEED_1357u64;
+
+    for fen in fens_regresion() {
+        let mut tablero = Board::from_fen(fen).unwrap();
+        for _ply in 0..14 {
+            // 1) sumar/restar: comparar el acumulador construido con el
+            // camino NEON (via desde_tablero, que llama a `sumar`) contra
+            // uno construido a mano con el camino escalar.
+            let acc_neon = AcumBulletAmenazas::desde_tablero(red, &tablero);
+
+            let mut acc_escalar = [[0i32; H]; 2];
+            for j in 0..H {
+                acc_escalar[0][j] = red.l0b[j] as i32;
+                acc_escalar[1][j] = red.l0b[j] as i32;
+            }
+            let mut pares: Vec<(usize, usize)> = Vec::with_capacity(MAX_ACTIVE);
+            map_features(&tablero, |s, n| pares.push((s, n)));
+            let (stm_i, ntm_i) = if tablero.turn == Color::White { (0usize, 1usize) } else { (1, 0) };
+            for &(s, _) in &pares {
+                red.sumar_escalar(&mut acc_escalar[stm_i], s);
+            }
+            for &(_, n) in &pares {
+                red.sumar_escalar(&mut acc_escalar[ntm_i], n);
+            }
+            assert_eq!(
+                acc_neon.acc, acc_escalar,
+                "sumar NEON != escalar en {}",
+                tablero.to_fen()
+            );
+
+            // restar: partir del acumulador ya sumado y restar todas las
+            // mismas features con cada camino; ambos deben volver al bias.
+            let mut r_neon = acc_neon.acc;
+            let mut r_escalar = acc_escalar;
+            for &(s, _) in &pares {
+                red.restar(&mut r_neon[stm_i], s);
+                red.restar_escalar(&mut r_escalar[stm_i], s);
+            }
+            for &(_, n) in &pares {
+                red.restar(&mut r_neon[ntm_i], n);
+                red.restar_escalar(&mut r_escalar[ntm_i], n);
+            }
+            assert_eq!(r_neon, r_escalar, "restar NEON != escalar en {}", tablero.to_fen());
+
+            // 2) capa de salida: NEON vs escalar sobre el MISMO acumulador.
+            let eval_neon = red.salida_desde_acumuladores(&acc_neon.acc, tablero.turn);
+            let eval_escalar = red.salida_desde_acumuladores_escalar(&acc_neon.acc, tablero.turn);
+            assert_eq!(
+                eval_neon, eval_escalar,
+                "salida NEON != escalar en {}",
+                tablero.to_fen()
+            );
+
+            comprobadas += 1;
+
+            let legales = crate::movegen::generate_legal(&tablero);
+            if legales.is_empty() {
+                break;
+            }
+            semilla ^= semilla << 7;
+            semilla ^= semilla >> 9;
+            let mv = legales[(semilla as usize) % legales.len()];
+            tablero = tablero.make_move(&mv);
+        }
+    }
+
+    assert!(comprobadas >= 100, "solo se comprobaron {comprobadas} posiciones");
+}
+
+/// Microbenchmark temporal: NEON vs escalar en `producto_punto` de forma
+/// aislada (sin ruido de movegen/TT/UCI). Solo imprime la razon, no impone
+/// aserciones de tiempo.
+#[test]
+fn microbench_producto_punto_neon_vs_escalar() {
+    use std::hint::black_box;
+    let red = red_sintetica();
+    let tablero = Board::from_fen(
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    )
+    .unwrap();
+    let acc = AcumBulletAmenazas::desde_tablero(red, &tablero);
+    let (yo, rival) = (&acc.acc[0], &acc.acc[1]);
+    let iter = 2_000_000usize;
+    let mut sink: i64 = 0;
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..iter {
+        sink = sink.wrapping_add(red.producto_punto(black_box(yo), black_box(rival)));
+    }
+    let t_neon = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    for _ in 0..iter {
+        sink = sink.wrapping_add(red.producto_punto_escalar(black_box(yo), black_box(rival)));
+    }
+    let t_escalar = t1.elapsed();
+
+    eprintln!(
+        "[microbench producto_punto] NEON: {:.4}s | escalar: {:.4}s | speedup x{:.2}",
+        t_neon.as_secs_f64(),
+        t_escalar.as_secs_f64(),
+        t_escalar.as_secs_f64() / t_neon.as_secs_f64()
+    );
+    sink = black_box(sink);
+    assert!(sink != i64::MIN || true, "sink dummy");
+}
+
+/// Microbenchmark temporal de `sumar`/`restar` (acumulador incremental):
+/// NEON vs escalar, aislado.
+#[test]
+fn microbench_sumar_restar_neon_vs_escalar() {
+    use std::hint::black_box;
+    let red = red_sintetica();
+    let iter = 3_000_000usize;
+
+    let mut acc_neon = [0i32; H];
+    let t0 = std::time::Instant::now();
+    for i in 0..iter {
+        red.sumar(black_box(&mut acc_neon), black_box(i % N_INPUTS));
+    }
+    let t_neon = t0.elapsed();
+
+    let mut acc_escalar = [0i32; H];
+    let t1 = std::time::Instant::now();
+    for i in 0..iter {
+        red.sumar_escalar(black_box(&mut acc_escalar), black_box(i % N_INPUTS));
+    }
+    let t_escalar = t1.elapsed();
+
+    eprintln!(
+        "[microbench sumar] NEON: {:.4}s | escalar: {:.4}s | speedup x{:.2}",
+        t_neon.as_secs_f64(),
+        t_escalar.as_secs_f64(),
+        t_escalar.as_secs_f64() / t_neon.as_secs_f64()
+    );
+    black_box(acc_neon);
+    black_box(acc_escalar);
 }
 }

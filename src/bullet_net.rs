@@ -59,42 +59,52 @@ fn scale() -> i32 {
 
 const ALINEACION: usize = 64;
 
-/// Bytes de pesos para una capa oculta de `h` neuronas.
-const fn bytes_utiles(h: usize) -> usize {
-    (N_ENTRADA * h + h + 2 * h + 1) * 2
+/// Bytes de pesos para una capa oculta de `h` neuronas y `b` "output
+/// buckets" (capas de salida por material). El formato viejo es b = 1.
+const fn bytes_utiles(h: usize, b: usize) -> usize {
+    (N_ENTRADA * h + h + b * 2 * h + b) * 2
 }
 
-/// Tamanos de capa oculta admitidos. Se distinguen por el tamano del
-/// archivo, que es distinto para cada uno.
-const OCULTAS_SOPORTADAS: [usize; 2] = [256, 512];
+/// Arquitecturas admitidas: (capa oculta, output buckets). Cada combinacion
+/// da un tamano de archivo DISTINTO, asi que el tamano identifica el
+/// formato sin necesidad de cabecera (los archivos viejos siguen cargando).
+const ARQUITECTURAS_SOPORTADAS: [(usize, usize); 3] = [(256, 1), (512, 1), (512, 8)];
+
+/// Maximo de output buckets soportado.
+pub const B_MAX: usize = 8;
 
 pub struct RedBullet {
     /// Neuronas de la capa oculta de ESTA red (256 o 512).
     h: usize,
+    /// Output buckets de ESTA red (1 = formato viejo, 8 = por material).
+    buckets: usize,
     /// [feature][neurona] -- 768 bloques contiguos de `h` pesos.
     l0w: Vec<i16>,
     l0b: [i16; H_MAX],
-    l1w: [i16; 2 * H_MAX],
-    l1b: i16,
+    /// Capa de salida: `buckets` bloques de 2*H_MAX pesos. Dentro de cada
+    /// bloque, la mitad "stm" empieza en 0 y la mitad "ntm" en H_MAX.
+    l1w: Vec<i16>,
+    /// Un sesgo de salida por bucket.
+    l1b: [i16; B_MAX],
 }
 
-/// Deduce el tamano de capa oculta a partir del tamano del archivo, o None
-/// si no corresponde a ninguna arquitectura bullet conocida.
-pub fn oculta_para_tamano(n: usize) -> Option<usize> {
-    OCULTAS_SOPORTADAS
+/// Deduce (oculta, buckets) a partir del tamano del archivo, o None si no
+/// corresponde a ninguna arquitectura bullet conocida.
+pub fn arquitectura_para_tamano(n: usize) -> Option<(usize, usize)> {
+    ARQUITECTURAS_SOPORTADAS
         .into_iter()
-        .find(|&h| n >= bytes_utiles(h) && n - bytes_utiles(h) < ALINEACION)
+        .find(|&(h, b)| n >= bytes_utiles(h, b) && n - bytes_utiles(h, b) < ALINEACION)
 }
 
 /// True si el tamano del archivo corresponde a esta arquitectura.
 pub fn tamano_plausible(n: usize) -> bool {
-    oculta_para_tamano(n).is_some()
+    arquitectura_para_tamano(n).is_some()
 }
 
 impl RedBullet {
     pub fn cargar_de_bytes(datos: &[u8]) -> Option<RedBullet> {
-        let h = oculta_para_tamano(datos.len())?;
-        let utiles = bytes_utiles(h);
+        let (h, buckets) = arquitectura_para_tamano(datos.len())?;
+        let utiles = bytes_utiles(h, buckets);
         // El relleno debe ser la firma "bullet" repetida; si no lo es, el
         // archivo no es lo que creemos y preferimos rechazarlo antes que
         // cargar pesos desalineados.
@@ -122,22 +132,32 @@ impl RedBullet {
         cursor += N_ENTRADA * h * 2;
         let l0b_v = leer(cursor, h);
         cursor += h * 2;
-        let l1w_v = leer(cursor, 2 * h);
-        cursor += 2 * h * 2;
-        let l1b = leer(cursor, 1)[0];
+        // l1w: `buckets` bloques consecutivos de [stm (h) | ntm (h)] (con
+        // buckets=1 es el formato viejo tal cual; con buckets>1 es el orden
+        // que produce SavedFormat::id("l1w").transpose() en bullet: los 2h
+        // pesos de cada bucket contiguos). Al copiarlo a bloques de 2*H_MAX
+        // hay que separar las mitades para que "ntm" empiece en H_MAX.
+        let mut l1w = vec![0i16; buckets * 2 * H_MAX];
+        for bk in 0..buckets {
+            let v = leer(cursor, 2 * h);
+            cursor += 2 * h * 2;
+            let base = bk * 2 * H_MAX;
+            l1w[base..base + h].copy_from_slice(&v[..h]);
+            l1w[base + H_MAX..base + H_MAX + h].copy_from_slice(&v[h..]);
+        }
+        let l1b_v = leer(cursor, buckets);
 
         let mut l0b = [0i16; H_MAX];
         l0b[..h].copy_from_slice(&l0b_v);
-        // l1w se guarda como [stm (h) | ntm (h)]; al copiarlo a un array de
-        // H_MAX hay que separar los dos bloques para que la mitad "ntm"
-        // empiece siempre en H_MAX, no en h.
-        let mut l1w = [0i16; 2 * H_MAX];
-        l1w[..h].copy_from_slice(&l1w_v[..h]);
-        l1w[H_MAX..H_MAX + h].copy_from_slice(&l1w_v[h..]);
+        let mut l1b = [0i16; B_MAX];
+        l1b[..buckets].copy_from_slice(&l1b_v);
 
-        eprintln!("info string NNUE bullet: capa oculta de {h} neuronas");
+        eprintln!(
+            "info string NNUE bullet: capa oculta de {h} neuronas, {buckets} output bucket(s)"
+        );
         Some(RedBullet {
             h,
+            buckets,
             l0w,
             l0b,
             l1w,
@@ -186,6 +206,21 @@ pub struct AcumBullet {
     /// Solo las primeras `red.h` posiciones son significativas.
     persp: [[i16; H_MAX]; 2],
     negras_mueven: bool,
+    /// Piezas totales en el tablero (reyes incluidos). Solo se usa para
+    /// elegir el output bucket; se mantiene incrementalmente.
+    piezas: u8,
+}
+
+/// Piezas totales (reyes incluidos) de un tablero.
+#[inline(always)]
+fn contar_piezas(b: &Board) -> u8 {
+    let mut n = 0u32;
+    for color in 0..2usize {
+        for &pt in ALL_PIECE_TYPES.iter() {
+            n += b.pieces[color][pt as usize].count_ones();
+        }
+    }
+    n as u8
 }
 
 impl AcumBullet {
@@ -205,6 +240,7 @@ impl AcumBullet {
             red,
             persp,
             negras_mueven: b.turn == Color::Black,
+            piezas: contar_piezas(b),
         }
     }
 
@@ -231,6 +267,7 @@ impl AcumBullet {
         let red = self.red;
         let nuevo = self;
         nuevo.negras_mueven = despues.turn == Color::Black;
+        nuevo.piezas = contar_piezas(despues);
         for color in 0..2usize {
             for (pt_idx, &pt) in ALL_PIECE_TYPES.iter().enumerate() {
                 let a = antes.pieces[color][pt as usize];
@@ -262,24 +299,133 @@ impl AcumBullet {
         } else {
             (&self.persp[0], &self.persp[1])
         };
-        let w = &self.red.l1w;
+        let bk = self.bucket();
+        let suma = self.producto_punto(yo, rival, bk);
+        let salida = suma / QA as i64 + self.red.l1b[bk] as i64;
+        (salida * scale() as i64) as f32 / (QA * QB) as f32
+    }
+
+    /// Indice del output bucket segun el material. Misma formula que
+    /// `MaterialCount<N>` de bullet: (piezas_totales - 2) / ceil(32/N),
+    /// contando TODAS las piezas, reyes incluidos. Con redes de 1 bucket
+    /// (formato viejo) siempre es 0.
+    #[inline(always)]
+    fn bucket(&self) -> usize {
+        let b = self.red.buckets;
+        if b == 1 {
+            return 0;
+        }
+        let divisor = 32usize.div_ceil(b);
+        let idx = (self.piezas.max(2) as usize - 2) / divisor;
+        idx.min(b - 1)
+    }
+
+    /// Capa de salida: SCReLU (clamp 0..QA, al cuadrado) por los pesos l1w,
+    /// sumando las dos perspectivas. Es el mismo papel que `Red::salida` en
+    /// neural.rs, que el perfilado senalo como ~80% del tiempo de busqueda:
+    /// se ejecuta COMPLETA (h*2 = 1024 terminos) en cada evaluacion.
+    #[inline(always)]
+    fn producto_punto(&self, yo: &[i16; H_MAX], rival: &[i16; H_MAX], bucket: usize) -> i64 {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            // RANGOS (verificados sobre los pesos reales y razonados para el
+            // caso peor posible del formato):
+            //   v = clamp(acumulador, 0, 255)   ->  0..255
+            //   v*v                             ->  0..65025   (cabe en i32)
+            //   w es i16                        ->  -32768..32767
+            //   v*v*w                           ->  |.| <= 65025*32768 = 2.13e9
+            // Ese producto cabe justo en i32 (limite 2.147e9), asi que cada
+            // termino se calcula en i32 con vmulq_s32 sin desbordar NUNCA,
+            // sea cual sea la red. Lo que SI desbordaria es la suma de los
+            // 1024 terminos (con los pesos reales, max |l1w| = 84, ya son
+            // ~5.6e9), asi que los terminos se acumulan ENSANCHANDO a i64 con
+            // vpadalq_s32 (suma por pares de i32 -> i64, una instruccion).
+            // La suma entera es asociativa: el i64 final es EXACTAMENTE el
+            // mismo que el del bucle escalar, sin ninguna aproximacion.
+            //
+            // CUATRO acumuladores independientes, por el mismo motivo que en
+            // neural.rs: con uno solo las multiplicaciones forman una cadena
+            // de dependencias y el bucle queda limitado por latencia.
+            let cero = vdupq_n_s16(0);
+            let tope = vdupq_n_s16(QA as i16);
+            let w = self.red.l1w.as_ptr().add(bucket * 2 * H_MAX);
+            let mut acc0 = vdupq_n_s64(0);
+            let mut acc1 = vdupq_n_s64(0);
+            let mut acc2 = vdupq_n_s64(0);
+            let mut acc3 = vdupq_n_s64(0);
+            // Cierre que procesa 8 neuronas: clamp -> ensanchar a i32 ->
+            // v*v -> por el peso -> acumular ensanchando a i64.
+            macro_rules! bloque {
+                ($src:expr, $peso:expr, $a:expr, $b:expr) => {{
+                    let v16 = vminq_s16(vmaxq_s16(vld1q_s16($src), cero), tope);
+                    let w16 = vld1q_s16($peso);
+                    let v_lo = vmovl_s16(vget_low_s16(v16));
+                    let v_hi = vmovl_s16(vget_high_s16(v16));
+                    let w_lo = vmovl_s16(vget_low_s16(w16));
+                    let w_hi = vmovl_s16(vget_high_s16(w16));
+                    let p_lo = vmulq_s32(vmulq_s32(v_lo, v_lo), w_lo);
+                    let p_hi = vmulq_s32(vmulq_s32(v_hi, v_hi), w_hi);
+                    $a = vpadalq_s32($a, p_lo);
+                    $b = vpadalq_s32($b, p_hi);
+                }};
+            }
+            let mut j = 0;
+            while j + 8 <= self.red.h {
+                bloque!(yo.as_ptr().add(j), w.add(j), acc0, acc1);
+                bloque!(rival.as_ptr().add(j), w.add(H_MAX + j), acc2, acc3);
+                j += 8;
+            }
+            let acc = vaddq_s64(vaddq_s64(acc0, acc1), vaddq_s64(acc2, acc3));
+            let mut suma = vgetq_lane_s64::<0>(acc) + vgetq_lane_s64::<1>(acc);
+            // Cola escalar por si algun dia hay una `h` que no sea multiplo
+            // de 8 (hoy solo hay redes de 256 y 512, asi que no se ejecuta).
+            let base = bucket * 2 * H_MAX;
+            for k in j..self.red.h {
+                let v = yo[k].clamp(0, QA as i16) as i64;
+                suma += v * v * self.red.l1w[base + k] as i64;
+                let u = rival[k].clamp(0, QA as i16) as i64;
+                suma += u * u * self.red.l1w[base + H_MAX + k] as i64;
+            }
+            return suma;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.producto_punto_escalar(yo, rival, bucket)
+        }
+    }
+
+    /// Camino ESCALAR original de la capa de salida. Se conserva como
+    /// referencia de correccion: el test `salida_neon_igual_que_escalar`
+    /// compara termino a termino contra la version vectorizada.
+    ///
+    /// SCReLU: clamp(x, 0, QA)^2. El cuadrado deja la escala en QA^2*QB,
+    /// por eso quien llama divide una vez entre QA para volver a QA*QB, que
+    /// es la escala en la que bullet guardo l1b.
+    #[inline(always)]
+    fn producto_punto_escalar(&self, yo: &[i16; H_MAX], rival: &[i16; H_MAX], bucket: usize) -> i64 {
+        let w = &self.red.l1w[bucket * 2 * H_MAX..(bucket + 1) * 2 * H_MAX];
         let mut suma: i64 = 0;
-        // SCReLU: clamp(x, 0, QA)^2. El cuadrado deja la escala en QA^2*QB,
-        // por eso se divide una vez entre QA para volver a QA*QB, que es la
-        // escala en la que bullet guardo l1b.
         for j in 0..self.red.h {
             let v = yo[j].clamp(0, QA as i16) as i64;
             suma += v * v * w[j] as i64;
             let u = rival[j].clamp(0, QA as i16) as i64;
             suma += u * u * w[H_MAX + j] as i64;
         }
-        let salida = suma / QA as i64 + self.l1b_i64();
-        (salida * scale() as i64) as f32 / (QA * QB) as f32
+        suma
     }
 
-    #[inline(always)]
-    fn l1b_i64(&self) -> i64 {
-        self.red.l1b as i64
+    /// Igual que `evaluar` pero forzando el camino escalar. Solo para tests.
+    #[cfg(test)]
+    pub fn evaluar_escalar(&self) -> f32 {
+        let (yo, rival) = if self.negras_mueven {
+            (&self.persp[1], &self.persp[0])
+        } else {
+            (&self.persp[0], &self.persp[1])
+        };
+        let bk = self.bucket();
+        let salida = self.producto_punto_escalar(yo, rival, bk) / QA as i64 + self.red.l1b[bk] as i64;
+        (salida * scale() as i64) as f32 / (QA * QB) as f32
     }
 }
 
@@ -289,7 +435,11 @@ mod tests {
     use crate::movegen::generate_legal;
 
     fn red() -> Option<&'static RedBullet> {
-        let ruta = std::env::var("MIMOTOR_RED_BULLET").ok()?;
+        // Por defecto, la red que ESTA DESPLEGADA en produccion (512
+        // neuronas); MIMOTOR_RED_BULLET permite apuntar a otra.
+        let ruta = std::env::var("MIMOTOR_RED_BULLET").unwrap_or_else(|_| {
+            "/Users/Tavito/mi-motor-rust-produccion/pesos_amenazas_prueba.bin".to_string()
+        });
         let datos = std::fs::read(ruta).ok()?;
         Some(Box::leak(Box::new(RedBullet::cargar_de_bytes(&datos)?)))
     }
@@ -363,6 +513,60 @@ mod tests {
         }
         assert_eq!(acumulador.persp, original);
         assert_eq!(acumulador.negras_mueven, original_turno);
+    }
+
+    /// EQUIVALENCIA NUMERICA de la capa de salida vectorizada con NEON
+    /// contra el bucle escalar original. Es el test critico del cambio: un
+    /// error de indice o un desbordamiento aqui no romperia nada de forma
+    /// visible, solo daria evaluaciones sutilmente mal. Se recorren muchas
+    /// decenas de posiciones (aperturas conocidas, finales, posiciones
+    /// tacticas y partidas aleatorias legales) exigiendo igualdad EXACTA.
+    #[test]
+    fn salida_neon_igual_que_escalar() {
+        let Some(red) = red() else {
+            eprintln!("sin red bullet: test omitido");
+            return;
+        };
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 1",
+            "rnbqkb1r/pp3ppp/4pn2/2pp4/2PP4/2N1PN2/PP3PPP/R1BQKB1R w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "8/8/8/8/8/8/6k1/4K2R w K - 0 1",
+            "4k3/8/8/8/8/8/8/4K2R b K - 0 1",
+            "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1",
+            "2rq1rk1/pp1bppbp/3p1np1/8/2BNP3/2N1BP2/PPPQ2PP/2KR3R b - - 0 1",
+            "8/k7/3p4/p2P1p2/P2P1P2/8/8/K7 w - - 0 1",
+        ];
+        let mut comprobadas = 0usize;
+        let mut semilla = 0x1234_ABCD_9876u64;
+        for fen in fens {
+            let mut tablero = crate::board::Board::from_fen(fen).unwrap();
+            // La posicion de partida y despues una partida aleatoria legal
+            // de hasta 12 jugadas a partir de ella.
+            for _ply in 0..12 {
+                let acc = AcumBullet::desde_tablero(red, &tablero);
+                assert_eq!(
+                    acc.evaluar(),
+                    acc.evaluar_escalar(),
+                    "NEON != escalar en {}",
+                    tablero.to_fen()
+                );
+                comprobadas += 1;
+                let legales = generate_legal(&tablero);
+                if legales.is_empty() {
+                    break;
+                }
+                semilla ^= semilla << 7;
+                semilla ^= semilla >> 9;
+                let mv = legales[(semilla as usize) % legales.len()];
+                tablero = tablero.make_move(&mv);
+            }
+        }
+        assert!(comprobadas >= 60, "solo se comprobaron {comprobadas} posiciones");
     }
 
     #[test]

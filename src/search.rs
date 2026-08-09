@@ -16,7 +16,7 @@ use std::time::Instant;
 
 pub const INFINITO: i32 = 30_000;
 pub const MATE: i32 = 29_000;
-const MAX_PLY: u32 = 64;
+const MAX_PLY: u32 = 128;
 // Tamano del array de path para deteccion de repeticion. Cubre partidas
 // largas (historial real) mas la rama de busqueda mas profunda. 512 es
 // holgado: una partida rara vez pasa de ~300 medios-movimientos.
@@ -130,10 +130,24 @@ fn margen_interno_tiempo(movetime_ms: u64) -> u64 {
     }
 }
 
+/// Techo DURO del reloj para la busqueda en curso, en ms (0 = sin techo).
+///
+/// Gestion de tiempo de dos presupuestos: `search_time` recibe el
+/// presupuesto "optimo" y este global lleva el "maximo". Es global (y no un
+/// parametro) porque lo tienen que ver TODOS los caminos de busqueda,
+/// incluidos los hilos que crea `buscar_lazy_smp` por dentro. Lo escribe el
+/// bucle UCI al parsear cada `go`, siempre antes de arrancar la busqueda.
+pub static TIEMPO_MAXIMO_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fija el techo duro del reloj para el proximo `go`. `None` lo desactiva.
+pub fn fijar_tiempo_maximo(ms: Option<u64>) {
+    TIEMPO_MAXIMO_MS.store(ms.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Debug)]
 pub struct TimeUp;
 
-const MAX_KILLER_PLY: usize = 100; // margen sobre MAX_PLY para cubrir extensiones de jaque
+const MAX_KILLER_PLY: usize = 176; // margen sobre MAX_PLY para cubrir extensiones de jaque
 
 // Centinela para eval_stack: "no hay eval estatica en este ply" (nodo en
 // jaque). Ninguna evaluacion real puede valer i32::MIN.
@@ -205,12 +219,49 @@ fn corrhist_update(entry: &mut i32, diff: i32, depth: i32) {
     *entry = (*entry).clamp(-CORR_MAX, CORR_MAX);
 }
 
+/// Techo de las tablas de historia (mismo orden de magnitud que Stockfish).
+const MAX_HIST: i32 = 16384;
+
+/// Actualizacion con GRAVEDAD de una tabla de historia, mismo patron que
+/// `corrhist_update`: el bonus se amortigua a medida que la entrada se aleja
+/// de cero, asi la tabla se satura suavemente en vez de crecer sin limite.
+/// Antes se hacia `entry += depth*depth` a secas, que con profundidades
+/// altas dejaba unas pocas entradas dominando todo el ordenamiento.
+#[inline]
+fn hist_update(entry: &mut i32, bonus: i32) {
+    let bonus = bonus.clamp(-MAX_HIST, MAX_HIST);
+    *entry += bonus - *entry * bonus.abs() / MAX_HIST;
+    *entry = (*entry).clamp(-MAX_HIST, MAX_HIST);
+}
+
 // 6 tipos de pieza x 64 casilleros, dos veces (jugada rival + jugada propia).
 const CONT_HIST_SIZE: usize = 6 * 64 * 6 * 64;
 
 #[inline]
 fn cont_idx(prev_pt: usize, prev_to: usize, pt: usize, to: usize) -> usize {
     ((prev_pt * 64 + prev_to) * 6 + pt) * 64 + to
+}
+
+// Capture history: 6 tipos de pieza que mueve x 64 destinos x 6 tipos de
+// victima. Aprende que capturas concretas suelen ser buenas mas alla de lo
+// que dice el material puro (SEE), p.ej. "caballo x peon en d5" en
+// estructuras donde ese peon sostiene todo el centro.
+const CAPT_HIST_SIZE: usize = 6 * 64 * 6;
+
+#[inline]
+fn capt_idx(pt: usize, to: usize, victima: usize) -> usize {
+    (pt * 64 + to) * 6 + victima
+}
+
+/// Tipo de pieza capturada por `mv`. En al paso la victima es un peon aunque
+/// no haya nada en la casilla destino -- mismo criterio que usa `see()`.
+#[inline]
+fn victima_de(b: &Board, mv: &Move) -> usize {
+    if mv.flag == MoveFlag::EnPassant {
+        PieceType::Pawn as usize
+    } else {
+        b.piece_at(mv.to).map(|(_, pt)| pt as usize).unwrap_or(0)
+    }
 }
 
 /// Si el rival ya ataca `sq` ANTES de jugar el movimiento (tablero en la
@@ -220,6 +271,31 @@ fn cont_idx(prev_pt: usize, prev_to: usize, pt: usize, to: usize) -> usize {
 #[inline]
 fn casilla_amenazada(b: &Board, sq: crate::types::Square) -> bool {
     b.is_square_attacked_by(sq, b.turn.opposite())
+}
+
+/// Insertion sort ESTABLE de `moves[inicio..n]` por `claves[inicio..n]`
+/// (las dos listas se mueven en paralelo). Estable = claves iguales conservan
+/// el orden original, igual que el sort que se usaba antes: asi la secuencia
+/// final de jugadas es exactamente la misma.
+/// `sees` es el arreglo paralelo de SEE por jugada (ver campo see_negamax):
+/// se permuta EXACTAMENTE igual que `claves` para que quede sincronizado con
+/// `moves` despues del ordenamiento.
+fn ordenar_estable(moves: &mut [Move], claves: &mut [i32], sees: &mut [i32], inicio: usize, n: usize) {
+    for i in (inicio + 1)..n {
+        let m = moves[i];
+        let k = claves[i];
+        let s = sees[i];
+        let mut j = i;
+        while j > inicio && claves[j - 1] > k {
+            moves[j] = moves[j - 1];
+            claves[j] = claves[j - 1];
+            sees[j] = sees[j - 1];
+            j -= 1;
+        }
+        moves[j] = m;
+        claves[j] = k;
+        sees[j] = s;
+    }
 }
 
 /// ¿La jugada `mv` da jaque al rey rival? Equivalente exacto a
@@ -459,6 +535,13 @@ pub struct Searcher {
     tt_mask: usize,
     pub nodes: u64,
     deadline: Option<Instant>,
+    /// Techo DURO opcional del reloj (gestion de tiempo de dos presupuestos,
+    /// estilo timeman.cpp de Stockfish). `search_time` recibe el presupuesto
+    /// "optimo" (objetivo normal); este campo, si esta puesto, es el
+    /// "maximo": el motor puede estirarse hasta aca cuando la posicion lo
+    /// pide (score que cae, mejor jugada inestable) pero JAMAS lo cruza.
+    /// None = comportamiento clasico (maximo == optimo).
+    pub tiempo_maximo_ms: Option<u64>,
     stop: bool,
     // Generacion de la busqueda actual para aging de la TT (0..31): se
     // incrementa al inicio de cada busqueda y las entradas de la generacion
@@ -491,6 +574,10 @@ pub struct Searcher {
     // jugada rival inmediata -- captura patrones de plan (p.ej. "despues de
     // avanzar este peon, esta jugada de caballo corta mucho").
     cont_history_2: Vec<i32>,
+    // Capture history: historial analogo al de las quiets pero para capturas,
+    // indexado [pieza_que_mueve][destino][victima]. Solo se usa como DESEMPATE
+    // dentro del carril que ya define el SEE (ver clave_orden_movimiento).
+    capture_history: Vec<i32>,
     // Counter moves: la mejor respuesta silenciosa conocida contra cada
     // jugada rival (pieza, destino). Se prueba en el ordenamiento despues
     // de los killers.
@@ -539,6 +626,22 @@ pub struct Searcher {
     // pertenece a un solo hilo y order_moves_ply no es reentrante, asi que
     // no hay contencion. Las claves se precomputan una sola vez por llamada.
     claves_orden_movimiento: [i32; MAX_MOVES],
+    // Buffer de claves de orden POR PLY para el bucle principal de negamax.
+    // Tiene que ser por ply (no uno solo compartido) porque el nodo padre
+    // sigue usando sus claves mientras los hijos buscan. Va en el heap del
+    // Searcher y no en la pila del frame: una array local de 1KB se
+    // inicializaria a cero en CADA nodo, y eso solo ya se comia la ganancia.
+    claves_negamax: Vec<[i32; MAX_MOVES]>,
+    // Paso 2 del SEE deduplicado: SEE de cada jugada del bucle principal de
+    // negamax, calculado UNA sola vez en el mismo momento que la clave de
+    // orden (ver claves_negamax arriba) para no recalcularlo despues en el
+    // SEE-prune del bucle. Centinela i32::MIN para jugadas que no son
+    // capturas. MISMO ciclo de vida y tamano que claves_negamax, y debe
+    // permutarse EXACTAMENTE igual en cada reordenamiento/rotacion de
+    // `moves` -- si se desincroniza, el SEE queda pegado a la jugada
+    // equivocada (bug silencioso). Ver debug_assert en el punto de consumo
+    // (SEE-prune) que detecta esa desincronizacion en tests.
+    see_negamax: Vec<[i32; MAX_MOVES]>,
     pub lmr_intentos: u64,
     pub lmr_reintentos: u64,
     // Hindsight reductions: para el hijo alcanzado mediante una busqueda
@@ -601,6 +704,7 @@ impl Searcher {
             tt_mask,
             nodes: 0,
             deadline: None,
+            tiempo_maximo_ms: None,
             stop: false,
             tt_generation: 0,
             killers: vec![[None, None]; MAX_KILLER_PLY],
@@ -608,6 +712,7 @@ impl Searcher {
             history_amenaza: Box::new([[0i32; 64]; 64]),
             cont_history: vec![0i32; CONT_HIST_SIZE],
             cont_history_2: vec![0i32; CONT_HIST_SIZE],
+            capture_history: vec![0i32; CAPT_HIST_SIZE],
             counter_moves: vec![None; 6 * 64],
             // Activado por defecto: el torneo h2h de esta sesion confirmo
             // +80 ELO (61.3% en 40 partidas) con la reescritura PVS -- ver
@@ -623,6 +728,8 @@ impl Searcher {
             path: [0u64; MAX_PATH],
             path_len: 0,
             claves_orden_movimiento: [0; MAX_MOVES],
+            claves_negamax: vec![[0i32; MAX_MOVES]; MAX_PLY as usize + 2],
+            see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
             lmr_intentos: 0,
             lmr_reintentos: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -648,12 +755,14 @@ impl Searcher {
             tt_mask,
             nodes: 0,
             deadline: None,
+            tiempo_maximo_ms: None,
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
             history_amenaza: Box::new([[0i32; 64]; 64]),
             cont_history: vec![0i32; CONT_HIST_SIZE],
             cont_history_2: vec![0i32; CONT_HIST_SIZE],
+            capture_history: vec![0i32; CAPT_HIST_SIZE],
             counter_moves: vec![None; 6 * 64],
             tt_generation: 0,
             modo_lmr,
@@ -666,6 +775,8 @@ impl Searcher {
             path: [0u64; MAX_PATH],
             path_len: 0,
             claves_orden_movimiento: [0; MAX_MOVES],
+            claves_negamax: vec![[0i32; MAX_MOVES]; MAX_PLY as usize + 2],
+            see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
             lmr_intentos: 0,
             lmr_reintentos: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -850,6 +961,9 @@ impl Searcher {
         for v in self.cont_history_2.iter_mut() {
             *v /= 2;
         }
+        for v in self.capture_history.iter_mut() {
+            *v /= 2;
+        }
         for v in self.corr_pawn.iter_mut() {
             *v /= 2;
         }
@@ -867,6 +981,29 @@ impl Searcher {
     /// senales (peones, no-peones de ambos colores, jugada previa) y las
     /// suma a la eval cruda. Se usa SOLO para decisiones de poda/reduccion
     /// (RFP, razoring, futility), nunca se guarda en la TT.
+    /// Refina la eval estatica con el score guardado en la TT.
+    ///
+    /// Hallazgo de Stockfish: si hay entrada en la TT, su score viene de una
+    /// BUSQUEDA de verdad, asi que es mucho mas preciso que la eval estatica
+    /// para alimentar razoring / futilidad / null-move. Solo se adopta
+    /// cuando la cota de la entrada es coherente con la direccion del
+    /// cambio (un fail-high solo puede SUBIR la estimacion, un fail-low solo
+    /// bajarla) y lejos de puntajes de mate, donde no es comparable con una
+    /// eval estatica.
+    #[inline]
+    fn eval_con_tt(&self, eval: i32, entrada: Option<&TTEntry>) -> i32 {
+        let Some(e) = entrada else { return eval };
+        if e.score.abs() >= MATE - 1000 {
+            return eval;
+        }
+        match e.flag {
+            TTFlag::Exact => e.score,
+            TTFlag::Beta if e.score > eval => e.score,
+            TTFlag::Alpha if e.score < eval => e.score,
+            _ => eval,
+        }
+    }
+
     fn eval_corregida(&self, b: &Board, static_eval: i32, prev: Option<(usize, usize)>) -> i32 {
         let stm = b.turn as usize;
         let base = stm * CORR_SIZE;
@@ -918,7 +1055,13 @@ impl Searcher {
         pt_mv: usize,
     ) {
         if mv.is_capture() {
-            return; // MVV-LVA/SEE ya ordenan las capturas primero, no necesitan refuerzo
+            // Las capturas tienen su propia tabla: el orden grueso lo sigue
+            // dando SEE, esto solo afina entre capturas de valor parecido.
+            hist_update(
+                &mut self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, &mv))],
+                depth * depth,
+            );
+            return; // no tocan killers/history/counter/cont (son para quiets)
         }
         let p = ply as usize;
         if p < MAX_KILLER_PLY {
@@ -929,18 +1072,21 @@ impl Searcher {
             }
         }
         if casilla_amenazada(b, mv.to) {
-            self.history_amenaza[mv.from as usize][mv.to as usize] += depth * depth;
+            hist_update(
+                &mut self.history_amenaza[mv.from as usize][mv.to as usize],
+                depth * depth,
+            );
         } else {
-            self.history[mv.from as usize][mv.to as usize] += depth * depth;
+            hist_update(&mut self.history[mv.from as usize][mv.to as usize], depth * depth);
         }
         if let Some((prev_pt, prev_to)) = prev {
             let idx = cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize);
-            self.cont_history[idx] += depth * depth;
+            hist_update(&mut self.cont_history[idx], depth * depth);
             self.counter_moves[prev_pt * 64 + prev_to] = Some(mv);
         }
         if let Some((p2_pt, p2_to)) = prev2 {
             let idx = cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize);
-            self.cont_history_2[idx] += depth * depth;
+            hist_update(&mut self.cont_history_2[idx], depth * depth);
         }
     }
 
@@ -1021,15 +1167,22 @@ impl Searcher {
         // `self.tt` esta prestado mutablemente, asi que no puede capturar
         // `self` por referencia.
         let generacion = self.tt_generation;
+        // Antes: una colision de OTRA clave siempre pisaba, sin mirar
+        // profundidad. Eso dejaba que las escrituras masivas de quiescence
+        // (depth=0, en casi todos los nodos) desalojaran constantemente las
+        // entradas profundas de negamax que caian en el mismo casillero,
+        // reduciendo la TT efectiva de la busqueda principal. Ahora una
+        // colision de otra clave se trata igual que una de la MISMA clave:
+        // solo reemplaza si es al menos tan profunda (o si la entrada previa
+        // es de una generacion vieja, que siempre se descarta).
         let reemplazar = |slot: Option<TTEntry>| match slot {
             None => true,
-            Some(existing) if existing.key != key => true,
             Some(existing) if existing.generation != generacion => true,
             Some(existing) => {
                 depth > existing.depth
                     || (depth == existing.depth
-                        && flag == TTFlag::Exact
-                        && existing.flag != TTFlag::Exact)
+                        && (existing.key != key
+                            || (flag == TTFlag::Exact && existing.flag != TTFlag::Exact)))
             }
         };
         let entry = TTEntry {
@@ -1106,10 +1259,19 @@ impl Searcher {
         }
         if mv.is_capture() {
             let see = see_precalculado.unwrap_or_else(|| crate::see::see(b, mv));
+            let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+            // CLAMP obligatorio: el capture history crece sin cota (bonus
+            // depth*depth), y sin acotarlo una captura mala podria colarse
+            // delante de la jugada de la TT. Con el SEE multiplicado por 8 el
+            // rango material ocupa [0, 7200], asi que un desempate de +-400
+            // solo reordena capturas de valor CASI IGUAL: nunca saca a una
+            // captura de su carril.
+            let ch = self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))]
+                .clamp(-400, 400);
             if see >= 0 {
-                return -(10_000 + see);
+                return -(10_000 + see * 8 + ch);
             }
-            return 1000 - see;
+            return 1000 - see - ch;
         }
         if mv.promotion.is_some() {
             return -5000;
@@ -1209,6 +1371,14 @@ impl Searcher {
         mut alpha: i32,
         beta: i32,
         ply: u32,
+        // Profundidad DENTRO de quiescence (no confundir con `ply`, el ply
+        // absoluto del arbol completo). Siempre 0 en las llamadas desde
+        // FUERA de quiescence (negamax, ProbCut); se incrementa en 1 en cada
+        // llamada recursiva DENTRO de quiescence. Unico proposito: permitir
+        // que SOLO el primer nivel (qdepth == 0) pruebe jaques silenciosos
+        // (ver mas abajo) -- a partir de qdepth >= 1 nunca se generan, eso es
+        // lo que evita la explosion combinatoria de jaques encadenados.
+        qdepth: i32,
     ) -> Result<i32, TimeUp> {
         self.check_time()?;
         // Quiescence también puede cruzar una secuencia de 50 plies sin
@@ -1258,7 +1428,7 @@ impl Searcher {
                 // Ligar el resultado ANTES de deshacer, y recien despues
                 // aplicar el `?`: asi ningun retorno temprano se salta el
                 // undo del acumulador NNUE.
-                let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1);
+                let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
                 self.salir_hijo(&next_eval, b, &next);
                 let sc = -res?;
                 if sc > best {
@@ -1281,7 +1451,17 @@ impl Searcher {
             return Ok(best);
         }
 
-        let stand_pat = self.evaluar_quiescence(b, eval_state);
+        // CORRECTION HISTORY tambien en el stand-pat de quiescence: es la
+        // misma eval estatica que en negamax, asi que arrastra el mismo
+        // sesgo sistematico y merece la misma correccion. Sin esto, negamax
+        // y quiescence trabajaban con escalas ligeramente distintas.
+        // Se pasa `prev = None` porque quiescence no recibe la jugada previa;
+        // se aplican igual las correcciones por estructura de peones y por
+        // piezas, que son las de mayor peso.
+        let stand_pat = {
+            let raw = self.evaluar_quiescence(b, eval_state);
+            self.eval_corregida(b, raw, None)
+        };
         if ply >= MAX_PLY {
             return Ok(stand_pat);
         }
@@ -1340,7 +1520,7 @@ impl Searcher {
             }
 
             let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
-            let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1);
+            let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
             self.salir_hijo(&next_eval, b, &next);
             let sc = -res?;
             if sc > best {
@@ -1352,6 +1532,50 @@ impl Searcher {
                 break;
             }
         }
+        // Jaques silenciosos: SOLO en el primer nivel de quiescence
+        // (qdepth == 0), y solo si las capturas no cortaron ya (alpha <
+        // beta). Nunca se recursiona con qdepth 0 de nuevo -- las llamadas
+        // de mas abajo usan qdepth + 1 -- asi que este bloque JAMAS se
+        // ejecuta en qdepth >= 1. Eso es lo que evita la explosion de nodos:
+        // sin este freno cada jaque silencioso podria a su vez probar sus
+        // propios jaques silenciosos, y los de esos, encadenando sin fin.
+        if qdepth == 0 && alpha < beta && stand_pat + 150 > alpha {
+            let mut jaques_probados = 0usize;
+            for mv in generate_legal(b) {
+                if jaques_probados >= 5 {
+                    break;
+                }
+                // Las capturas/promociones ya se probaron arriba.
+                if mv.is_capture() || mv.promotion.is_some() {
+                    continue;
+                }
+                if !da_jaque_sin_copiar(b, &mv) {
+                    continue;
+                }
+                // Filtro barato antes del caro: SEE solo sobre las que ya
+                // dan jaque. Descarta jaques que regalan material sin
+                // compensacion.
+                if crate::see::see(b, &mv) < 0 {
+                    continue;
+                }
+                jaques_probados += 1;
+
+                let next = b.make_move(&mv);
+                let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
+                let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
+                self.salir_hijo(&next_eval, b, &next);
+                let sc = -res?;
+                if sc > best {
+                    best = sc;
+                    best_mv = Some(mv);
+                }
+                alpha = alpha.max(sc);
+                if alpha >= beta {
+                    break;
+                }
+            }
+        }
+
         let flag = if best >= beta {
             TTFlag::Beta
         } else if best <= alpha_orig {
@@ -1449,7 +1673,7 @@ impl Searcher {
         }
 
         if depth <= 0 || ply >= MAX_PLY {
-            return self.quiescence(b, eval_state, alpha, beta, ply);
+            return self.quiescence(b, eval_state, alpha, beta, ply, 0);
         }
 
         let alpha_orig = alpha;
@@ -1460,7 +1684,12 @@ impl Searcher {
             entry.score = score_from_tt(entry.score, ply);
             tt_move = entry.best;
             tt_entry_full = Some(entry);
-            if entry.depth >= depth {
+            // En nodos PV (ventana no nula) NO se corta por la TT: la PV
+            // tiene que salir de una busqueda real, no de una entrada
+            // guardada que puede venir de otra ventana o de otro camino. En
+            // esos nodos la entrada solo aporta `tt_move` para el orden.
+            let nodo_pv = beta > alpha + 1;
+            if entry.depth >= depth && !nodo_pv {
                 match entry.flag {
                     TTFlag::Exact => return Ok(entry.score),
                     TTFlag::Beta if entry.score >= beta => return Ok(entry.score),
@@ -1525,7 +1754,8 @@ impl Searcher {
         if !en_jaque && !es_pv && depth <= RFP_PROF_MAX && beta.abs() < MATE - 1000 {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
-            let static_eval = self.eval_corregida(b, raw, prev);
+            let static_eval =
+                self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
             // improving: con mejora el margen se achica (poda mas agresivo);
             // sin mejora se agranda (mas conservador, poda menos).
             let margen_ply = if improving { RFP_MARGEN_POR_PLY * 3 / 5 } else { RFP_MARGEN_POR_PLY };
@@ -1547,17 +1777,31 @@ impl Searcher {
         if !en_jaque && !es_pv && depth <= RAZOR_PROF_MAX && alpha.abs() < MATE - 1000 {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
-            let static_eval = self.eval_corregida(b, raw, prev);
+            let static_eval =
+                self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
             // improving: con mejora el margen se achica; sin mejora se agranda
             // (mas conservador, se razorea menos).
             let margen_base = if improving { RAZOR_MARGEN_BASE * 3 / 5 } else { RAZOR_MARGEN_BASE };
             let margen = margen_base + RAZOR_MARGEN_POR_PLY * depth;
             if static_eval + margen <= alpha {
-                let sc = self.quiescence(b, eval_state, alpha, alpha + 1, ply)?;
+                let sc = self.quiescence(b, eval_state, alpha, alpha + 1, ply, 0)?;
                 if sc <= alpha {
                     return Ok(sc);
                 }
             }
+        }
+
+        // El zobrist de ESTE nodo entra al path ANTES de null-move y ProbCut:
+        // ambos lanzan busquedas hijas, y si una linea dentro de esos
+        // subarboles vuelve exactamente a esta posicion, tiene que detectarse
+        // como repeticion/tablas. Antes se empujaba recien despues de ambos
+        // bloques, asi que esos subarboles podian devolver un puntaje de
+        // "ganado" en lo que en realidad eran tablas por repeticion y producir
+        // un corte beta falso. El pop correspondiente se hace en todas las
+        // salidas posteriores de la funcion.
+        if self.path_len < MAX_PATH {
+            self.path[self.path_len] = b.zobrist;
+            self.path_len += 1;
         }
 
         // Null-move pruning: si "pasar el turno" y aun asi el rival no supera
@@ -1606,7 +1850,8 @@ impl Searcher {
         {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
-            let eval_nmp = self.eval_corregida(b, raw, prev);
+            let eval_nmp =
+                self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
             if eval_nmp >= beta {
                 let r_eval = ((eval_nmp - beta) / NULL_MOVE_EVAL_DIV).min(NULL_MOVE_EVAL_MAX);
                 let r_adaptativo = NULL_MOVE_R_BASE + depth / NULL_MOVE_DEPTH_DIV + r_eval;
@@ -1634,6 +1879,7 @@ impl Searcher {
                 self.salir_hijo(&next_eval, b, &next);
                 let sc_null = -res_null?;
                 if sc_null >= beta {
+                    self.path_len = self.path_len.saturating_sub(1);
                     return Ok(if sc_null >= MATE - 1000 { beta } else { sc_null });
                 }
             }
@@ -1651,13 +1897,32 @@ impl Searcher {
         const PROBCUT_MARGEN: i32 = 150;
         if !en_jaque && !es_pv && depth >= PROBCUT_PROF_MIN && beta.abs() < MATE - 1000 {
             let probcut_beta = beta + PROBCUT_MARGEN;
+            let sdepth_guarda = (depth - 4).max(1);
+            // Guarda de TT: si ya hay una entrada para esta posicion buscada a
+            // profundidad >= la que usaria la sonda, y su puntaje queda por
+            // debajo del umbral de ProbCut, la sonda fallaria seguro. Saltarla
+            // y ahorrar todo ese trabajo.
+            let saltar_probcut = tt_entry_full
+                .as_ref()
+                .is_some_and(|e| e.depth >= sdepth_guarda && e.score < probcut_beta);
             let mut capturas = generate_captures_legal(b);
-            capturas.sort_by_cached_key(|mv| -crate::see::see(b, mv));
+            if saltar_probcut {
+                capturas.clear();
+            }
+            // Igual que en quiescence: calcular el SEE una sola vez por
+            // captura y llevarlo junto a la jugada evita recalcularlo para
+            // ordenar y de nuevo para el filtro de abajo.
+            let mut capturas_see: ArrayVec<(Move, i32), MAX_MOVES> = ArrayVec::new();
+            for mv in &capturas {
+                capturas_see.push((*mv, crate::see::see(b, mv)));
+            }
+            capturas_see.sort_by_key(|(_, see)| -see);
             let sdepth = (depth - 4).max(1);
             let mut probcut_corto = false;
             let mut probcut_score = 0;
-            for mv in &capturas {
-                if crate::see::see(b, mv) < 0 {
+            let mut probcut_move: Option<Move> = None;
+            for (mv, see) in &capturas_see {
+                if *see < 0 {
                     continue;
                 }
                 let next = b.make_move(mv);
@@ -1666,7 +1931,7 @@ impl Searcher {
                 }
                 let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, sdepth);
                 let res_rapido =
-                    self.quiescence(&next, &next_eval, -probcut_beta, -probcut_beta + 1, ply + 1);
+                    self.quiescence(&next, &next_eval, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
                 let sc_rapido = match res_rapido {
                     Ok(v) => -v,
                     Err(e) => {
@@ -1702,10 +1967,23 @@ impl Searcher {
                 if sc_confirmado >= probcut_beta {
                     probcut_corto = true;
                     probcut_score = sc_confirmado;
+                    probcut_move = Some(*mv);
                     break;
                 }
             }
             if probcut_corto {
+                // Guardar el corte en la TT: la sonda equivale a una busqueda
+                // fail-high a profundidad sdepth+1, asi que si se revisita este
+                // nodo no hace falta repetir el trabajo.
+                self.tt_store(
+                    key,
+                    sdepth + 1,
+                    probcut_score,
+                    ply,
+                    TTFlag::Beta,
+                    probcut_move,
+                );
+                self.path_len = self.path_len.saturating_sub(1);
                 return Ok(probcut_score);
             }
         }
@@ -1725,12 +2003,49 @@ impl Searcher {
             depth -= 1;
         }
 
-        let mut moves = generate_legal(b);
-        if moves.is_empty() {
-            return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
+        // Profundidad minima para activar la verificacion de singularidad.
+        const SE_PROF_MIN: i32 = 8;
+        let se_activable =
+            self.modo_singular && !en_sondeo_se && !en_jaque && ply > 0 && depth >= SE_PROF_MIN;
+        // NOTA HISTORICA: se probo una "generacion por etapas" completa
+        // (TT sola -> capturas -> silenciosas) al estilo Stockfish. Medida
+        // h2h dio 42.0% (+21 =42 -37): regresion clara, asi que se revirtio
+        // por completo. Aca se usa siempre el camino clasico: lista completa
+        // generada de una, con ordenamiento diferido (seleccion perezosa).
+        // Buffer de claves de ESTE ply (ver comentario del campo).
+        let pl_claves = ply as usize;
+        let mut moves;
+        let n_moves;
+        let mut lista_ordenada;
+        {
+            moves = generate_legal(b);
+            if moves.is_empty() {
+                self.path_len = self.path_len.saturating_sub(1);
+                return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
+            }
+            // ORDEN DE JUGADAS BAJO DEMANDA (seleccion perezosa): claves
+            // calculadas todas de una, ordenamiento diferido hasta que la
+            // primera jugada no corta.
+            n_moves = moves.len();
+            {
+                let mut amenazas: Option<u64> = None;
+                for j in 0..n_moves {
+                    let mv_j = &moves[j];
+                    // SEE calculado UNA sola vez aca (paso 2 del SEE
+                    // deduplicado) y reutilizado tanto por
+                    // clave_orden_movimiento como por el SEE-prune mas abajo
+                    // en el bucle principal. Centinela i32::MIN para jugadas
+                    // que no son capturas.
+                    let see_j = mv_j.is_capture().then(|| crate::see::see(b, mv_j));
+                    let k = self.clave_orden_movimiento(
+                        b, mv_j, tt_move, ply, prev, prev2, see_j, &mut amenazas,
+                    );
+                    self.claves_negamax[pl_claves][j] = k;
+                    self.see_negamax[pl_claves][j] = see_j.unwrap_or(i32::MIN);
+                }
+            }
+            lista_ordenada = false;
         }
-        self.order_moves_ply(b, &mut moves, tt_move, ply, prev, prev2);
-        if self.path_len < MAX_PATH { self.path[self.path_len] = b.zobrist; self.path_len += 1; }
 
         // Singular extensions: si la jugada de la TT es tan claramente
         // superior a TODAS las demas que ninguna otra logra siquiera
@@ -1754,9 +2069,33 @@ impl Searcher {
         //     "parece" singular) y la extension de jaque ya existente puede
         //     encadenarse con la sonda de verificacion, multiplicando el
         //     costo sin aportar nada (la extension de jaque ya cubre ese caso).
-        const SE_PROF_MIN: i32 = 8;
         let mut jugada_singular: Option<Move> = None;
-        if self.modo_singular && !en_sondeo_se && !en_jaque && ply > 0 && depth >= SE_PROF_MIN {
+        // Cuanto se ajusta la profundidad de la jugada de la TT cuando la
+        // verificacion singular dice algo sobre ella. Rango posible:
+        //   +2 -> doble extension (singular Y con brecha grande, nodo no-PV)
+        //   +1 -> singular normal (comportamiento historico)
+        //   -2 -> extension NEGATIVA: no es singular y ademas el valor de la
+        //         TT ya supera beta, asi que el nodo casi seguro corta igual
+        //         y no vale la pena gastar profundidad completa en esa rama.
+        // Solo se usa si jugada_singular == Some(esa jugada).
+        let mut ext_singular: i32 = 0;
+        // La verificacion de singularidad recorre TODAS las jugadas antes del
+        // bucle principal y corta apenas una alcanza la ventana: su costo (y
+        // el contenido de la TT que deja) depende del orden en que las
+        // recorre. Para que el comportamiento sea identico al de antes, en
+        // los (pocos) nodos donde la verificacion puede activarse se ordena
+        // la lista completa de una, como se hacia siempre.
+        if se_activable {
+            ordenar_estable(
+                &mut moves,
+                &mut self.claves_negamax[pl_claves],
+                &mut self.see_negamax[pl_claves],
+                0,
+                n_moves,
+            );
+            lista_ordenada = true;
+        }
+        if se_activable {
             if let (Some(entry), Some(tmv)) = (tt_entry_full, tt_move) {
                 if entry.depth >= depth - 3
                     && entry.flag == TTFlag::Beta
@@ -1812,8 +2151,49 @@ impl Searcher {
                             }
                         }
                     }
-                    if !se_timed_out && mejor_otra < sbeta {
+                    if se_timed_out {
+                        // Ni singular ni multicut: con corte por tiempo el
+                        // valor de mejor_otra no es confiable.
+                    } else if mejor_otra < sbeta {
                         jugada_singular = Some(tmv);
+                        // DOBLE EXTENSION: no solo ninguna otra jugada llega a
+                        // sbeta, sino que ni siquiera se le acerca por un
+                        // margen adicional. La brecha con la segunda mejor es
+                        // GRANDE: señal mucho mas fuerte de que la posicion es
+                        // "forzada" y conviene invertir mas busqueda ahi. Solo
+                        // en nodos que NO son PV: en PV la profundidad ya es
+                        // la mas alta y doblar extensiones ahi es la receta
+                        // clasica para explosiones de arbol.
+                        const SE_MARGEN2: i32 = 30;
+                        ext_singular = if !es_pv && mejor_otra < sbeta - SE_MARGEN2 {
+                            2
+                        } else {
+                            1
+                        };
+                    } else if mejor_otra >= beta && mejor_otra.abs() < MATE - 1000 {
+                        // MULTICUT: la jugada de la TT ya fallo alto
+                        // (entry.flag == TTFlag::Beta) y ADEMAS otra jugada
+                        // distinta supera beta en la busqueda reducida. Dos
+                        // fail-highs independientes: es casi seguro que el
+                        // nodo corta, asi que se devuelve sin explorar mas.
+                        // No se guarda en la TT: el score viene de una ventana
+                        // ajena a beta y contaminaria la tabla.
+                        self.path_len = self.path_len.saturating_sub(1);
+                        return Ok(mejor_otra);
+                    } else if entry.score >= beta {
+                        // EXTENSION NEGATIVA: la jugada de la TT NO resulto
+                        // singular (otra jugada alcanza sbeta) pero el valor
+                        // guardado en la TT ya dice que esta posicion es buena
+                        // para el que mueve incluso mas alla de la ventana
+                        // actual. No hay corte duro (eso lo cubre el multicut
+                        // de arriba), pero si hay evidencia de que el nodo se
+                        // resuelve solo: se REDUCE la jugada de la TT en vez
+                        // de buscarla a profundidad completa. Stockfish usa -3
+                        // aca (y -2 extra en cutNode); Mittens no tiene la
+                        // señal de cutNode, asi que se queda con el valor
+                        // conservador -2.
+                        jugada_singular = Some(tmv);
+                        ext_singular = -2;
                     }
                 }
             }
@@ -1863,17 +2243,84 @@ impl Searcher {
         // el orden aprenda a probarlas mas tarde. Cota fija en la pila.
         let mut quiets_buscados: [(u8, u8, bool); 64] = [(0, 0, false); 64];
         let mut n_quiets_buscados = 0usize;
-        for (idx, mv) in moves.iter().enumerate() {
+        // Lo mismo para las capturas buscadas sin cortar: (pieza, destino,
+        // victima), para aplicarles el malus de capture history.
+        let mut capts_buscadas: [(u8, u8, u8); 32] = [(0, 0, 0); 32];
+        let mut n_capts_buscadas = 0usize;
+        let mut idx_siguiente = 0usize;
+        'jugadas: loop {
+            // Se agotaron las jugadas: fin del bucle.
+            if idx_siguiente >= n_moves {
+                break 'jugadas;
+            }
+            let idx = idx_siguiente;
+            idx_siguiente += 1;
+            if !lista_ordenada {
+                if idx == 0 {
+                    // Solo se busca la MEJOR jugada (un barrido lineal) y se
+                    // la rota al frente. Si corta beta aca -- el caso mas
+                    // comun en un arbol bien ordenado -- el resto de la lista
+                    // nunca se ordena.
+                    let mut mejor_j = 0usize;
+                    for j in 1..n_moves {
+                        if self.claves_negamax[pl_claves][j]
+                            < self.claves_negamax[pl_claves][mejor_j]
+                        {
+                            mejor_j = j;
+                        }
+                    }
+                    if mejor_j != 0 {
+                        let m = moves[mejor_j];
+                        let k = self.claves_negamax[pl_claves][mejor_j];
+                        let s = self.see_negamax[pl_claves][mejor_j];
+                        for j in (1..=mejor_j).rev() {
+                            moves[j] = moves[j - 1];
+                            self.claves_negamax[pl_claves][j] =
+                                self.claves_negamax[pl_claves][j - 1];
+                            self.see_negamax[pl_claves][j] = self.see_negamax[pl_claves][j - 1];
+                        }
+                        moves[0] = m;
+                        self.claves_negamax[pl_claves][0] = k;
+                        self.see_negamax[pl_claves][0] = s;
+                    }
+                } else {
+                    // No hubo corte en la primera jugada: recien ahora se
+                    // ordena el resto, con las MISMAS claves ya calculadas.
+                    ordenar_estable(
+                        &mut moves,
+                        &mut self.claves_negamax[pl_claves],
+                        &mut self.see_negamax[pl_claves],
+                        1,
+                        n_moves,
+                    );
+                    lista_ordenada = true;
+                }
+            }
+            let mv_actual = moves[idx];
+            let mv = &mv_actual;
             // LMR: candidatas a reducir son jugadas silenciosas, tarde en el
             // orden (ya viene de mejor a peor), sin jaque propio ni jaque
             // que dan -- justo donde el orden ya filtra la mayoria de
             // jugadas malas sin gastar profundidad completa.
+            //
+            // Capturas TARDIAS con SEE negativo (capturas "malas", que ya
+            // perdieron su carril de orden frente a las buenas -- ver
+            // clave_orden_movimiento) tambien son candidatas, pero recien a
+            // partir de un idx bastante mas tardio que las quiets: la
+            // captura ya gasto su turno de ser probada a fondo si aparece
+            // pronto en el orden. Se usa el SEE ya cacheado en see_negamax
+            // (paso 2 del SEE deduplicado) en vez de recalcularlo.
+            const LMR_CAPTURAS_MOVES_SIN_REDUCIR: usize = 5;
             let es_reducible = self.modo_lmr
                 && !en_jaque
-                && idx >= LMR_MOVES_SIN_REDUCIR
                 && depth >= LMR_PROF_MIN
-                && !mv.is_capture()
-                && mv.promotion.is_none();
+                && mv.promotion.is_none()
+                && if mv.is_capture() {
+                    idx >= LMR_CAPTURAS_MOVES_SIN_REDUCIR
+                        && self.see_negamax[pl_claves][idx] < 0
+                } else {
+                    idx >= LMR_MOVES_SIN_REDUCIR
+                };
 
             // Cache de "¿la jugada da jaque?" para los 3 guardas de poda de
             // abajo (futility, LMP, SEE-prune): se calcula UNA sola vez por
@@ -1895,7 +2342,7 @@ impl Searcher {
                 let ev = *fut_eval.get_or_insert_with(|| {
                     let raw =
                         *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
-                    self.eval_corregida(b, raw, prev)
+                    self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref())
                 });
                 // improving: con mejora el margen de futilidad se achica -- se
                 // descartan mas jugadas silenciosas tardias; sin mejora el
@@ -1941,6 +2388,56 @@ impl Searcher {
                 }
             }
 
+            // PODA DE JUGADAS SILENCIOSAS por SEE y por historia negativa.
+            //
+            // Las dos usan la profundidad EFECTIVA post-LMR (`lmr_depth`), no
+            // la profundidad cruda del nodo: una quiet tardia que de todos
+            // modos se iba a buscar reducida a 2 plies no merece el margen de
+            // un nodo de profundidad 8. Esa es la diferencia clave respecto
+            // de podar por `depth` a secas.
+            if !es_pv
+                && !en_jaque
+                && best_move.is_some()
+                && !mv.is_capture()
+                && mv.promotion.is_none()
+                && beta.abs() < MATE - 1000
+            {
+                let r_est = tabla_lmr()[(depth as usize).min(63)][(idx + 1).min(63)].max(1);
+                let lmr_depth = (depth - r_est).max(0);
+                if lmr_depth <= 6 {
+                    let pt_q = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+                    // (b) Historia claramente negativa: esta jugada ya fallo
+                    //     repetidas veces en contextos parecidos.
+                    let h = self.history[mv.from as usize][mv.to as usize];
+                    let ch = match prev {
+                        Some((p_pt, p_to)) => {
+                            self.cont_history[cont_idx(p_pt, p_to, pt_q, mv.to as usize)]
+                        }
+                        None => 0,
+                    };
+                    let ch2 = match prev2 {
+                        Some((p2_pt, p2_to)) => {
+                            self.cont_history_2[cont_idx(p2_pt, p2_to, pt_q, mv.to as usize)]
+                        }
+                        None => 0,
+                    };
+                    let stat_score = 2 * h + ch + ch2;
+                    let hist_mala = stat_score < -4000 * depth;
+                    // (a) SEE negativo con margen cuadratico en lmr_depth
+                    //     (~-23*lmr_depth^2, calibracion de Stockfish).
+                    //     Se evalua PEREZOSAMENTE: si la historia ya condeno
+                    //     la jugada no hace falta pagar el SEE, que es lo
+                    //     caro de este guarda.
+                    let see_malo =
+                        || crate::see::see(b, mv) < -23 * lmr_depth * lmr_depth;
+                    if (hist_mala || see_malo())
+                        && !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv))
+                    {
+                        continue;
+                    }
+                }
+            }
+
             // SEE pruning en el loop principal (no solo en quiescence): en
             // nodos NO-PV y poca profundidad, una captura con SEE muy
             // negativo rara vez compensa aunque se reduzca por LMR -- se
@@ -1958,7 +2455,21 @@ impl Searcher {
                 && mv.is_capture()
                 && mv.promotion.is_none()
                 && beta.abs() < MATE - 1000
-                && crate::see::see(b, mv) < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
+                && {
+                    // SEE ya calculado en el llenado de claves_negamax (paso 2
+                    // del SEE deduplicado): se reutiliza el cacheado en vez de
+                    // volver a llamar a crate::see::see. El debug_assert
+                    // detecta cualquier desincronizacion entre see_negamax y
+                    // moves (p.ej. si un futuro cambio rota/ordena la lista
+                    // sin permutar see_negamax igual).
+                    let see_cacheado = self.see_negamax[pl_claves][idx];
+                    debug_assert_eq!(
+                        see_cacheado,
+                        crate::see::see(b, mv),
+                        "SEE cacheado desalineado con la jugada en idx={idx} (ver see_negamax)"
+                    );
+                    see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
+                }
             {
                 if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
                     continue;
@@ -1972,12 +2483,26 @@ impl Searcher {
                     (mv.from, mv.to, casilla_amenazada(b, mv.to));
                 n_quiets_buscados += 1;
             }
+            if mv.is_capture() && n_capts_buscadas < 32 {
+                let pt_c = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+                capts_buscadas[n_capts_buscadas] =
+                    (pt_c as u8, mv.to, victima_de(b, mv) as u8);
+                n_capts_buscadas += 1;
+            }
 
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
             let child_prev = Some((pt_mv, mv.to as usize));
             let child_prev2 = prev;
-            let ext = if jugada_singular == Some(*mv) { 1 } else { 0 };
+            // ext puede valer -2, 0, +1 o +2 (ver ext_singular arriba). El
+            // bloque singular solo corre con depth >= SE_PROF_MIN (8), asi que
+            // el peor caso es depth - 1 - 2 = depth - 3 >= 5: siempre positivo.
+            let ext = if jugada_singular == Some(*mv) {
+                ext_singular
+            } else {
+                0
+            };
+            debug_assert!(depth - 1 + ext >= 1, "profundidad hija invalida tras ext");
             // Para LMR usamos la profundidad de la posible re-búsqueda
             // completa, no la reducida: si falla alto no debe heredar una
             // evaluación clásica donde aún se requiere la NNUE.
@@ -1998,6 +2523,16 @@ impl Searcher {
                     r += 1;
                 }
                 if !mv.is_capture() {
+                    // AJUSTE PROPORCIONAL (antes era binario: -1 si la suma
+                    // daba positivo). Ahora la reduccion se mueve en
+                    // proporcion a la senal combinada, asi una quiet con
+                    // historia MUY buena se reduce bastante menos que una
+                    // apenas positiva, y una con historia mala se reduce mas.
+                    // Pesos tomados de movepick.cpp de Stockfish, que combina
+                    // (2252*main + 1126*cont[0] + 1093*cont[1]) / 1024:
+                    // el history principal pesa el doble que cada
+                    // continuation history. Se suma tambien cont_history_2
+                    // (follow-up a 2 plies), que antes no se usaba aca.
                     let h = self.history[mv.from as usize][mv.to as usize];
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
@@ -2005,11 +2540,40 @@ impl Searcher {
                         }
                         None => 0,
                     };
-                    if h + ch > 0 {
+                    let ch2 = match prev2 {
+                        Some((p2_pt, p2_to)) => {
+                            self.cont_history_2[cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize)]
+                        }
+                        None => 0,
+                    };
+                    let stat_score = 2 * h + ch + ch2;
+                    // K elegido para el rango real de las tablas de Mittens
+                    // (ya acotadas a +-MAX_HIST por la gravedad): el ajuste
+                    // queda acotado a +-2 plies, en el mismo orden de
+                    // magnitud que el -1 binario que reemplaza.
+                    r -= (stat_score / 8000).clamp(-2, 2);
+                } else {
+                    // Rama simetrica para capturas tardias con SEE negativo
+                    // (unicas capturas que llegan aca, ver es_reducible mas
+                    // arriba): reduccion MENOR que la de una quiet en la
+                    // misma posicion del indice -- una captura mala sigue
+                    // siendo mas prometedora que una quiet tardia, asi que se
+                    // resta 1 al calculo base. Si ademas el capture history
+                    // de esa captura es positivo (esta linea de capturas dio
+                    // buen resultado antes), se resta 1 mas -- igual que el
+                    // bonus de history para quiets arriba.
+                    r -= 1;
+                    let ch_capt = self.capture_history
+                        [capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))];
+                    if ch_capt > 0 {
                         r -= 1;
                     }
                 }
-                let r = r.clamp(1, (depth - 2).max(1));
+                // El tope se descuenta con la parte NEGATIVA de ext (si la
+                // jugada recibio extension negativa, la profundidad hija ya
+                // bajo y la reduccion no puede comerse lo que queda). Con
+                // ext >= 0 el tope es identico al historico (depth - 2).
+                let r = r.clamp(1, (depth - 2 + ext.min(0)).max(1));
                 let child_ply = (ply + 1) as usize;
                 if child_ply < MAX_KILLER_PLY {
                     self.hindsight_parent_eval[ply as usize] = *fut_eval.get_or_insert_with(|| {
@@ -2136,14 +2700,38 @@ impl Searcher {
                 // pieza de cada una); el envejecimiento /2 por "go" lo acota.
                 // El malus va a la MISMA tabla (amenaza o normal) que uso el
                 // bonus de esa quiet en su momento -- simetria con el bonus.
+                // Malus de capture history: se aplica SIEMPRE (haya cortado
+                // una captura o una quiet), porque las capturas buscadas antes
+                // sin exito fallaron igual en ambos casos.
+                {
+                    let malus = depth * depth;
+                    let pt_cortante = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+                    let cortante = if mv.is_capture() {
+                        Some((pt_cortante as u8, mv.to, victima_de(b, mv) as u8))
+                    } else {
+                        None
+                    };
+                    for &(cp, ct, cv) in &capts_buscadas[..n_capts_buscadas] {
+                        if Some((cp, ct, cv)) != cortante {
+                            hist_update(
+                                &mut self.capture_history
+                                    [capt_idx(cp as usize, ct as usize, cv as usize)],
+                                -malus,
+                            );
+                        }
+                    }
+                }
                 if !mv.is_capture() && mv.promotion.is_none() {
                     let malus = depth * depth;
                     for &(qf, qt, amenazada) in &quiets_buscados[..n_quiets_buscados] {
                         if (qf, qt) != (mv.from, mv.to) {
                             if amenazada {
-                                self.history_amenaza[qf as usize][qt as usize] -= malus;
+                                hist_update(
+                                    &mut self.history_amenaza[qf as usize][qt as usize],
+                                    -malus,
+                                );
                             } else {
-                                self.history[qf as usize][qt as usize] -= malus;
+                                hist_update(&mut self.history[qf as usize][qt as usize], -malus);
                             }
                         }
                     }
@@ -2453,7 +3041,24 @@ impl Searcher {
         }
 
         let inicio = Instant::now();
-        self.deadline = movetime_ms.map(|ms| {
+        // GESTION DE TIEMPO DE DOS PRESUPUESTOS (estilo timeman.cpp):
+        //   - `optimo` = movetime_ms: el objetivo normal, y la base sobre la
+        //     que se aplican los factores reactivos del corte blando.
+        //   - `maximo` = self.tiempo_maximo_ms (si main.rs lo puso): techo
+        //     DURO. El deadline se ancla aca, nunca al optimo, asi la
+        //     busqueda puede estirarse cuando la posicion se pone fea. Si
+        //     nadie puso un maximo, maximo == optimo (comportamiento previo).
+        let optimo_ms = movetime_ms;
+        let techo_global = match TIEMPO_MAXIMO_MS.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        };
+        let maximo_ms = match (movetime_ms, self.tiempo_maximo_ms.or(techo_global)) {
+            (Some(opt), Some(max)) => Some(max.max(opt)),
+            (Some(opt), None) => Some(opt),
+            (None, _) => None,
+        };
+        self.deadline = maximo_ms.map(|ms| {
             let budget = ms.saturating_sub(margen_interno_tiempo(ms));
             inicio + std::time::Duration::from_millis(budget)
         });
@@ -2473,6 +3078,14 @@ impl Searcher {
         // temprano. Si la mejor jugada acaba de cambiar (0), la posicion es
         // mas dudosa y conviene dejarle mas margen para una iteracion mas.
         let mut pv_estable: u32 = 0;
+        // Senales reactivas del time management (ver el corte blando abajo).
+        // `inestabilidad` acumula cambios de mejor jugada con decaimiento;
+        // `caida_score` es cuanto bajo el score respecto de la iteracion
+        // anterior; `esfuerzo_mejor` es el % de nodos que se fue a la mejor
+        // jugada en la ultima iteracion.
+        let mut inestabilidad: i32 = 0;
+        let mut caida_score: i32 = 0;
+        let mut esfuerzo_mejor: i32 = 0;
 
         for d in 1..=max_depth {
             self.reiniciar_nnue(b);
@@ -2503,8 +3116,16 @@ impl Searcher {
                     (-INFINITO, INFINITO)
                 };
 
+            // Mejor jugada con la que ARRANCA esta iteracion. Se guarda
+            // porque `mejor_mv` puede actualizarse a mitad de iteracion (ver
+            // el fail-high de la raiz mas abajo) y la senal de estabilidad
+            // del PV tiene que comparar contra el valor de la iteracion
+            // ANTERIOR, no contra ese adelanto.
+            let mv_al_entrar = mejor_mv;
             let mut actual_mv;
             let mut actual_sc;
+            let mut nodos_mejor: u64;
+            let mut nodos_iter: u64;
             let mut timed_out = false;
             let mut ancho = VENTANA_INICIAL;
 
@@ -2512,8 +3133,15 @@ impl Searcher {
                 let mut alpha = vent_alpha;
                 actual_mv = moves[0];
                 actual_sc = -INFINITO;
+                // ESFUERZO DE NODOS (factor (c) del time management): nodos
+                // gastados en la mejor jugada vs. el total de la iteracion.
+                // Si casi todos los nodos se fueron a la jugada que termino
+                // ganando, la eleccion es "obvia" y se puede cortar antes.
+                nodos_mejor = 0;
+                nodos_iter = 0;
                 if self.path_len < MAX_PATH { self.path[self.path_len] = b.zobrist; self.path_len += 1; }
                 for (idx, mv) in moves.iter().enumerate() {
+                    let nodos_antes = self.nodes;
                     let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let next = b.make_move(mv);
                     // Mantener el mismo contrato que negamax: si el hijo
@@ -2565,9 +3193,12 @@ impl Searcher {
                         sondeo
                     };
                     self.salir_hijo(&next_eval, b, &next);
+                    let nodos_mv = self.nodes.saturating_sub(nodos_antes);
+                    nodos_iter = nodos_iter.saturating_add(nodos_mv);
                     if sc > actual_sc {
                         actual_sc = sc;
                         actual_mv = *mv;
+                        nodos_mejor = nodos_mv;
                     }
                     if sc > alpha {
                         alpha = sc;
@@ -2590,7 +3221,26 @@ impl Searcher {
                 }
                 if actual_sc >= vent_beta && vent_beta < INFINITO {
                     ancho = ancho.saturating_mul(2);
+                    // La ventana se recentra sobre el score de la iteracion
+                    // ANTERIOR (no sobre el fail-high), igual que siempre.
                     vent_beta = mejor_sc.saturating_add(ancho).min(INFINITO);
+                    // BUG ARREGLADO: una jugada que falla ALTO en la raiz es
+                    // casi seguro la mejor, pero antes `mejor_mv` recien se
+                    // actualizaba al terminar la re-busqueda con la ventana
+                    // ancha. Si el reloj se acababa en el medio, la busqueda
+                    // devolvia la jugada VIEJA y tiraba el hallazgo. Ahora se
+                    // adopta de inmediato y ademas se rota al frente de la
+                    // lista para que la re-busqueda la pruebe primero.
+                    mejor_mv = Some(actual_mv);
+                    mejor_sc = actual_sc;
+                    mejor_prof = d;
+                    if let Some(pos) = moves.iter().position(|m| *m == actual_mv) {
+                        if pos > 0 {
+                            let m = moves[pos];
+                            moves.remove(pos);
+                            moves.insert(0, m);
+                        }
+                    }
                     continue;
                 }
                 break; // adentro de la ventana (o ya en ventana completa): valor confiable
@@ -2598,11 +3248,31 @@ impl Searcher {
             if timed_out {
                 break;
             }
-            if mejor_mv == Some(actual_mv) {
+            if mv_al_entrar == Some(actual_mv) {
                 pv_estable += 1;
             } else {
                 pv_estable = 0;
+                // Inestabilidad acumulada con decaimiento: cada cambio de
+                // mejor jugada suma, y el decaimiento de abajo la va
+                // olvidando si la posicion se asienta.
+                inestabilidad += 100;
             }
+            // Decaimiento (~25% por iteracion) para que un cambio viejo no
+            // siga estirando el reloj para siempre.
+            inestabilidad = inestabilidad * 3 / 4;
+            // Caida de score respecto de la iteracion anterior: senal fuerte
+            // de que la jugada elegida se esta cayendo y conviene pensar mas.
+            caida_score = if d >= 2 && mejor_sc.abs() < MATE - 1000 && actual_sc.abs() < MATE - 1000
+            {
+                (mejor_sc - actual_sc).max(0)
+            } else {
+                0
+            };
+            esfuerzo_mejor = if nodos_iter > 0 {
+                (nodos_mejor.saturating_mul(100) / nodos_iter) as i32
+            } else {
+                0
+            };
             mejor_mv = Some(actual_mv);
             mejor_sc = actual_sc;
             mejor_prof = d;
@@ -2628,11 +3298,42 @@ impl Searcher {
             } else {
                 70
             };
-            if let Some(ms) = movetime_ms
+            // FACTORES REACTIVOS sobre el presupuesto optimo (en centesimas).
+            // Arrancan en 100 (= sin cambio) y se multiplican entre si.
+            let mut factor: u64 = 100;
+            // (a) El score cayo respecto de la iteracion anterior: estirar
+            //     hasta ~1.7x, proporcional a la caida a partir de 30cp.
+            if caida_score >= 30 {
+                let extra = (caida_score as u64).saturating_sub(30) * 70 / 120;
+                factor = factor * (100 + extra.min(70)) / 100;
+            }
+            // (b) La mejor jugada viene cambiando: estirar hasta ~1.5x.
+            if inestabilidad > 0 {
+                factor = factor * (100 + (inestabilidad as u64 / 2).min(50)) / 100;
+            }
+            // (c) Jugada "obvia": mas del 90% de los nodos se fueron a la
+            //     mejor jugada y el PV ya viene estable -> cortar antes.
+            if esfuerzo_mejor > 90 && pv_estable >= 3 && caida_score == 0 {
+                factor = factor * 75 / 100;
+            }
+            // Clamp: nunca menos del 40% ni mas del 200% del objetivo.
+            let factor = factor.clamp(40, 200);
+            if let Some(ms) = optimo_ms
                 && ms > 25
-                && inicio.elapsed().as_millis() as u64 > ms.saturating_mul(fraccion_corte) / 100
             {
-                break;
+                let umbral = ms.saturating_mul(fraccion_corte) / 100;
+                let umbral = umbral.saturating_mul(factor) / 100;
+                // El corte blando NUNCA puede autorizar mas alla del techo
+                // duro: si el factor lo estira por encima del maximo, manda
+                // el maximo (el deadline lo corta igual, pero asi no se
+                // arranca una iteracion condenada a abortarse).
+                let umbral = match maximo_ms {
+                    Some(max) => umbral.min(max.saturating_mul(fraccion_corte) / 100),
+                    None => umbral,
+                };
+                if inicio.elapsed().as_millis() as u64 > umbral {
+                    break;
+                }
             }
         }
         // La raiz nunca pasa por negamax (el loop de arriba la maneja
@@ -2795,13 +3496,22 @@ mod regression_tests {
 
     #[test]
     fn tt_colision_de_otra_clave_se_reemplaza() {
+        // Una colision de OTRA clave solo pisa si es al menos tan profunda:
+        // si no, una entrada de quiescence (depth=0) desalojaria
+        // constantemente las entradas profundas de negamax que compartan
+        // casillero, encogiendo la TT efectiva de la busqueda principal.
         let mut s = Searcher::new(1);
         let k1 = 0x10u64;
         let k2 = k1.wrapping_add((s.tt_mask as u64) + 1);
         s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        // Menos profunda: NO debe pisar.
         s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
+        assert!(s.tt_probe(k2).is_none());
+        // Al menos tan profunda: SI debe pisar.
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
         assert!(s.tt_probe(k1).is_none());
-        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(1));
+        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
 
     // La TT COMPARTIDA (Lazy SMP) es un camino de codigo distinto al Local
@@ -2853,7 +3563,7 @@ mod regression_tests {
         let mut s = Searcher::new(1);
         let eval_state = crear_eval_state(&b);
         let score = s
-            .quiescence(&b, &eval_state, -INFINITO, INFINITO, 3)
+            .quiescence(&b, &eval_state, -INFINITO, INFINITO, 3, 0)
             .unwrap();
         assert_eq!(score, -MATE + 3);
     }
@@ -2867,7 +3577,7 @@ mod regression_tests {
         let mut s = Searcher::new(1);
         let eval_state = crear_eval_state(&b);
         assert_eq!(
-            s.quiescence(&b, &eval_state, -INFINITO, INFINITO, 0)
+            s.quiescence(&b, &eval_state, -INFINITO, INFINITO, 0, 0)
                 .unwrap(),
             draw_score(&b, &eval_state, None)
         );

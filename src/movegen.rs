@@ -386,6 +386,131 @@ pub fn generate_legal(b: &Board) -> MoveList {
     moves
 }
 
+/// ¿`mv` es una jugada LEGAL en `b`? Validador directo, sin generar la lista
+/// completa de jugadas. Usado por la busqueda por etapas (staged movegen):
+/// permite probar la jugada de la TT sola, ANTES de generar nada, y si corta
+/// beta no se genera ni ordena ninguna otra jugada.
+///
+/// La jugada puede venir de la TT (otra posicion con colision de zobrist, o
+/// una entrada vieja), asi que se valida TODO: pieza propia en `from`,
+/// consistencia del flag con el tablero, patron de movimiento de la pieza,
+/// promocion coherente, y por ultimo que el propio rey no quede en jaque
+/// (make_move + in_check, siempre correcto, tambien en jaque actual).
+///
+/// Enroque y al paso (raros como jugada de TT) van por el camino lento pero
+/// trivialmente correcto: pertenencia a generate_legal.
+/// Equivalencia exacta con `generate_legal(b).contains(mv)` verificada
+/// exhaustivamente en tests (es_legal_coincide_con_generate_legal).
+pub fn es_legal(b: &Board, mv: &Move) -> bool {
+    use crate::bitboard::{bishop_attacks, king_attacks, knight_attacks, queen_attacks, rook_attacks};
+
+    let us = b.turn;
+    if mv.from > 63 || mv.to > 63 || mv.from == mv.to {
+        return false;
+    }
+    // Casos con reglas especiales de legalidad: camino lento, siempre exacto.
+    if matches!(
+        mv.flag,
+        MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
+    ) {
+        return generate_legal(b).contains(mv);
+    }
+    // Pieza propia en el origen.
+    let Some((c, pt)) = b.piece_at(mv.from) else {
+        return false;
+    };
+    if c != us {
+        return false;
+    }
+    // Consistencia del flag con el contenido del destino.
+    match mv.flag {
+        MoveFlag::Capture => match b.piece_at(mv.to) {
+            Some((cv, ptv)) => {
+                // Nunca capturar pieza propia ni al rey (una entrada TT
+                // corrupta con "captura de rey" romperia make_move).
+                if cv == us || ptv == PieceType::King {
+                    return false;
+                }
+            }
+            None => return false,
+        },
+        MoveFlag::Quiet | MoveFlag::DoublePush => {
+            if bit(mv.to) & b.occupied != 0 {
+                return false;
+            }
+        }
+        _ => unreachable!(),
+    }
+    // Promocion coherente: solo peon a ultima fila, y a una de las 4 piezas
+    // que la generacion realmente produce.
+    let promo_rank: u8 = match us {
+        Color::White => 7,
+        Color::Black => 0,
+    };
+    match mv.promotion {
+        Some(p) => {
+            if pt != PieceType::Pawn
+                || rank_of(mv.to) != promo_rank
+                || !matches!(
+                    p,
+                    PieceType::Queen | PieceType::Rook | PieceType::Bishop | PieceType::Knight
+                )
+            {
+                return false;
+            }
+        }
+        None => {
+            // La generacion SIEMPRE marca promocion en peon a ultima fila.
+            if pt == PieceType::Pawn && rank_of(mv.to) == promo_rank {
+                return false;
+            }
+        }
+    }
+    // DoublePush es exclusivo del peon: la generacion jamas lo pone en otra
+    // pieza (una entrada TT corrupta si podria).
+    if mv.flag == MoveFlag::DoublePush && pt != PieceType::Pawn {
+        return false;
+    }
+    // Patron de movimiento de la pieza sobre la ocupacion actual.
+    let patron_ok = match pt {
+        PieceType::Knight => knight_attacks(mv.from) & bit(mv.to) != 0,
+        PieceType::Bishop => bishop_attacks(mv.from, b.occupied) & bit(mv.to) != 0,
+        PieceType::Rook => rook_attacks(mv.from, b.occupied) & bit(mv.to) != 0,
+        PieceType::Queen => queen_attacks(mv.from, b.occupied) & bit(mv.to) != 0,
+        PieceType::King => king_attacks(mv.from) & bit(mv.to) != 0,
+        PieceType::Pawn => {
+            let (push_dir, start_rank): (i32, u8) = match us {
+                Color::White => (1, 1),
+                Color::Black => (-1, 6),
+            };
+            let f = file_of(mv.from) as i32;
+            let r = rank_of(mv.from) as i32;
+            match mv.flag {
+                MoveFlag::Capture => pawn_attacks(us, mv.from) & bit(mv.to) != 0,
+                MoveFlag::Quiet => {
+                    let one = r + push_dir;
+                    (0..8).contains(&one) && mv.to == make_square(f as u8, one as u8)
+                }
+                MoveFlag::DoublePush => {
+                    if rank_of(mv.from) != start_rank {
+                        false
+                    } else {
+                        let mid = make_square(f as u8, (r + push_dir) as u8);
+                        let dst = make_square(f as u8, (r + 2 * push_dir) as u8);
+                        mv.to == dst && bit(mid) & b.occupied == 0
+                    }
+                }
+                _ => false,
+            }
+        }
+    };
+    if !patron_ok {
+        return false;
+    }
+    // Legalidad real: el propio rey no puede quedar en jaque.
+    !b.make_move(mv).in_check(us)
+}
+
 /// Referencia lenta (ray-casting puro, sin atajo de clavadas) usada SOLO en
 /// tests para verificar que generate_legal produce exactamente el mismo
 /// conjunto de jugadas.
@@ -447,6 +572,72 @@ mod equivalencia_legal_tests {
         ];
         for b in &posiciones {
             explorar(b, 3);
+        }
+    }
+
+    /// es_legal debe coincidir EXACTAMENTE con la pertenencia a
+    /// generate_legal, para cualquier Move posible (incluidos los invalidos
+    /// que podrian salir de una entrada TT vieja o con colision).
+    fn es_legal_coincide(b: &Board) {
+        let legales = generate_legal(b);
+        // Todas las legales deben pasar.
+        for mv in &legales {
+            assert!(
+                es_legal(b, mv),
+                "es_legal rechaza jugada legal {} en {}",
+                mv.to_uci(),
+                b.to_fen()
+            );
+        }
+        // Barrido de jugadas arbitrarias: ninguna no-legal debe pasar.
+        let flags = [
+            MoveFlag::Quiet,
+            MoveFlag::Capture,
+            MoveFlag::DoublePush,
+            MoveFlag::EnPassant,
+            MoveFlag::CastleKing,
+            MoveFlag::CastleQueen,
+        ];
+        let promos = [None, Some(PieceType::Queen), Some(PieceType::Knight)];
+        for from in 0..64u8 {
+            for to in 0..64u8 {
+                for &flag in &flags {
+                    for &promo in &promos {
+                        let mv = Move::new(from, to, promo, flag);
+                        let esperado = legales.contains(&mv);
+                        assert_eq!(
+                            es_legal(b, &mv),
+                            esperado,
+                            "es_legal diverge en {} para {:?}",
+                            b.to_fen(),
+                            mv
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn es_legal_coincide_con_generate_legal() {
+        let posiciones = [
+            crate::board::Board::startpos(),
+            Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -")
+                .unwrap(),
+            Board::from_fen("rnbqkbnr/pp1ppppp/8/2pP4/8/8/PPP1PPPP/RNBQKBNR w KQkq c6 0 2")
+                .unwrap(),
+            Board::from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1").unwrap(),
+            Board::from_fen("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1")
+                .unwrap(),
+            Board::from_fen("4k3/1P6/8/8/8/8/1p6/4K3 w - - 0 1").unwrap(),
+        ];
+        for b in &posiciones {
+            es_legal_coincide(b);
+            // Ademas, un nivel de profundidad para cubrir respuestas (jaques,
+            // al paso recien habilitado, perdida de derechos de enroque...).
+            for mv in generate_legal(b) {
+                es_legal_coincide(&b.make_move(&mv));
+            }
         }
     }
 

@@ -983,6 +983,25 @@ fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead
     objetivo.max(1).min(techo).min(disponible.max(1))
 }
 
+/// Techo DURO del reloj para la jugada actual ("maximo" de timeman.cpp).
+/// El presupuesto objetivo (`calcular_movetime_reloj`) puede estirarse por
+/// los factores reactivos de la busqueda, pero NUNCA mas alla de esto.
+///
+/// DOS limites, y manda el mas chico:
+///  - 80% del tiempo realmente disponible en el reloj (ya descontado el
+///    Move Overhead): la red de seguridad absoluta.
+///  - 4x el presupuesto objetivo: sin esto, una sola iteracion profunda
+///    arrancada justo antes del corte blando podia comerse casi todo el
+///    reloj de golpe (se midio una partida perdida por tiempo asi).
+/// Perder por tiempo es peor que cualquier Elo que se gane.
+fn calcular_movetime_maximo(mio_i: i64, move_overhead_ms: u64, objetivo_ms: u64) -> u64 {
+    let mio = mio_i.max(0) as u64;
+    let disponible = mio.saturating_sub(move_overhead_ms);
+    let por_reloj = disponible.saturating_mul(80) / 100;
+    let por_objetivo = objetivo_ms.saturating_mul(4);
+    por_reloj.min(por_objetivo).max(1)
+}
+
 fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
@@ -1011,6 +1030,7 @@ fn uci_loop() {
     // que solo vive unos milisegundos. Es experimental y apagado por defecto;
     // el modo normal conserva stop asíncrono sin ninguna variación.
     let mut sync_ultrabullet = false;
+    let mut multipv: usize = 1;
     if let Ok(p) = std::env::var("MIMOTOR_PERSONALIDAD")
         && let Some(pers) = eval::personalidad_desde_texto(&p)
     {
@@ -1109,6 +1129,7 @@ fn uci_loop() {
                 println!("option name QSearchNNUE type check default true");
                 println!("option name NNUEClassicalDepth type spin default 0 min 0 max 4");
                 println!("option name SyncUltraBullet type check default false");
+                println!("option name MultiPV type spin default 1 min 1 max 10");
                 println!("uciok");
                 io::stdout().flush().ok();
             }
@@ -1187,6 +1208,10 @@ fn uci_loop() {
                     } else if nombre.eq_ignore_ascii_case("syncultrabullet") {
                         if let Some(v) = valor {
                             sync_ultrabullet = v.eq_ignore_ascii_case("true");
+                        }
+                    } else if nombre.eq_ignore_ascii_case("multipv") {
+                        if let Some(n) = valor.and_then(|v| v.parse::<usize>().ok()) {
+                            multipv = n.clamp(1, 10);
                         }
                     } else if nombre.eq_ignore_ascii_case("nnuepath")
                         || nombre.eq_ignore_ascii_case("nnpath")
@@ -1383,6 +1408,9 @@ fn uci_loop() {
                 // movetime explicito, o wtime/btime(+winc/binc/movestogo), o
                 // "go infinite" (sin limite propio, corta solo con "stop").
                 let mut movetime: Option<u64> = None;
+                // Solo se pone cuando el `go` trae reloj (wtime/btime); con
+                // `go movetime` o `go depth` no hay dos presupuestos.
+                let mut movetime_maximo: Option<u64> = None;
                 if let Some(i) = partes.iter().position(|&p| p == "movetime") {
                     movetime = partes.get(i + 1).and_then(|s| s.parse().ok());
                 } else if !infinito {
@@ -1427,10 +1455,23 @@ fn uci_loop() {
                             movestogo,
                             move_overhead_ms,
                         ));
+                        // Techo duro para el time management de dos
+                        // presupuestos (ver Searcher::tiempo_maximo_ms).
+                        movetime_maximo = Some(calcular_movetime_maximo(
+                            mio_i,
+                            move_overhead_ms,
+                            movetime.unwrap_or(0),
+                        ));
                     } else {
                         movetime = Some(2000); // "go" sin ningun parametro de tiempo: default razonable
                     }
                 }
+
+                // Publica el techo duro del reloj para ESTA busqueda (lo
+                // leen todos los caminos, incluidos los hilos de Lazy SMP).
+                // Se fija siempre, tambien a None, para que un `go movetime`
+                // no herede el techo del `go` anterior.
+                search::fijar_tiempo_maximo(movetime_maximo);
 
                 // "searchmoves e2e4 d2d4 ...": restringe la busqueda en la
                 // RAIZ a solo estas jugadas -- pensado para repartir el
@@ -1449,6 +1490,101 @@ fn uci_loop() {
                 let stop_flag = Arc::new(AtomicBool::new(false));
                 let board_copy = board;
                 let hist_copy = game_history.clone();
+
+                // MultiPV: Mittens no tiene un algoritmo de multi-linea real
+                // (compartir el ply de raiz entre N lineas simultaneas). En
+                // su lugar se simula con N busquedas SECUENCIALES completas,
+                // cada una excluyendo (via root_moves_filtro) las jugadas de
+                // raiz ya encontradas en las anteriores -- el mismo truco que
+                // "searchmoves" ya permitia hacer desde afuera, ahora nativo
+                // y repartiendo el movetime total entre las N pasadas. Es
+                // sincrono (no soporta "stop" a mitad de camino ni "ponder")
+                // porque su uso previsto es analisis con movetime fijo, no
+                // partidas en vivo -- el camino normal (MultiPV=1, el
+                // default) no se toca y sigue siendo totalmente asincrono.
+                if multipv > 1 {
+                    let modo_lmr = searcher_slot.as_ref().unwrap().modo_lmr;
+                    let universo: Vec<Move> = match &searchmoves_filtro {
+                        Some(f) => f.clone(),
+                        None => movegen::generate_legal(&board_copy).to_vec(),
+                    };
+                    let tiempo_por_linea = movetime.map(|t| (t / multipv as u64).max(1));
+                    let mut excluidas: Vec<Move> = Vec::new();
+                    // (score, profundidad, nodos, pv)
+                    let mut lineas: Vec<(i32, i32, u64, Vec<Move>)> = Vec::new();
+                    for _ in 0..multipv {
+                        let candidatas: Vec<Move> = universo
+                            .iter()
+                            .copied()
+                            .filter(|m| !excluidas.contains(m))
+                            .collect();
+                        if candidatas.is_empty() {
+                            break;
+                        }
+                        let (mv, sc, nodos, prof, pv) = if n_hilos > 1 {
+                            let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
+                                &board_copy,
+                                tiempo_por_linea,
+                                64,
+                                n_hilos,
+                                &smp_tt,
+                                &smp_generacion,
+                                smp_tt_mask,
+                                modo_lmr,
+                                qsearch_nnue,
+                                nnue_classical_depth,
+                                &hist_copy,
+                                Arc::new(AtomicBool::new(false)),
+                                Some(candidatas),
+                            );
+                            let prof = resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
+                            // La TT compartida ya tiene el resultado: se
+                            // reconstruye la PV envolviendola en un Searcher
+                            // liviano solo para leerla (no busca nada).
+                            let lector = Searcher::new_con_tt_compartida(
+                                Arc::clone(&smp_tt),
+                                smp_tt_mask,
+                                modo_lmr,
+                            );
+                            let pv = lector.extraer_pv(&board_copy, 10);
+                            (mv, sc, nodos, prof, pv)
+                        } else {
+                            let mut s = searcher_slot.take().expect("searcher multipv");
+                            s.set_game_history(hist_copy.clone());
+                            s.root_moves_filtro = Some(candidatas);
+                            let (mv, sc, prof) =
+                                s.search_time(&board_copy, tiempo_por_linea, 64, |_, _, _, _| {});
+                            let nodos = s.nodes;
+                            let pv = s.extraer_pv(&board_copy, 10);
+                            searcher_slot = Some(s);
+                            (mv, sc, nodos, prof, pv)
+                        };
+                        let Some(mv) = mv else { break };
+                        excluidas.push(mv);
+                        let pv = if pv.first() == Some(&mv) { pv } else { vec![mv] };
+                        lineas.push((sc, prof, nodos, pv));
+                    }
+                    lineas.sort_by(|a, b| b.0.cmp(&a.0));
+                    for (i, (sc, prof, nodos, pv)) in lineas.iter().enumerate() {
+                        let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
+                        println!(
+                            "info depth {} multipv {} score {} nodes {} pv {}",
+                            prof,
+                            i + 1,
+                            formatear_score_uci(*sc),
+                            nodos,
+                            pv_txt
+                        );
+                    }
+                    io::stdout().flush().ok();
+                    let bestmove = lineas.first().and_then(|(_, _, _, pv)| pv.first().copied());
+                    println!(
+                        "bestmove {}",
+                        bestmove.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+                    );
+                    io::stdout().flush().ok();
+                    continue;
+                }
 
                 // A relojes extremadamente cortos el overhead de crear y
                 // despertar el hilo UCI pesa tanto como una fracción de la

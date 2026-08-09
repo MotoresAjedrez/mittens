@@ -991,6 +991,25 @@ fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead
     objetivo.max(1).min(techo).min(disponible.max(1))
 }
 
+/// Techo DURO del reloj para la jugada actual ("maximo" de timeman.cpp).
+/// El presupuesto objetivo (`calcular_movetime_reloj`) puede estirarse por
+/// los factores reactivos de la busqueda, pero NUNCA mas alla de esto.
+///
+/// DOS limites, y manda el mas chico:
+///  - 80% del tiempo realmente disponible en el reloj (ya descontado el
+///    Move Overhead): la red de seguridad absoluta.
+///  - 4x el presupuesto objetivo: sin esto, una sola iteracion profunda
+///    arrancada justo antes del corte blando podia comerse casi todo el
+///    reloj de golpe (se midio una partida perdida por tiempo asi).
+/// Perder por tiempo es peor que cualquier Elo que se gane.
+fn calcular_movetime_maximo(mio_i: i64, move_overhead_ms: u64, objetivo_ms: u64) -> u64 {
+    let mio = mio_i.max(0) as u64;
+    let disponible = mio.saturating_sub(move_overhead_ms);
+    let por_reloj = disponible.saturating_mul(80) / 100;
+    let por_objetivo = objetivo_ms.saturating_mul(4);
+    por_reloj.min(por_objetivo).max(1)
+}
+
 pub fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
@@ -1391,6 +1410,7 @@ pub fn uci_loop() {
                 // movetime explicito, o wtime/btime(+winc/binc/movestogo), o
                 // "go infinite" (sin limite propio, corta solo con "stop").
                 let mut movetime: Option<u64> = None;
+                let mut movetime_maximo: Option<u64> = None;
                 if let Some(i) = partes.iter().position(|&p| p == "movetime") {
                     movetime = partes.get(i + 1).and_then(|s| s.parse().ok());
                 } else if !infinito {
@@ -1435,10 +1455,21 @@ pub fn uci_loop() {
                             movestogo,
                             move_overhead_ms,
                         ));
+                        movetime_maximo = Some(calcular_movetime_maximo(
+                            mio_i,
+                            move_overhead_ms,
+                            movetime.unwrap_or(0),
+                        ));
                     } else {
                         movetime = Some(2000); // "go" sin ningun parametro de tiempo: default razonable
                     }
                 }
+
+                // Publica el techo duro del reloj para ESTA busqueda (lo
+                // leen todos los caminos, incluidos los hilos de Lazy SMP).
+                // Se fija siempre, tambien a None, para que un `go movetime`
+                // no herede el techo del `go` anterior.
+                search::fijar_tiempo_maximo(movetime_maximo);
 
                 // "searchmoves e2e4 d2d4 ...": restringe la busqueda en la
                 // RAIZ a solo estas jugadas -- pensado para repartir el
