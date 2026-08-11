@@ -512,8 +512,15 @@ pub fn existe_jugada_legal(b: &Board) -> bool {
 
     for mv in generate_pseudo_legal(b) {
         if mv.from == king_sq {
-            // Ya cubiertas arriba (incluido el enroque, que además sale
-            // legalizado de gen_castling).
+            // El enroque sale ya legalizado de gen_castling. (De hecho nunca
+            // puede ser la ÚNICA jugada legal: enrocar exige que la casilla
+            // intermedia f1/d1 esté vacía y no atacada, lo que hace legal
+            // también Rf1/Rd1, que el barrido de arriba ya habría aceptado.
+            // Se acepta aquí igual para no depender de ese razonamiento.)
+            if matches!(mv.flag, MoveFlag::CastleKing | MoveFlag::CastleQueen) {
+                return true;
+            }
+            // Las demás jugadas de rey ya se probaron en el barrido de arriba.
             continue;
         }
         if !en_jaque && mv.flag != MoveFlag::EnPassant && bit(mv.from) & pinned == 0 {
