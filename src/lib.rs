@@ -66,7 +66,7 @@ fn run_simple(fen: &str, movetime_ms: u64) {
         }
     };
     let mut s = Searcher::new(64);
-    let (mv, sc, prof) = s.search_time(&b, Some(movetime_ms), 64, |_, _, _, _| {});
+    let (mv, sc, prof) = s.search_time(&b, Some(movetime_ms), 64, |_, _, _, _, _| {});
     let pv = s.extraer_pv(&b, 12);
     let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
     println!("================ MiMotor Tal ================");
@@ -1398,11 +1398,13 @@ pub fn uci_loop() {
                         // rompe el parseo de GUIs y testers (Cutechess, Arena,
                         // herramientas de CCRL).
                         let (mv, _sc, _) =
-                            s.search_time(&board_copy, None, depth, |depth, score, nodes, ms| {
+                            s.search_time(&board_copy, None, depth, |depth, score, nodes, ms, pv| {
                                 let nps = nodes.saturating_mul(1000) / ms.max(1);
+                                let pv_txt =
+                                    pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
                                 println!(
-                                    "info depth {} score {} nodes {} time {} nps {}",
-                                    depth, formatear_score_uci(score), nodes, ms, nps
+                                    "info depth {} score {} nodes {} time {} nps {} pv {}",
+                                    depth, formatear_score_uci(score), nodes, ms, nps, pv_txt
                                 );
                                 io::stdout().flush().ok();
                             });
@@ -1535,10 +1537,12 @@ pub fn uci_loop() {
                     s.set_external_stop(Some(Arc::clone(&stop_flag)));
                     s.root_moves_filtro = searchmoves_filtro.clone();
                     let (mv, _sc, _) =
-                        s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
+                        s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms, pv| {
+                            let pv_txt =
+                                pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
                             println!(
-                                "info depth {} score {} nodes {} time {}",
-                                depth, formatear_score_uci(score), nodes, ms
+                                "info depth {} score {} nodes {} time {} pv {}",
+                                depth, formatear_score_uci(score), nodes, ms, pv_txt
                             );
                             io::stdout().flush().ok();
                         });
@@ -1581,9 +1585,16 @@ pub fn uci_loop() {
                             resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
                         let ms = t0.elapsed().as_millis().max(1) as u64;
                         let nps = nodos.saturating_mul(1000) / ms;
+                        // La TT compartida ya tiene el resultado de todos los
+                        // hilos: se reconstruye la PV envolviendola en un
+                        // Searcher liviano solo para leerla (no busca nada).
+                        let lector =
+                            Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, modo_lmr);
+                        let pv = lector.extraer_pv(&board_copy, profundidad.max(1) as usize);
+                        let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
                         println!(
-                            "info depth {} score {} nodes {} time {} nps {}",
-                            profundidad, formatear_score_uci(sc), nodos, ms, nps
+                            "info depth {} score {} nodes {} time {} nps {} pv {}",
+                            profundidad, formatear_score_uci(sc), nodos, ms, nps, pv_txt
                         );
                         println!(
                             "bestmove {}",
@@ -1600,10 +1611,12 @@ pub fn uci_loop() {
                     s.root_moves_filtro = searchmoves_filtro.clone();
                     let handle = std::thread::spawn(move || {
                         let (mv, _sc, _) =
-                            s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms| {
+                            s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms, pv| {
+                                let pv_txt =
+                                    pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
                                 println!(
-                                    "info depth {} score {} nodes {} time {}",
-                                    depth, formatear_score_uci(score), nodes, ms
+                                    "info depth {} score {} nodes {} time {} pv {}",
+                                    depth, formatear_score_uci(score), nodes, ms, pv_txt
                                 );
                                 io::stdout().flush().ok();
                             });
