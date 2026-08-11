@@ -1499,10 +1499,12 @@ impl Searcher {
         // descartarian de todos modos) -- evita el trabajo mas caro de
         // legalizar jugadas que nunca se van a buscar. Si NO hay capturas
         // legales, con eso solo no se puede distinguir "posicion tranquila
-        // normal" de "ahogado real": para ese caso, y SOLO ese, se paga el
-        // generate_legal completo para detectar el ahogado correctamente.
+        // normal" de "ahogado real": para ese caso, y SOLO ese, se consulta
+        // existe_jugada_legal, que corta en cuanto encuentra UNA jugada legal
+        // (antes se generaba y legalizaba la lista COMPLETA solo para mirar
+        // si quedaba vacia -- en cada hoja tranquila de quiescence).
         let capturas = generate_captures_legal(b);
-        if capturas.is_empty() && generate_legal(b).is_empty() {
+        if capturas.is_empty() && !crate::movegen::existe_jugada_legal(b) {
             return Ok(0); // ahogado
         }
         // Igual que la lista principal: quiescence vive en las hojas y no

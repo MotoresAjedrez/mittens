@@ -266,3 +266,45 @@ fn estado_derivado_y_fen_consistentes_tras_make_move() {
         }
     }
 }
+
+/// existe_jugada_legal debe coincidir SIEMPRE con `!generate_legal().is_empty()`.
+#[test]
+fn existe_jugada_legal_coincide_con_generate_legal() {
+    use crate::movegen::existe_jugada_legal;
+    let semillas = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        // Ahogados y mates reales.
+        "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1",
+        "k7/8/1Q6/8/8/8/8/K7 b - - 0 1",
+        "8/8/8/8/8/5K1k/8/6Rq w - - 0 1",
+        "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3",
+    ];
+    let mut rng = Rng(0xFEED_FACE_5AA5_1111);
+    let mut vistas = 0u32;
+    for fen in semillas {
+        let raiz = Board::from_fen(fen).unwrap();
+        assert_eq!(existe_jugada_legal(&raiz), !generate_legal(&raiz).is_empty(), "{}", fen);
+        for _ in 0..400 {
+            let mut b = raiz;
+            for _ in 0..100 {
+                let movs = generate_legal(&b);
+                assert_eq!(
+                    existe_jugada_legal(&b),
+                    !movs.is_empty(),
+                    "existe_jugada_legal diverge en {}",
+                    b.to_fen()
+                );
+                vistas += 1;
+                if movs.is_empty() {
+                    break;
+                }
+                b = b.make_move(&movs[(rng.next() % movs.len() as u64) as usize]);
+            }
+        }
+    }
+    assert!(vistas > 50_000, "muestra chica: {}", vistas);
+}
