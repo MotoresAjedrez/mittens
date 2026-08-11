@@ -266,9 +266,15 @@ fn puesto_avanzado_seguro(color: Color, sq: Square, peones_rivales: Bitboard) ->
 
 const BONUS_PUESTO: [i32; 6] = [0, 25, 12, 0, 0, 0]; // solo caballo/alfil
 
-fn pareja_alfiles_bonus(color: Color, b: &Board) -> f64 {
+// Pareja de alfiles. Antes solo la cobraba la personalidad Universal, asi que
+// la personalidad por DEFECTO (Tal) jugaba con cero bonus por pareja de
+// alfiles: un termino de eval estandar que vale 30-50cp y que no tiene nada
+// que ver con el estilo agresivo o tecnico. Ahora la cobran las dos, y con
+// dependencia de fase: la pareja vale mas cuanto mas abierto queda el tablero
+// (en el final los alfiles dominan a los caballos).
+fn pareja_alfiles_bonus(color: Color, b: &Board, egf: f64) -> f64 {
     if popcount(b.pieces[color as usize][PieceType::Bishop as usize]) >= 2 {
-        35.0
+        25.0 + 25.0 * egf
     } else {
         0.0
     }
@@ -439,7 +445,21 @@ fn shield_raw(ksq: Square, color: Color, propios: Bitboard) -> i32 {
     s
 }
 
+// Estructura de peones en "unidades" (el peso por unidad lo pone la
+// personalidad: 8 para Tal, 16 para Universal).
+//
+// Cambios respecto de la version anterior:
+//  - Doblados y aislados pasan de -1 a -2 unidades. A 8cp/unidad el castigo
+//    por peon doblado era de solo 8cp, muy por debajo del rango habitual
+//    (15-25cp); el motor cambiaba piezas a estructura rota casi gratis.
+//  - Un aislado que ADEMAS esta doblado se castiga extra: es el defecto
+//    estructural mas caro y antes se sumaba de forma casi plana.
+//  - Nuevo: bono de falange (peones propios lado a lado). Antes la eval solo
+//    sabia castigar estructura mala, no premiar la buena, asi que era ciega a
+//    la diferencia entre peones conectados y peones sueltos pero no aislados.
+//    Es una mascara sin color, no hace falta saber en que direccion avanzan.
 fn pawn_structure_raw(pawns: Bitboard) -> i32 {
+    const NO_FILE_A: Bitboard = !0x0101010101010101u64;
     let mut score = 0;
     for f in 0..8u8 {
         let fm: Bitboard = 0x0101010101010101u64 << f;
@@ -455,13 +475,18 @@ fn pawn_structure_raw(pawns: Bitboard) -> i32 {
         let count = popcount(pawns & fm) as i32;
         if count > 0 {
             if count > 1 {
-                score -= count - 1;
+                score -= 2 * (count - 1);
             }
             if pawns & adyacentes == 0 {
-                score -= count;
+                score -= 2 * count;
+                if count > 1 {
+                    score -= 2; // aislado y doblado a la vez: defecto grave
+                }
             }
         }
     }
+    // Falange: cada par de peones adyacentes en la misma fila.
+    score += popcount(pawns & ((pawns << 1) & NO_FILE_A)) as i32;
     score
 }
 
@@ -1002,6 +1027,24 @@ fn evaluar_clasica(b: &Board, cache: Option<&ClassicalAccumulator>) -> i32 {
             let sq = crate::bitboard::pop_lsb(&mut bb);
             let base = PASO_BONUS[indice_avance(color, sq)] as f64;
             let mut bono = base * (0.5 + 0.5 * egf);
+            // Un pasado con una pieza rival plantada delante NO es el mismo
+            // activo que uno con el camino libre: no avanza y muchas veces es
+            // una debilidad. Antes valian exactamente lo mismo.
+            let delante = if color == Color::White {
+                if rank_of(sq) < 7 {
+                    1u64 << (sq + 8)
+                } else {
+                    0
+                }
+            } else if rank_of(sq) > 0 {
+                1u64 << (sq - 8)
+            } else {
+                0
+            };
+            let ocupacion_rival = if color == Color::White { occ_b } else { occ_w };
+            if delante & ocupacion_rival != 0 {
+                bono *= 0.55;
+            }
             let casilla_coronacion = if color == Color::White {
                 make_square(file_of(sq), 7)
             } else {
@@ -1058,6 +1101,8 @@ fn evaluar_clasica(b: &Board, cache: Option<&ClassicalAccumulator>) -> i32 {
     // el territorio del rival de forma permanente no contradice la
     // identidad agresiva, la complementa.
     let mut extra = 0.0f64;
+    // Pareja de alfiles para AMBAS personalidades (antes solo Universal).
+    extra += pareja_alfiles_bonus(Color::White, b, egf) - pareja_alfiles_bonus(Color::Black, b, egf);
     if !es_universal {
         if ar.ataque_w - ar.ataque_b > 60.0 {
             if b.pieces[Color::White as usize][PieceType::Queen as usize] & occ_w != 0 {
@@ -1088,8 +1133,6 @@ fn evaluar_clasica(b: &Board, cache: Option<&ClassicalAccumulator>) -> i32 {
             }
         }
     } else {
-        extra += pareja_alfiles_bonus(Color::White, b) - pareja_alfiles_bonus(Color::Black, b);
-
         for (color, signo, rivales) in [(Color::White, 1.0f64, pb), (Color::Black, -1.0f64, pw)] {
             for pt in [PieceType::Knight, PieceType::Bishop] {
                 let mut bb = b.pieces[color as usize][pt as usize];
