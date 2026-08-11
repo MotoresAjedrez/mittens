@@ -1,11 +1,12 @@
 use crate::board::Board;
-use crate::movegen::generate_legal;
+use crate::movegen::{MoveList, generate_legal, generate_legal_into};
 
 pub fn perft(b: &Board, depth: u32) -> u64 {
     if depth == 0 {
         return 1;
     }
-    let moves = generate_legal(b);
+    let mut moves = MoveList::new();
+    generate_legal_into(b, &mut moves);
     if depth == 1 {
         return moves.len() as u64;
     }
