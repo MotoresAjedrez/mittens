@@ -2962,7 +2962,7 @@ impl Searcher {
         b: &Board,
         movetime_ms: Option<u64>,
         max_depth: i32,
-        mut on_info: impl FnMut(i32, i32, u64, u64),
+        mut on_info: impl FnMut(i32, i32, u64, u64, &[Move]),
     ) -> (Option<Move>, i32, i32) {
         // Red de seguridad (ver from_fen y search_fixed_depth): nunca buscar
         // una posicion ilegal; devolver sin jugada (bestmove 0000) en vez de
@@ -3021,7 +3021,7 @@ impl Searcher {
         };
         if let Some(mv) = crate::polyglot::probe(b) {
             if filtro_permite(&mv) {
-                on_info(1, 0, 0, 0);
+                on_info(1, 0, 0, 0, &[mv]);
                 return (Some(mv), 0, 1);
             }
         }
@@ -3035,7 +3035,7 @@ impl Searcher {
         // chequeo del filtro que el libro, por la misma razon.
         if let Some((mv, sc)) = crate::syzygy::mejor_jugada_raiz(b) {
             if filtro_permite(&mv) {
-                on_info(1, sc, 0, 0);
+                on_info(1, sc, 0, 0, &[mv]);
                 return (Some(mv), sc, 1);
             }
         }
@@ -3276,7 +3276,21 @@ impl Searcher {
             mejor_mv = Some(actual_mv);
             mejor_sc = actual_sc;
             mejor_prof = d;
-            on_info(d, mejor_sc, self.nodes, inicio.elapsed().as_millis() as u64);
+            // La raiz nunca pasa por negamax (el loop la maneja aparte), asi
+            // que sin esto la TT no tiene entrada para ella y extraer_pv()
+            // no puede ni arrancar a caminarla -- se guardaria recien al
+            // final de toda la busqueda (ver mas abajo) y cada "info"
+            // intermedio imprimiria "pv" vacio. Se repite aca, una vez por
+            // iteracion, solo para que el reporte informativo tenga de donde
+            // arrancar; no afecta la busqueda en si (el valor final se
+            // vuelve a escribir igual al terminar el loop).
+            self.tt_store(b.zobrist, mejor_prof, mejor_sc, 0, TTFlag::Exact, mejor_mv);
+            // El PV mostrado en "info" es puramente informativo (no
+            // participa de la busqueda): se reconstruye caminando la TT
+            // desde la raiz, acotado a la profundidad ya completada para no
+            // arrastrar basura de iteraciones futuras sin terminar.
+            let pv_info = self.extraer_pv(b, mejor_prof.max(1) as usize);
+            on_info(d, mejor_sc, self.nodes, inicio.elapsed().as_millis() as u64, &pv_info);
 
             if mejor_sc.abs() >= MATE - 1000 {
                 break;
@@ -3407,7 +3421,7 @@ pub fn buscar_lazy_smp(
         s.set_external_stop(Some(external_stop));
         s.set_game_history(game_history.to_vec());
         s.root_moves_filtro = root_moves_filtro;
-        let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _| {});
+        let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _, _| {});
         let nodos = s.nodes;
         return (
             mv,
@@ -3445,7 +3459,7 @@ pub fn buscar_lazy_smp(
                 s.set_external_stop(Some(external_stop));
                 s.set_game_history(game_history);
                 let (mv, sc, prof) =
-                    s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _| {});
+                    s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _, _| {});
                 ResultadoHilo {
                     mv,
                     score: sc,
@@ -3756,7 +3770,7 @@ mod regresion_posicion_ilegal {
         assert!(mv.is_none(), "posicion ilegal: no debe haber jugada");
         assert_eq!(nodes, 0);
         assert_eq!(sc, 0);
-        let (mv2, sc2, _) = s.search_time(&ilegal, None, 8, |_, _, _, _| {});
+        let (mv2, sc2, _) = s.search_time(&ilegal, None, 8, |_, _, _, _, _| {});
         assert!(mv2.is_none());
         assert_eq!(sc2, 0);
     }
@@ -3866,7 +3880,7 @@ mod reproduccion_h5c5 {
 
         let mut s = Searcher::new(64);
         for movetime in [20u64, 100, 500] {
-            let (mv, _sc, _prof) = s.search_time(&b, Some(movetime), 64, |_, _, _, _| {});
+            let (mv, _sc, _prof) = s.search_time(&b, Some(movetime), 64, |_, _, _, _, _| {});
             let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
             assert!(
                 legales.contains(&uci),
@@ -3990,7 +4004,7 @@ mod reproduccion_h5c5 {
 
         let mut s = Searcher::new(16);
         s.set_game_history(hist.clone());
-        let (mv, sc, _) = s.search_time(&b, Some(200), 64, |_, _, _, _| {});
+        let (mv, sc, _) = s.search_time(&b, Some(200), 64, |_, _, _, _, _| {});
         let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
         assert!(
             legales.contains(&uci),
@@ -4003,7 +4017,7 @@ mod reproduccion_h5c5 {
         let b50 = Board::from_fen("8/8/4k3/8/8/4K3/6R1/8 w - - 100 120").unwrap();
         let legales50 = legal_raiz(&b50);
         let mut s50 = Searcher::new(16);
-        let (mv50, _sc50, _) = s50.search_time(&b50, Some(200), 64, |_, _, _, _| {});
+        let (mv50, _sc50, _) = s50.search_time(&b50, Some(200), 64, |_, _, _, _, _| {});
         let uci50 = mv50.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
         assert!(
             legales50.contains(&uci50),
