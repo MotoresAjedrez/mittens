@@ -3082,6 +3082,15 @@ impl Searcher {
             0 => None,
             v => Some(v),
         };
+        // ¿Hay un RELOJ REAL detras de este presupuesto? main.rs solo publica
+        // un techo duro (fijar_tiempo_maximo) cuando el `go` trae
+        // wtime/btime. Con `go movetime X` no hay techo: el presupuesto ES el
+        // limite y el tiempo que no se usa NO se ahorra para despues, se
+        // pierde. Por eso el corte blando (que existe para GUARDAR reloj para
+        // las jugadas siguientes) solo tiene sentido con reloj real; con
+        // movetime fijo cortar al 55-85% del presupuesto era regalar entre un
+        // 15% y un 45% del tiempo de pensar en cada jugada.
+        let hay_reloj_real = self.tiempo_maximo_ms.or(techo_global).is_some();
         let maximo_ms = match (movetime_ms, self.tiempo_maximo_ms.or(techo_global)) {
             (Some(opt), Some(max)) => Some(max.max(opt)),
             (Some(opt), None) => Some(opt),
@@ -3363,6 +3372,7 @@ impl Searcher {
             let factor = factor.clamp(40, 200);
             if let Some(ms) = optimo_ms
                 && ms > 25
+                && hay_reloj_real
             {
                 let umbral = ms.saturating_mul(fraccion_corte) / 100;
                 let umbral = umbral.saturating_mul(factor) / 100;
