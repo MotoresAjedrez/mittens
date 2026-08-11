@@ -69,17 +69,17 @@ impl PieceType {
 pub type Square = u8;
 
 #[inline(always)]
-pub fn make_square(file: u8, rank: u8) -> Square {
+pub const fn make_square(file: u8, rank: u8) -> Square {
     rank * 8 + file
 }
 
 #[inline(always)]
-pub fn file_of(sq: Square) -> u8 {
+pub const fn file_of(sq: Square) -> u8 {
     sq % 8
 }
 
 #[inline(always)]
-pub fn rank_of(sq: Square) -> u8 {
+pub const fn rank_of(sq: Square) -> u8 {
     sq / 8
 }
 

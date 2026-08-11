@@ -7,7 +7,10 @@ use crate::board::Board;
 use crate::eval::{
     EvalState, crear_eval_state, evaluate_classical_with_state, evaluate_with_state,
 };
-use crate::movegen::{MAX_MOVES, generate_captures_legal, generate_legal};
+use crate::movegen::{
+    MAX_MOVES, MoveList, generate_captures_legal, generate_captures_legal_into, generate_legal,
+    generate_legal_into,
+};
 use crate::types::{Move, MoveFlag, PieceType};
 use arrayvec::ArrayVec;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -1437,7 +1440,8 @@ impl Searcher {
         // En jaque no existe "stand pat": quedarse quieto es ilegal. Se deben
         // buscar TODAS las evasiones legales, incluidas jugadas silenciosas.
         if en_jaque {
-            let mut evasiones = generate_legal(b);
+            let mut evasiones = MoveList::new();
+            generate_legal_into(b, &mut evasiones);
             if evasiones.is_empty() {
                 return Ok(-MATE + ply as i32);
             }
@@ -1508,7 +1512,8 @@ impl Searcher {
         // existe_jugada_legal, que corta en cuanto encuentra UNA jugada legal
         // (antes se generaba y legalizaba la lista COMPLETA solo para mirar
         // si quedaba vacia -- en cada hoja tranquila de quiescence).
-        let capturas = generate_captures_legal(b);
+        let mut capturas = MoveList::new();
+        generate_captures_legal_into(b, &mut capturas);
         if capturas.is_empty() && !crate::movegen::existe_jugada_legal(b) {
             return Ok(0); // ahogado
         }
@@ -1571,7 +1576,9 @@ impl Searcher {
         // propios jaques silenciosos, y los de esos, encadenando sin fin.
         if qdepth == 0 && alpha < beta && stand_pat + 150 > alpha {
             let mut jaques_probados = 0usize;
-            for mv in generate_legal(b) {
+            let mut jaques_lista = MoveList::new();
+            generate_legal_into(b, &mut jaques_lista);
+            for mv in jaques_lista.iter().copied() {
                 if jaques_probados >= 5 {
                     break;
                 }
@@ -1945,7 +1952,8 @@ impl Searcher {
             let saltar_probcut = tt_entry_full
                 .as_ref()
                 .is_some_and(|e| e.depth >= sdepth_guarda && e.score < probcut_beta);
-            let mut capturas = generate_captures_legal(b);
+            let mut capturas = MoveList::new();
+            generate_captures_legal_into(b, &mut capturas);
             if saltar_probcut {
                 capturas.clear();
             }
@@ -2058,7 +2066,8 @@ impl Searcher {
         let n_moves;
         let mut lista_ordenada;
         {
-            moves = generate_legal(b);
+            moves = MoveList::new();
+            generate_legal_into(b, &mut moves);
             if moves.is_empty() {
                 self.path_len = self.path_len.saturating_sub(1);
                 return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });

@@ -12,22 +12,22 @@ pub type Bitboard = u64;
 pub const EMPTY: Bitboard = 0;
 
 #[inline(always)]
-pub fn bit(sq: Square) -> Bitboard {
+pub const fn bit(sq: Square) -> Bitboard {
     1u64 << sq
 }
 
 #[inline(always)]
-pub fn popcount(bb: Bitboard) -> u32 {
+pub const fn popcount(bb: Bitboard) -> u32 {
     bb.count_ones()
 }
 
 #[inline(always)]
-pub fn lsb(bb: Bitboard) -> Square {
+pub const fn lsb(bb: Bitboard) -> Square {
     bb.trailing_zeros() as Square
 }
 
 #[inline(always)]
-pub fn msb(bb: Bitboard) -> Square {
+pub const fn msb(bb: Bitboard) -> Square {
     63 - bb.leading_zeros() as Square
 }
 
@@ -61,9 +61,17 @@ struct Tables {
     rays: [[Bitboard; 64]; 8],         // [dir][square]
 }
 
-static TABLES: OnceLock<Tables> = OnceLock::new();
+/// Tablas de geometria pura (caballo, rey, ataques de peon y rayos): no
+/// dependen de nada del tablero, asi que se calculan al COMPILAR en vez de
+/// dentro de un OnceLock. Antes cada `knight_attacks`/`king_attacks`/
+/// `pawn_attacks` y cada consulta de rayos pagaba una carga atomica Acquire
+/// mas un salto para comprobar la inicializacion; ahora es un acceso directo
+/// a un static. El contenido es identico por construccion (mismo codigo,
+/// ejecutado por el evaluador de constantes) y el test
+/// `tablas_const_coinciden_con_construccion` lo verifica entrada por entrada.
+static TABLES_CONST: Tables = build_tables();
 
-fn dir_index(dir: Dir) -> usize {
+const fn dir_index(dir: Dir) -> usize {
     match dir {
         Dir::N => 0,
         Dir::S => 1,
@@ -76,7 +84,7 @@ fn dir_index(dir: Dir) -> usize {
     }
 }
 
-fn step(file: i32, rank: i32, dir: Dir) -> Option<(i32, i32)> {
+const fn step(file: i32, rank: i32, dir: Dir) -> Option<(i32, i32)> {
     let (df, dr) = match dir {
         Dir::N => (0, 1),
         Dir::S => (0, -1),
@@ -88,66 +96,94 @@ fn step(file: i32, rank: i32, dir: Dir) -> Option<(i32, i32)> {
         Dir::SW => (-1, -1),
     };
     let (nf, nr) = (file + df, rank + dr);
-    if (0..8).contains(&nf) && (0..8).contains(&nr) {
+    if nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
         Some((nf, nr))
     } else {
         None
     }
 }
 
-fn build_tables() -> Tables {
+/// Todas las direcciones, en el mismo orden que `ROOK_DIRS ++ BISHOP_DIRS`.
+const TODAS_LAS_DIRS: [Dir; 8] = [
+    Dir::N,
+    Dir::S,
+    Dir::E,
+    Dir::W,
+    Dir::NE,
+    Dir::NW,
+    Dir::SE,
+    Dir::SW,
+];
+
+const fn build_tables() -> Tables {
     let mut knight = [0u64; 64];
     let mut king = [0u64; 64];
     let mut pawn_attacks = [[0u64; 64]; 2];
     let mut rays = [[0u64; 64]; 8];
 
-    for sq in 0..64u8 {
+    let knight_deltas: [(i32, i32); 8] = [
+        (1, 2),
+        (2, 1),
+        (2, -1),
+        (1, -2),
+        (-1, -2),
+        (-2, -1),
+        (-2, 1),
+        (-1, 2),
+    ];
+
+    let mut sq = 0u8;
+    while sq < 64 {
         let f = file_of(sq) as i32;
         let r = rank_of(sq) as i32;
 
         // Caballo
-        let knight_deltas = [
-            (1, 2),
-            (2, 1),
-            (2, -1),
-            (1, -2),
-            (-1, -2),
-            (-2, -1),
-            (-2, 1),
-            (-1, 2),
-        ];
-        for (df, dr) in knight_deltas {
+        let mut i = 0;
+        while i < 8 {
+            let (df, dr) = knight_deltas[i];
             let (nf, nr) = (f + df, r + dr);
-            if (0..8).contains(&nf) && (0..8).contains(&nr) {
+            if nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
                 knight[sq as usize] |= bit(make_square(nf as u8, nr as u8));
             }
+            i += 1;
         }
 
         // Rey
-        for df in -1..=1i32 {
-            for dr in -1..=1i32 {
-                if df == 0 && dr == 0 {
-                    continue;
+        let mut df = -1i32;
+        while df <= 1 {
+            let mut dr = -1i32;
+            while dr <= 1 {
+                if !(df == 0 && dr == 0) {
+                    let (nf, nr) = (f + df, r + dr);
+                    if nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
+                        king[sq as usize] |= bit(make_square(nf as u8, nr as u8));
+                    }
                 }
-                let (nf, nr) = (f + df, r + dr);
-                if (0..8).contains(&nf) && (0..8).contains(&nr) {
-                    king[sq as usize] |= bit(make_square(nf as u8, nr as u8));
-                }
+                dr += 1;
             }
+            df += 1;
         }
 
         // Peones (ataques diagonales, no incluye avance)
-        for (color_idx, dr) in [(0usize, 1i32), (1usize, -1i32)] {
-            for df in [-1i32, 1i32] {
+        let mut color_idx = 0usize;
+        while color_idx < 2 {
+            let dr = if color_idx == 0 { 1i32 } else { -1i32 };
+            let mut j = 0;
+            while j < 2 {
+                let df = if j == 0 { -1i32 } else { 1i32 };
                 let (nf, nr) = (f + df, r + dr);
-                if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                if nf >= 0 && nf < 8 && nr >= 0 && nr < 8 {
                     pawn_attacks[color_idx][sq as usize] |= bit(make_square(nf as u8, nr as u8));
                 }
+                j += 1;
             }
+            color_idx += 1;
         }
 
         // Rayos para piezas deslizantes
-        for &dir in ROOK_DIRS.iter().chain(BISHOP_DIRS.iter()) {
+        let mut d = 0usize;
+        while d < 8 {
+            let dir = TODAS_LAS_DIRS[d];
             let mut ray = 0u64;
             let (mut cf, mut cr) = (f, r);
             while let Some((nf, nr)) = step(cf, cr, dir) {
@@ -156,7 +192,9 @@ fn build_tables() -> Tables {
                 cr = nr;
             }
             rays[dir_index(dir)][sq as usize] = ray;
+            d += 1;
         }
+        sq += 1;
     }
 
     Tables {
@@ -167,20 +205,24 @@ fn build_tables() -> Tables {
     }
 }
 
+#[inline(always)]
 fn tables() -> &'static Tables {
-    TABLES.get_or_init(build_tables)
+    &TABLES_CONST
 }
 
+#[inline(always)]
 pub fn knight_attacks(sq: Square) -> Bitboard {
-    tables().knight[sq as usize]
+    TABLES_CONST.knight[sq as usize]
 }
 
+#[inline(always)]
 pub fn king_attacks(sq: Square) -> Bitboard {
-    tables().king[sq as usize]
+    TABLES_CONST.king[sq as usize]
 }
 
+#[inline(always)]
 pub fn pawn_attacks(color: crate::types::Color, sq: Square) -> Bitboard {
-    tables().pawn_attacks[color as usize][sq as usize]
+    TABLES_CONST.pawn_attacks[color as usize][sq as usize]
 }
 
 pub const FILE_A: Bitboard = 0x0101_0101_0101_0101;
@@ -392,12 +434,19 @@ pub fn queen_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
 // (misma fila, columna o diagonal), sin incluir a ni b; 0 si no estan
 // alineadas. Se usa para detectar piezas clavadas: construida una sola vez
 // con ray-casting de referencia (independiente de las tablas mágicas).
-static BETWEEN: OnceLock<Vec<Bitboard>> = OnceLock::new();
+/// Igual que las tablas de geometria: calculada al compilar (antes era un
+/// `OnceLock<Vec<..>>`, o sea una carga atomica MAS una indireccion al heap y
+/// un chequeo de limites de slice en cada consulta). `pinned_pieces` la
+/// consulta una vez por atacante deslizante alineado con el rey.
+static BETWEEN: [Bitboard; 64 * 64] = build_between();
 
-fn build_between() -> Vec<Bitboard> {
-    let mut t = vec![0u64; 64 * 64];
-    for a in 0..64u8 {
-        for &dir in ROOK_DIRS.iter().chain(BISHOP_DIRS.iter()) {
+const fn build_between() -> [Bitboard; 64 * 64] {
+    let mut t = [0u64; 64 * 64];
+    let mut a = 0u8;
+    while a < 64 {
+        let mut d = 0usize;
+        while d < 8 {
+            let dir = TODAS_LAS_DIRS[d];
             let mut acc = 0u64;
             let (mut cf, mut cr) = (file_of(a) as i32, rank_of(a) as i32);
             while let Some((nf, nr)) = step(cf, cr, dir) {
@@ -407,13 +456,16 @@ fn build_between() -> Vec<Bitboard> {
                 cf = nf;
                 cr = nr;
             }
+            d += 1;
         }
+        a += 1;
     }
     t
 }
 
+#[inline(always)]
 pub fn between(a: Square, b: Square) -> Bitboard {
-    BETWEEN.get_or_init(build_between)[a as usize * 64 + b as usize]
+    BETWEEN[a as usize * 64 + b as usize]
 }
 
 /// Piezas propias clavadas contra su rey por una torre/dama/alfil enemiga en
@@ -460,6 +512,110 @@ pub fn pinned_pieces(
         }
     }
     pinned
+}
+
+#[cfg(test)]
+mod tablas_const_tests {
+    use super::*;
+
+    /// Reconstruye las tablas EN TIEMPO DE EJECUCION con el codigo original
+    /// (bucles con iteradores) y compara entrada por entrada con las tablas
+    /// que ahora produce el evaluador de constantes.
+    #[test]
+    fn tablas_const_coinciden_con_construccion() {
+        for sq in 0..64u8 {
+            let f = file_of(sq) as i32;
+            let r = rank_of(sq) as i32;
+
+            let mut knight = 0u64;
+            for (df, dr) in [
+                (1, 2),
+                (2, 1),
+                (2, -1),
+                (1, -2),
+                (-1, -2),
+                (-2, -1),
+                (-2, 1),
+                (-1, 2),
+            ] {
+                let (nf, nr) = (f + df, r + dr);
+                if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                    knight |= bit(make_square(nf as u8, nr as u8));
+                }
+            }
+            assert_eq!(knight_attacks(sq), knight, "caballo en {}", sq);
+
+            let mut king = 0u64;
+            for df in -1..=1i32 {
+                for dr in -1..=1i32 {
+                    if df == 0 && dr == 0 {
+                        continue;
+                    }
+                    let (nf, nr) = (f + df, r + dr);
+                    if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                        king |= bit(make_square(nf as u8, nr as u8));
+                    }
+                }
+            }
+            assert_eq!(king_attacks(sq), king, "rey en {}", sq);
+
+            for (color_idx, dr) in [(0usize, 1i32), (1usize, -1i32)] {
+                let mut pa = 0u64;
+                for df in [-1i32, 1i32] {
+                    let (nf, nr) = (f + df, r + dr);
+                    if (0..8).contains(&nf) && (0..8).contains(&nr) {
+                        pa |= bit(make_square(nf as u8, nr as u8));
+                    }
+                }
+                let color = if color_idx == 0 {
+                    crate::types::Color::White
+                } else {
+                    crate::types::Color::Black
+                };
+                assert_eq!(pawn_attacks(color, sq), pa, "peon {:?} en {}", color, sq);
+            }
+
+            for &dir in ROOK_DIRS.iter().chain(BISHOP_DIRS.iter()) {
+                let mut ray = 0u64;
+                let (mut cf, mut cr) = (f, r);
+                while let Some((nf, nr)) = step(cf, cr, dir) {
+                    ray |= bit(make_square(nf as u8, nr as u8));
+                    cf = nf;
+                    cr = nr;
+                }
+                assert_eq!(
+                    tables().rays[dir_index(dir)][sq as usize],
+                    ray,
+                    "rayo dir={} sq={}",
+                    dir_index(dir),
+                    sq
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn between_const_coincide_con_construccion() {
+        let mut t = vec![0u64; 64 * 64];
+        for a in 0..64u8 {
+            for &dir in ROOK_DIRS.iter().chain(BISHOP_DIRS.iter()) {
+                let mut acc = 0u64;
+                let (mut cf, mut cr) = (file_of(a) as i32, rank_of(a) as i32);
+                while let Some((nf, nr)) = step(cf, cr, dir) {
+                    let b = make_square(nf as u8, nr as u8);
+                    t[a as usize * 64 + b as usize] = acc;
+                    acc |= bit(b);
+                    cf = nf;
+                    cr = nr;
+                }
+            }
+        }
+        for a in 0..64u8 {
+            for b in 0..64u8 {
+                assert_eq!(between(a, b), t[a as usize * 64 + b as usize], "{a}-{b}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

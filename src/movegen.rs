@@ -21,35 +21,37 @@ const PROMO_PIECES: [PieceType; 4] = [
 ];
 
 /// Genera todas las jugadas pseudo-legales (no filtra jaques propios).
+///
+/// Devolver la lista POR VALOR cuesta caro: `MoveList` son 1028 bytes en la
+/// pila y cada retorno se materializaba como un `memmove` (visible en el
+/// perfil: ~2% del tiempo total repartido entre las cuatro funciones de
+/// generacion). La version `_into` escribe directamente en la lista del
+/// llamante y elimina esa copia; esta se mantiene como envoltura para el
+/// codigo que prefiere el estilo por valor (tests, herramientas, UCI).
 pub fn generate_pseudo_legal(b: &Board) -> MoveList {
     let mut moves = MoveList::new();
+    generate_pseudo_legal_into(b, &mut moves);
+    moves
+}
+
+pub fn generate_pseudo_legal_into(b: &Board, moves: &mut MoveList) {
     let us = b.turn;
     let them = us.opposite();
     let own = b.occupied_co[us as usize];
     let enemy = b.occupied_co[them as usize];
     let occ = b.occupied;
 
-    gen_pawn_moves(b, us, enemy, occ, &mut moves);
-    gen_piece_moves(b, us, PieceType::Knight, own, occ, &mut moves, |sq, _| {
+    gen_pawn_moves(b, us, enemy, occ, moves);
+    gen_piece_moves(b, us, PieceType::Knight, own, occ, moves, |sq, _| {
         knight_attacks(sq)
     });
-    gen_piece_moves(
-        b,
-        us,
-        PieceType::Bishop,
-        own,
-        occ,
-        &mut moves,
-        bishop_attacks,
-    );
-    gen_piece_moves(b, us, PieceType::Rook, own, occ, &mut moves, rook_attacks);
-    gen_piece_moves(b, us, PieceType::Queen, own, occ, &mut moves, queen_attacks);
-    gen_piece_moves(b, us, PieceType::King, own, occ, &mut moves, |sq, _| {
+    gen_piece_moves(b, us, PieceType::Bishop, own, occ, moves, bishop_attacks);
+    gen_piece_moves(b, us, PieceType::Rook, own, occ, moves, rook_attacks);
+    gen_piece_moves(b, us, PieceType::Queen, own, occ, moves, queen_attacks);
+    gen_piece_moves(b, us, PieceType::King, own, occ, moves, |sq, _| {
         king_attacks(sq)
     });
-    gen_castling(b, us, &mut moves);
-
-    moves
+    gen_castling(b, us, moves);
 }
 
 fn gen_piece_moves<F>(
@@ -216,22 +218,26 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
 /// casillas vacias, y ninguna cuesta legalizar solo para descartarla despues.
 pub fn generate_pseudo_legal_captures(b: &Board) -> MoveList {
     let mut moves = MoveList::new();
+    generate_pseudo_legal_captures_into(b, &mut moves);
+    moves
+}
+
+pub fn generate_pseudo_legal_captures_into(b: &Board, moves: &mut MoveList) {
     let us = b.turn;
     let them = us.opposite();
     let enemy = b.occupied_co[them as usize];
     let occ = b.occupied;
 
-    gen_pawn_captures(b, us, enemy, occ, &mut moves);
-    gen_piece_captures(b, us, PieceType::Knight, enemy, occ, &mut moves, |sq, _| {
+    gen_pawn_captures(b, us, enemy, occ, moves);
+    gen_piece_captures(b, us, PieceType::Knight, enemy, occ, moves, |sq, _| {
         knight_attacks(sq)
     });
-    gen_piece_captures(b, us, PieceType::Bishop, enemy, occ, &mut moves, bishop_attacks);
-    gen_piece_captures(b, us, PieceType::Rook, enemy, occ, &mut moves, rook_attacks);
-    gen_piece_captures(b, us, PieceType::Queen, enemy, occ, &mut moves, queen_attacks);
-    gen_piece_captures(b, us, PieceType::King, enemy, occ, &mut moves, |sq, _| {
+    gen_piece_captures(b, us, PieceType::Bishop, enemy, occ, moves, bishop_attacks);
+    gen_piece_captures(b, us, PieceType::Rook, enemy, occ, moves, rook_attacks);
+    gen_piece_captures(b, us, PieceType::Queen, enemy, occ, moves, queen_attacks);
+    gen_piece_captures(b, us, PieceType::King, enemy, occ, moves, |sq, _| {
         king_attacks(sq)
     });
-    moves
 }
 
 fn gen_piece_captures<F>(
@@ -297,6 +303,12 @@ fn gen_pawn_captures(b: &Board, us: Color, enemy: Bitboard, occ: Bitboard, moves
 /// generar ni legalizar las jugadas silenciosas que se descartarian despues.
 /// Usa el mismo atajo de clavadas que generate_legal para el camino comun.
 pub fn generate_captures_legal(b: &Board) -> MoveList {
+    let mut moves = MoveList::new();
+    generate_captures_legal_into(b, &mut moves);
+    moves
+}
+
+pub fn generate_captures_legal_into(b: &Board, moves: &mut MoveList) {
     use crate::bitboard::pinned_pieces;
 
     let us = b.turn;
@@ -312,7 +324,7 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
         // No deberia llamarse en jaque (quiescence usa generate_legal para
         // evasiones, que incluyen bloqueos silenciosos), pero se deja
         // correcto por si se reutiliza en otro contexto.
-        let mut moves = generate_pseudo_legal_captures(b);
+        generate_pseudo_legal_captures_into(b, moves);
         moves.retain(|mv| {
             if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
                 casilla_segura_para_rey(b, king_sq, mv.to, us)
@@ -320,7 +332,7 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
                 camino_lento(mv)
             }
         });
-        return moves;
+        return;
     }
 
     let own = b.occupied_co[us as usize];
@@ -330,7 +342,7 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
         | b.pieces[them as usize][PieceType::Queen as usize];
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
 
-    let mut moves = generate_pseudo_legal_captures(b);
+    generate_pseudo_legal_captures_into(b, moves);
     moves.retain(|mv| {
         if bit(mv.from) & pinned == 0 && mv.from != king_sq && mv.flag != MoveFlag::EnPassant {
             return true;
@@ -341,7 +353,6 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
             camino_lento(mv)
         }
     });
-    moves
 }
 
 /// ¿La casilla `to` es segura para el rey de `us` que actualmente está en
@@ -401,6 +412,12 @@ fn casilla_segura_para_rey(b: &Board, king_sq: Square, to: Square, us: Color) ->
 /// Equivalencia verificada exhaustivamente en tests (bitboard::pin_tests /
 /// movegen fuzz) y con la suite de perft completa sin cambios de resultado.
 pub fn generate_legal(b: &Board) -> MoveList {
+    let mut moves = MoveList::new();
+    generate_legal_into(b, &mut moves);
+    moves
+}
+
+pub fn generate_legal_into(b: &Board, moves: &mut MoveList) {
     use crate::bitboard::pinned_pieces;
 
     let us = b.turn;
@@ -420,7 +437,7 @@ pub fn generate_legal(b: &Board) -> MoveList {
         // atacante) sigue por el camino lento, siempre correcto.
         // gen_castling no produce nada estando en jaque, asi que aqui no hay
         // enroques que considerar.
-        let mut moves = generate_pseudo_legal(b);
+        generate_pseudo_legal_into(b, moves);
         moves.retain(|mv| {
             if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
                 casilla_segura_para_rey(b, king_sq, mv.to, us)
@@ -428,7 +445,7 @@ pub fn generate_legal(b: &Board) -> MoveList {
                 camino_lento(mv)
             }
         });
-        return moves;
+        return;
     }
 
     let own = b.occupied_co[us as usize];
@@ -438,7 +455,7 @@ pub fn generate_legal(b: &Board) -> MoveList {
         | b.pieces[them as usize][PieceType::Queen as usize];
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
 
-    let mut moves = generate_pseudo_legal(b);
+    generate_pseudo_legal_into(b, moves);
     moves.retain(|mv| {
         if bit(mv.from) & pinned == 0
             && mv.from != king_sq
@@ -467,7 +484,6 @@ pub fn generate_legal(b: &Board) -> MoveList {
             _ => camino_lento(mv),
         }
     });
-    moves
 }
 
 /// ¿Existe al menos UNA jugada legal? Equivalente a
@@ -510,7 +526,10 @@ pub fn existe_jugada_legal(b: &Board) -> bool {
         )
     };
 
-    for mv in generate_pseudo_legal(b) {
+    let mut pseudo = MoveList::new();
+    generate_pseudo_legal_into(b, &mut pseudo);
+    for mv in &pseudo {
+        let mv = *mv;
         if mv.from == king_sq {
             // El enroque sale ya legalizado de gen_castling. (De hecho nunca
             // puede ser la ÚNICA jugada legal: enrocar exige que la casilla
