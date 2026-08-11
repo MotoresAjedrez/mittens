@@ -185,6 +185,90 @@ impl RedBullet {
             *a = a.wrapping_sub(w);
         }
     }
+
+    /// Aplica de UNA SOLA PASADA todas las features que cambian en una
+    /// jugada: las de `add` se suman y las de `sub` se restan.
+    ///
+    /// Antes cada feature hacia su propio recorrido del acumulador: 512
+    /// lecturas + 512 escrituras POR FEATURE. Una jugada normal cambia 2
+    /// features y una captura 3, por cada una de las DOS perspectivas, o sea
+    /// entre 4 y 6 pasadas completas de 1 KB cada una por nodo de busqueda.
+    /// Aqui el acumulador se lee y escribe UNA vez (en registros NEON, por
+    /// bloques de 32 valores) y de cada feature solo se leen sus pesos.
+    ///
+    /// El resultado es BIT A BIT IDENTICO al de antes: la suma envolvente de
+    /// i16 es asociativa y conmutativa, asi que ni el orden ni el
+    /// agrupamiento cambian nada, ni siquiera si hubiera desbordamiento.
+    fn aplicar_features(&self, acc: &mut [i16; H_MAX], add: &[u16], sub: &[u16]) {
+        // El camino escalar indexa por `columna()`, que hace slicing y
+        // PANICA si la feature se sale de rango. El camino NEON usa punteros
+        // crudos, asi que una feature fuera de rango leeria memoria ajena en
+        // silencio. Por construccion `feature()` devuelve 0..768 siempre, y
+        // este assert deja constancia de esa precondicion para que un cambio
+        // futuro en el esquema de features falle en los tests en vez de
+        // corromper la evaluacion.
+        debug_assert!(
+            add.iter().chain(sub).all(|&f| (f as usize) < N_ENTRADA),
+            "feature fuera de rango en aplicar_features"
+        );
+        // Bloques de 32 i16 = 4 registros NEON. Las redes reales tienen
+        // h = 256 o 512 (ambas multiplos de 32); si algun dia hubiera otra,
+        // se cae al camino escalar, que da exactamente lo mismo.
+        #[cfg(target_arch = "aarch64")]
+        if self.h % 32 == 0 {
+            unsafe {
+                use std::arch::aarch64::*;
+                let w0 = self.l0w.as_ptr();
+                let h = self.h;
+                let mut t = 0;
+                while t < h {
+                    let p = acc.as_mut_ptr().add(t);
+                    let mut r0 = vld1q_s16(p);
+                    let mut r1 = vld1q_s16(p.add(8));
+                    let mut r2 = vld1q_s16(p.add(16));
+                    let mut r3 = vld1q_s16(p.add(24));
+                    for &f in add {
+                        let w = w0.add(f as usize * h + t);
+                        r0 = vaddq_s16(r0, vld1q_s16(w));
+                        r1 = vaddq_s16(r1, vld1q_s16(w.add(8)));
+                        r2 = vaddq_s16(r2, vld1q_s16(w.add(16)));
+                        r3 = vaddq_s16(r3, vld1q_s16(w.add(24)));
+                    }
+                    for &f in sub {
+                        let w = w0.add(f as usize * h + t);
+                        r0 = vsubq_s16(r0, vld1q_s16(w));
+                        r1 = vsubq_s16(r1, vld1q_s16(w.add(8)));
+                        r2 = vsubq_s16(r2, vld1q_s16(w.add(16)));
+                        r3 = vsubq_s16(r3, vld1q_s16(w.add(24)));
+                    }
+                    vst1q_s16(p, r0);
+                    vst1q_s16(p.add(8), r1);
+                    vst1q_s16(p.add(16), r2);
+                    vst1q_s16(p.add(24), r3);
+                    t += 32;
+                }
+            }
+            return;
+        }
+        for &f in add {
+            self.sumar(acc, f as usize);
+        }
+        for &f in sub {
+            self.restar(acc, f as usize);
+        }
+    }
+}
+
+/// Buffer de features que cambian en una jugada. Cota holgada: el maximo
+/// real es 4 casillas (enroque: rey y torre, origen y destino), y con las
+/// dos perspectivas separadas cada lista no pasa de 4 entradas. 8 deja
+/// margen y sigue cabiendo en registros/pila sin coste.
+const MAX_CAMBIOS: usize = 8;
+
+#[derive(Default)]
+struct Cambios {
+    add: arrayvec::ArrayVec<u16, MAX_CAMBIOS>,
+    sub: arrayvec::ArrayVec<u16, MAX_CAMBIOS>,
 }
 
 /// Indice de feature en Chess768 visto desde `persp` (0=blancas, 1=negras).
@@ -267,7 +351,20 @@ impl AcumBullet {
         let red = self.red;
         let nuevo = self;
         nuevo.negras_mueven = despues.turn == Color::Black;
-        nuevo.piezas = contar_piezas(despues);
+        // Antes se recontaban las 12 bitboards enteras en cada jugada solo
+        // para elegir el output bucket. El conteo cambia EXACTAMENTE en las
+        // piezas que aparecen menos las que desaparecen, que es justo lo que
+        // ya se esta recorriendo aqui abajo.
+        let mut delta_piezas: i32 = 0;
+
+        // Se recolectan primero TODAS las features que cambian (a lo sumo 4:
+        // enroque) y se aplican de una sola pasada por perspectiva, en vez de
+        // una pasada completa del acumulador por feature. Resultado
+        // bit-identico (ver `aplicar_features`).
+        let mut c0 = Cambios::default();
+        let mut c1 = Cambios::default();
+        let mut desbordado = false;
+
         for color in 0..2usize {
             for (pt_idx, &pt) in ALL_PIECE_TYPES.iter().enumerate() {
                 let a = antes.pieces[color][pt as usize];
@@ -276,19 +373,40 @@ impl AcumBullet {
                     continue;
                 }
                 let mut anadidas = d & !a;
+                delta_piezas += anadidas.count_ones() as i32;
                 while anadidas != 0 {
                     let sq = crate::bitboard::pop_lsb(&mut anadidas) as usize;
-                    red.sumar(&mut nuevo.persp[0], feature(0, color, pt_idx, sq));
-                    red.sumar(&mut nuevo.persp[1], feature(1, color, pt_idx, sq));
+                    let f0 = feature(0, color, pt_idx, sq) as u16;
+                    let f1 = feature(1, color, pt_idx, sq) as u16;
+                    if c0.add.try_push(f0).is_err() || c1.add.try_push(f1).is_err() {
+                        desbordado = true;
+                    }
                 }
                 let mut quitadas = a & !d;
+                delta_piezas -= quitadas.count_ones() as i32;
                 while quitadas != 0 {
                     let sq = crate::bitboard::pop_lsb(&mut quitadas) as usize;
-                    red.restar(&mut nuevo.persp[0], feature(0, color, pt_idx, sq));
-                    red.restar(&mut nuevo.persp[1], feature(1, color, pt_idx, sq));
+                    let f0 = feature(0, color, pt_idx, sq) as u16;
+                    let f1 = feature(1, color, pt_idx, sq) as u16;
+                    if c0.sub.try_push(f0).is_err() || c1.sub.try_push(f1).is_err() {
+                        desbordado = true;
+                    }
                 }
             }
         }
+
+        if desbordado {
+            // Imposible con jugadas legales (maximo 4 casillas cambian), pero
+            // si un llamador pasara dos tableros arbitrarios se recalcula
+            // entero en vez de aplicar un delta incompleto.
+            *nuevo = AcumBullet::desde_tablero(red, despues);
+            return;
+        }
+
+        nuevo.piezas = (nuevo.piezas as i32 + delta_piezas) as u8;
+        debug_assert_eq!(nuevo.piezas, contar_piezas(despues));
+        red.aplicar_features(&mut nuevo.persp[0], &c0.add, &c0.sub);
+        red.aplicar_features(&mut nuevo.persp[1], &c1.add, &c1.sub);
     }
 
     /// Salida en centipeones desde la perspectiva del lado que mueve
@@ -435,13 +553,20 @@ mod tests {
     use crate::movegen::generate_legal;
 
     fn red() -> Option<&'static RedBullet> {
-        // Por defecto, la red que ESTA DESPLEGADA en produccion (512
-        // neuronas); MIMOTOR_RED_BULLET permite apuntar a otra.
-        let ruta = std::env::var("MIMOTOR_RED_BULLET").unwrap_or_else(|_| {
-            "/Users/Tavito/mi-motor-rust-produccion/pesos_amenazas_prueba.bin".to_string()
-        });
-        let datos = std::fs::read(ruta).ok()?;
-        Some(Box::leak(Box::new(RedBullet::cargar_de_bytes(&datos)?)))
+        // Por defecto, la red que ESTA DESPLEGADA en produccion: los MISMOS
+        // bytes que `include_bytes!` embebe en el binario (ver neural.rs,
+        // PESOS_EMBEBIDOS), no una copia suelta en una ruta absoluta de una
+        // maquina concreta -- si esa ruta no existia, todos estos tests se
+        // "omitian" en silencio y no verificaban nada.
+        // MIMOTOR_RED_BULLET permite apuntar a otra red.
+        static RED: std::sync::OnceLock<Option<&'static RedBullet>> = std::sync::OnceLock::new();
+        *RED.get_or_init(|| {
+            let datos = match std::env::var("MIMOTOR_RED_BULLET") {
+                Ok(ruta) => std::fs::read(ruta).ok()?,
+                Err(_) => include_bytes!("../pesos_bullet_512_buckets8.bin").to_vec(),
+            };
+            Some(Box::leak(Box::new(RedBullet::cargar_de_bytes(&datos)?)))
+        })
     }
 
     #[test]
@@ -567,6 +692,287 @@ mod tests {
             }
         }
         assert!(comprobadas >= 60, "solo se comprobaron {comprobadas} posiciones");
+    }
+
+    /// CONSISTENCIA MASIVA del acumulador incremental (ronda2).
+    ///
+    /// Los tests anteriores cubrian unas pocas posiciones y una linea
+    /// aleatoria corta. Este recorre ~20 mil posiciones distintas, con
+    /// mutacion in-place + undo (exactamente el patron que usa la busqueda:
+    /// `entrar_hijo` / `salir_hijo` en search.rs) y, EN CADA UNA, compara:
+    ///   * las dos perspectivas del acumulador, bit a bit, contra el
+    ///     recalculo completo desde el tablero,
+    ///   * `negras_mueven` y `piezas` (este ultimo elige el output bucket:
+    ///     si se desincroniza, la evaluacion usa la capa de salida
+    ///     equivocada sin que nada mas se note),
+    ///   * la evaluacion en centipeones, con igualdad EXACTA.
+    /// Al desandar cada linea se vuelve a comprobar todo, y al final se exige
+    /// que el acumulador haya vuelto bit a bit al de la raiz.
+    ///
+    /// Las posiciones semilla estan elegidas para que la caminata aleatoria
+    /// tenga que pasar por enroques, capturas al paso, promociones (a las
+    /// cuatro piezas) y capturas; el test lo VERIFICA al final en vez de
+    /// confiar en que salieron.
+    #[test]
+    fn consistencia_masiva_incremental_vs_recalculo() {
+        let Some(red) = red() else {
+            panic!("la red embebida deberia cargar siempre");
+        };
+        let semillas_fen = [
+            // Apertura estandar: enroques por ambos lados, capturas al paso.
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            // "Kiwipete": enroques disponibles, mucha captura y deslizantes.
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            // Final de peones: promociones garantizadas en pocas jugadas.
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            // Peones a un paso de coronar, para ambos bandos.
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            // Con casilla al paso ya disponible en la raiz.
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            // Muchos peones a punto de promocionar en las dos alas.
+            "8/PPPk4/8/8/8/8/4Kppp/8 w - - 0 1",
+            // Final escaso: fuerza buckets de material bajos.
+            "8/8/4k3/8/8/3K4/8/7R w - - 0 1",
+        ];
+
+        let mut semilla = 0x0BAD_C0DE_5EED_1234u64;
+        let mut rand = move || {
+            semilla ^= semilla << 13;
+            semilla ^= semilla >> 7;
+            semilla ^= semilla << 17;
+            semilla
+        };
+
+        let mut posiciones = 0usize;
+        let mut vistos_enroque = 0usize;
+        let mut vistos_al_paso = 0usize;
+        let mut vistas_promociones = [0usize; 4];
+        let mut vistas_capturas = 0usize;
+
+        for fen in semillas_fen {
+            let raiz = crate::board::Board::from_fen(fen).unwrap();
+            let mut acumulador = AcumBullet::desde_tablero(red, &raiz);
+            let raiz_persp = acumulador.persp;
+            let raiz_piezas = acumulador.piezas;
+            let raiz_turno = acumulador.negras_mueven;
+
+            for _linea in 0..60 {
+                let mut pila: Vec<(crate::board::Board, crate::board::Board)> = Vec::new();
+                let mut tablero = raiz;
+                for _ply in 0..50 {
+                    let legales = generate_legal(&tablero);
+                    if legales.is_empty() {
+                        break;
+                    }
+                    let mv = legales[(rand() >> 1) as usize % legales.len()];
+                    match mv.flag {
+                        crate::types::MoveFlag::CastleKing
+                        | crate::types::MoveFlag::CastleQueen => vistos_enroque += 1,
+                        crate::types::MoveFlag::EnPassant => {
+                            vistos_al_paso += 1;
+                            vistas_capturas += 1;
+                        }
+                        crate::types::MoveFlag::Capture => vistas_capturas += 1,
+                        _ => {}
+                    }
+                    if let Some(p) = mv.promotion {
+                        // Knight..Queen -> 0..3 (el rey y el peon no promocionan).
+                        let idx = match p {
+                            crate::types::PieceType::Knight => 0,
+                            crate::types::PieceType::Bishop => 1,
+                            crate::types::PieceType::Rook => 2,
+                            _ => 3,
+                        };
+                        vistas_promociones[idx] += 1;
+                    }
+
+                    let siguiente = tablero.make_move(&mv);
+                    acumulador.aplicar_jugada(&tablero, &siguiente);
+                    comparar(&acumulador, red, &siguiente, "bajada", &mv);
+                    posiciones += 1;
+
+                    pila.push((tablero, siguiente));
+                    tablero = siguiente;
+                }
+                // Desandar la linea completa, igual que `salir_hijo`.
+                while let Some((antes, despues)) = pila.pop() {
+                    acumulador.aplicar_jugada(&despues, &antes);
+                    comparar(
+                        &acumulador,
+                        red,
+                        &antes,
+                        "undo",
+                        &crate::types::Move::new(0, 0, None, crate::types::MoveFlag::Quiet),
+                    );
+                    posiciones += 1;
+                }
+                assert_eq!(acumulador.persp, raiz_persp, "la raiz no se restauro: {fen}");
+                assert_eq!(acumulador.piezas, raiz_piezas);
+                assert_eq!(acumulador.negras_mueven, raiz_turno);
+            }
+        }
+
+        assert!(
+            posiciones >= 20_000,
+            "cobertura insuficiente: solo {posiciones} posiciones"
+        );
+        assert!(vistos_enroque > 0, "ningun enroque en la muestra");
+        assert!(vistos_al_paso > 0, "ninguna captura al paso en la muestra");
+        assert!(vistas_capturas > 100, "pocas capturas: {vistas_capturas}");
+        for (i, n) in vistas_promociones.iter().enumerate() {
+            assert!(*n > 0, "ninguna promocion del tipo {i} en la muestra");
+        }
+    }
+
+    /// Compara el acumulador incremental con el recalculo completo desde
+    /// `tablero`, en todos sus campos observables.
+    fn comparar(
+        acumulador: &AcumBullet,
+        red: &'static RedBullet,
+        tablero: &crate::board::Board,
+        fase: &str,
+        mv: &crate::types::Move,
+    ) {
+        let re = AcumBullet::desde_tablero(red, tablero);
+        assert_eq!(
+            acumulador.persp[0], re.persp[0],
+            "[{fase}] perspectiva blanca difiere tras {} en {}",
+            mv.to_uci(),
+            tablero.to_fen()
+        );
+        assert_eq!(
+            acumulador.persp[1], re.persp[1],
+            "[{fase}] perspectiva negra difiere tras {} en {}",
+            mv.to_uci(),
+            tablero.to_fen()
+        );
+        assert_eq!(
+            acumulador.negras_mueven, re.negras_mueven,
+            "[{fase}] turno desincronizado en {}",
+            tablero.to_fen()
+        );
+        assert_eq!(
+            acumulador.piezas, re.piezas,
+            "[{fase}] conteo de piezas (output bucket) desincronizado en {}",
+            tablero.to_fen()
+        );
+        assert_eq!(
+            acumulador.bucket(),
+            re.bucket(),
+            "[{fase}] output bucket distinto en {}",
+            tablero.to_fen()
+        );
+        assert_eq!(
+            acumulador.evaluar(),
+            re.evaluar(),
+            "[{fase}] evaluacion distinta en {}",
+            tablero.to_fen()
+        );
+        assert_eq!(
+            acumulador.evaluar(),
+            acumulador.evaluar_escalar(),
+            "[{fase}] NEON != escalar en {}",
+            tablero.to_fen()
+        );
+    }
+
+    /// El acumulador tambien tiene que sobrevivir a la jugada NULA (pasar
+    /// turno), que la busqueda aplica por la misma via `aplicar_jugada`: las
+    /// piezas no cambian pero SI el lado que mueve, y con el la mitad del
+    /// acumulador que va a "yo" y la que va al "rival" en la capa de salida.
+    #[test]
+    fn jugada_nula_consistente_y_reversible() {
+        let Some(red) = red() else {
+            panic!("la red embebida deberia cargar siempre");
+        };
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ];
+        for fen in fens {
+            let b = crate::board::Board::from_fen(fen).unwrap();
+            let mut acumulador = AcumBullet::desde_tablero(red, &b);
+            let original = acumulador.persp;
+            let nulo = b.make_null_move();
+            acumulador.aplicar_jugada(&b, &nulo);
+            let re = AcumBullet::desde_tablero(red, &nulo);
+            assert_eq!(acumulador.persp, re.persp, "nula: acumulador difiere en {fen}");
+            assert_eq!(acumulador.negras_mueven, re.negras_mueven);
+            assert_eq!(acumulador.piezas, re.piezas);
+            assert_eq!(acumulador.evaluar(), re.evaluar(), "nula: eval difiere en {fen}");
+            acumulador.aplicar_jugada(&nulo, &b);
+            assert_eq!(acumulador.persp, original, "nula: undo no restauro {fen}");
+            assert_eq!(acumulador.negras_mueven, b.turn == Color::Black);
+        }
+    }
+
+    /// Microbench AISLADO de la actualizacion del acumulador: la version de
+    /// una sola pasada (`aplicar_features`) contra la de una pasada completa
+    /// del acumulador POR FEATURE (`sumar`/`restar`, como estaba antes).
+    /// Se mide aqui y no con el bench de la busqueda porque en la busqueda
+    /// esta funcion es ~6% del tiempo total y el ruido de la maquina se lo
+    /// come. Ademas se exige que ambos caminos den el MISMO acumulador.
+    #[test]
+    fn microbench_actualizacion_una_pasada_vs_por_feature() {
+        let Some(red) = red() else { return };
+        let b = crate::board::Board::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let base = AcumBullet::desde_tablero(red, &b);
+        // Caso tipico de captura: 3 features cambian (origen, destino, pieza
+        // capturada).
+        let add: [u16; 1] = [feature(0, 0, 4, 27) as u16];
+        let sub: [u16; 2] = [feature(0, 0, 4, 21) as u16, feature(0, 1, 3, 27) as u16];
+
+        let repeticiones = 200_000;
+        let mut a = base.persp[0];
+        let t0 = std::time::Instant::now();
+        for _ in 0..repeticiones {
+            red.aplicar_features(&mut a, &add, &sub);
+            red.aplicar_features(&mut a, &sub, &add); // deshacer
+            std::hint::black_box(&a);
+        }
+        let t_lote = t0.elapsed();
+
+        let mut c = base.persp[0];
+        let t0 = std::time::Instant::now();
+        for _ in 0..repeticiones {
+            for &f in &add {
+                red.sumar(&mut c, f as usize);
+            }
+            for &f in &sub {
+                red.restar(&mut c, f as usize);
+            }
+            for &f in &add {
+                red.restar(&mut c, f as usize);
+            }
+            for &f in &sub {
+                red.sumar(&mut c, f as usize);
+            }
+            std::hint::black_box(&c);
+        }
+        let t_feature = t0.elapsed();
+
+        // Igualdad exacta: el agrupamiento no cambia el resultado.
+        let mut x = base.persp[0];
+        let mut y = base.persp[0];
+        red.aplicar_features(&mut x, &add, &sub);
+        for &f in &add {
+            red.sumar(&mut y, f as usize);
+        }
+        for &f in &sub {
+            red.restar(&mut y, f as usize);
+        }
+        assert_eq!(x, y, "una pasada != por feature");
+
+        eprintln!(
+            "acumulador: una pasada {:?} vs por feature {:?} ({:.2}x)",
+            t_lote,
+            t_feature,
+            t_feature.as_secs_f64() / t_lote.as_secs_f64().max(1e-9)
+        );
     }
 
     #[test]
