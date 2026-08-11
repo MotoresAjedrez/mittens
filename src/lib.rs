@@ -986,7 +986,18 @@ fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead
     } else {
         20_000
     };
-    let base = disponible / movestogo.max(1) as u64;
+    // Reparto base. `movestogo <= 0` = muerte subita (el GUI no manda
+    // movestogo): antes se asumia 30 jugadas por delante, lo que en un
+    // 10s+0.1s deja ~330ms por jugada y termina regalando reloj sin usar.
+    // Con incremento la partida se auto-sostiene, asi que se reparte mas
+    // agresivo (1/22) y ademas se suma el incremento completo menos un
+    // pelin; sin incremento se mantiene un reparto conservador.
+    let divisor = if movestogo <= 0 {
+        if inc > 0 { 22 } else { 28 }
+    } else {
+        movestogo as u64
+    };
+    let base = disponible / divisor.max(1);
     let objetivo = base.saturating_add(inc.saturating_mul(8) / 10);
     objetivo.max(1).min(techo).min(disponible.max(1))
 }
@@ -1451,7 +1462,7 @@ pub fn uci_loop() {
                             .position(|&p| p == "movestogo")
                             .and_then(|j| partes.get(j + 1))
                             .and_then(|s| s.parse().ok())
-                            .unwrap_or(30);
+                            .unwrap_or(0); // 0 = muerte subita (sin movestogo)
                         let (mio_i, inc_i) = if board.turn == types::Color::White {
                             (wtime, winc)
                         } else {
@@ -1494,6 +1505,26 @@ pub fn uci_loop() {
                             .filter_map(|s| parse_uci_move(&board, s))
                             .collect()
                     });
+
+                // JUGADA FORZADA (single reply): si en la raiz hay una sola
+                // jugada legal, no hay nada que decidir -- pensar aunque sea
+                // un milisegundo es tiempo tirado. Se responde de inmediato y
+                // el reloj queda entero para las jugadas que si importan. En
+                // partidas rapidas con jaques forzados esto ahorra segundos.
+                // Solo aplica a busquedas con reloj (no "infinite", no
+                // "searchmoves", no MultiPV: ahi el usuario quiere analisis).
+                if !infinito
+                    && movetime.is_some()
+                    && searchmoves_filtro.is_none()
+                {
+                    let legales = movegen::generate_legal(&board);
+                    if legales.len() == 1 {
+                        println!("info depth 1 score cp 0 nodes 1 time 0 pv {}", legales[0].to_uci());
+                        println!("bestmove {}", legales[0].to_uci());
+                        io::stdout().flush().ok();
+                        continue;
+                    }
+                }
 
                 let stop_flag = Arc::new(AtomicBool::new(false));
                 let board_copy = board;
