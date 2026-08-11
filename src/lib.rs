@@ -1495,6 +1495,26 @@ pub fn uci_loop() {
                             .collect()
                     });
 
+                // JUGADA FORZADA (single reply): si en la raiz hay una sola
+                // jugada legal, no hay nada que decidir -- pensar aunque sea
+                // un milisegundo es tiempo tirado. Se responde de inmediato y
+                // el reloj queda entero para las jugadas que si importan. En
+                // partidas rapidas con jaques forzados esto ahorra segundos.
+                // Solo aplica a busquedas con reloj (no "infinite", no
+                // "searchmoves", no MultiPV: ahi el usuario quiere analisis).
+                if !infinito
+                    && movetime.is_some()
+                    && searchmoves_filtro.is_none()
+                {
+                    let legales = movegen::generate_legal(&board);
+                    if legales.len() == 1 {
+                        println!("info depth 1 score cp 0 nodes 1 time 0 pv {}", legales[0].to_uci());
+                        println!("bestmove {}", legales[0].to_uci());
+                        io::stdout().flush().ok();
+                        continue;
+                    }
+                }
+
                 let stop_flag = Arc::new(AtomicBool::new(false));
                 let board_copy = board;
                 let hist_copy = game_history.clone();
