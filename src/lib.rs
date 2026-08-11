@@ -1033,6 +1033,16 @@ pub fn uci_loop() {
     // Por defecto la quiescence conserva NNUE. Esta opción permite medir la
     // variante ultrabullet sin depender de variables de entorno ocultas.
     let mut qsearch_nnue = true;
+    // La NNUE viene embebida en el binario y se activa por defecto: sin esto
+    // un tester UCI que no configure NNUEPath jugaria con evaluacion clasica
+    // pura, que es mucho mas debil.
+    match neural::cargar_embebida() {
+        Ok(checksum) => {
+            neural::set_activa(true);
+            eprintln!("info string NNUE embebida activa checksum {:016x}", checksum);
+        }
+        Err(e) => eprintln!("info string no se pudo cargar la NNUE embebida: {}", e),
+    }
     let mut nnue_classical_depth = 0i32;
     // Para `go movetime <=25` con un único hilo, evita crear un hilo nativo
     // que solo vive unos milisegundos. Es experimental y apagado por defecto;
@@ -1129,7 +1139,7 @@ pub fn uci_loop() {
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name BookPath type string default <empty>");
                 println!("option name OwnBook type check default true");
-                println!("option name UseNNUE type check default false");
+                println!("option name UseNNUE type check default true");
                 println!("option name NNUEPath type string default <empty>");
                 println!("option name UseNN type check default false");
                 println!("option name NNPath type string default <empty>");

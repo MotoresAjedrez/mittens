@@ -96,13 +96,19 @@ Opciones principales:
 - `Personalidad`: `tal` o `universal`.
 - `BookPath` y `OwnBook`: libro Polyglot.
 - `SyzygyPath`: tablas de finales.
-- `NNUEPath`: ruta al archivo de pesos NNUE (arquitectura actual: `pesos_amenazas_prueba.bin`, 5378 entradas).
-- `UseNNUE`: activa la evaluacion hibrida despues de cargar pesos validos.
+- `UseNNUE`: **activado por defecto**. La red va EMBEBIDA en el ejecutable
+  (`pesos_bullet_512_buckets8.bin`, formato bullet `768 -> 512`x2 -> 1 SCReLU
+  con 8 output buckets), asi que el motor evalua con NNUE sin necesidad de
+  configurar nada ni de que el .bin viaje junto al binario. Antes el valor por
+  defecto era `false` con `NNUEPath` vacio: cualquier tester que no
+  configurara la ruta hacia jugar al motor con evaluacion clasica pura, mucho
+  mas debil.
+- `NNUEPath`: opcional, solo para reemplazar la red embebida por otra.
 
-Ejemplo de NNUE (ruta relativa a esta carpeta):
+Ejemplo de red alternativa (ruta relativa a esta carpeta):
 
 ```text
-setoption name NNUEPath value pesos_amenazas_prueba.bin
+setoption name NNUEPath value pesos_bullet_512_buckets8.bin
 setoption name UseNNUE value true
 ```
 
@@ -124,7 +130,13 @@ LMR queda activado salvo que se defina expresamente `MIMOTOR_LMR=0`.
 
 ## Archivos binarios
 
-- `pesos_amenazas_prueba.bin`: pesos de la arquitectura NNUE ACTUAL en produccion (5378 entradas: 770 base + 4608 features de amenaza, `5378 -> 256 -> 32 -> 1`). Es el que hay que usar en `NNUEPath`.
+- `pesos_bullet_512_buckets8.bin`: pesos de la red NNUE ACTUAL en produccion
+  (formato bullet, `768 -> 512`x2 -> 1 SCReLU, 8 output buckets). Va embebida
+  en el ejecutable via `include_bytes!` desde `src/neural.rs`.
+- `pesos_amenazas_prueba.bin`: nombre historico; es BYTE A BYTE el mismo
+  archivo que `pesos_bullet_512_buckets8.bin` (mismo md5). Se conserva solo
+  porque scripts h2h antiguos lo nombran. NO es la arquitectura de 5378
+  entradas que decia esta documentacion.
 - `pesos_v1.bin`: fixture de la arquitectura VIEJA (770 entradas, `770 -> 256 -> 32 -> 1`), conservado solo porque dos tests unitarios en `src/neural.rs` (`rechaza_nan_sin_panico`, `checksum_es_estable`) lo usan via `include_bytes!` para probar el validador de bytes -- no representa la red que juega hoy.
 - `performance.bin`: conservado tal como fue proporcionado. El codigo actual no lo carga directamente.
 

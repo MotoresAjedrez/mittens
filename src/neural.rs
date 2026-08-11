@@ -1263,8 +1263,24 @@ fn almacenamiento() -> &'static RwLock<Option<RedCargada>> {
 /// Carga o reemplaza los pesos. Si la ruta o el contenido son invalidos se
 /// conserva la red anterior, evitando que un error de escritura apague una
 /// NNUE que ya estaba funcionando. Devuelve el checksum FNV-1a del archivo.
+/// Pesos NNUE embebidos en el binario (bullet 512 neuronas, 8 buckets de
+/// salida). Antes la red solo existia como archivo externo: si el operador
+/// del torneo no configuraba `NNUEPath`, el motor jugaba con evaluacion
+/// clasica pura. Embeberla hace que la NNUE este disponible siempre, sin
+/// depender de que el .bin viaje junto al ejecutable.
+const PESOS_EMBEBIDOS: &[u8] = include_bytes!("../pesos_bullet_512_buckets8.bin");
+
+/// Carga la red embebida. Se llama al arrancar el bucle UCI.
+pub fn cargar_embebida() -> Result<u64, String> {
+    cargar_de_datos(PESOS_EMBEBIDOS.to_vec())
+}
+
 pub fn cargar_detallado(path: &str) -> Result<u64, String> {
     let datos = std::fs::read(path).map_err(|e| format!("no se pudo leer: {e}"))?;
+    cargar_de_datos(datos)
+}
+
+fn cargar_de_datos(datos: Vec<u8>) -> Result<u64, String> {
     let checksum = checksum_fnv1a(&datos);
     // El formato se detecta por el tamano del archivo: la red bullet mide
     // 394754 bytes utiles + hasta 63 de relleno; la de amenazas, 11 MB.
