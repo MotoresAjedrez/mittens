@@ -6,7 +6,7 @@ description = "Motor de ajedrez UCI de Tavito, version reparada"
 
 [lib]
 name = "mimotor_core"
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
