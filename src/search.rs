@@ -700,6 +700,12 @@ pub struct Searcher {
     // de tiempo. Necesario para "go infinite" y para cumplir el protocolo
     // UCI que exigen los testers de listas de rating como CCRL.
     external_stop: Option<Arc<AtomicBool>>,
+    /// Mientras esta en true, `check_time` NO levanta `self.stop`: ni por
+    /// deadline ni por la bandera externa. Se usa SOLO durante la primera
+    /// iteracion de profundizacion (ver search_time) para garantizar que la
+    /// profundidad 1 siempre termine y `mejor_mv` sea una jugada realmente
+    /// buscada, nunca el fallback de generacion. Cuesta microsegundos.
+    blindar_stop: bool,
 }
 
 fn valor_pieza(pt: crate::types::PieceType) -> i32 {
@@ -759,6 +765,7 @@ impl Searcher {
             root_moves_filtro: None,
             null_move_r_extra: 0,
             external_stop: None,
+            blindar_stop: false,
         }
     }
 
@@ -806,6 +813,7 @@ impl Searcher {
             root_moves_filtro: None,
             null_move_r_extra: 0,
             external_stop: None,
+            blindar_stop: false,
         }
     }
 
@@ -1235,7 +1243,7 @@ impl Searcher {
 
     fn check_time(&mut self) -> Result<(), TimeUp> {
         self.nodes += 1;
-        if !self.stop && (self.nodes == 1 || self.nodes & 255 == 0) {
+        if !self.stop && !self.blindar_stop && (self.nodes == 1 || self.nodes & 255 == 0) {
             if let Some(dl) = self.deadline
                 && Instant::now() >= dl
             {
@@ -3155,6 +3163,12 @@ impl Searcher {
         let mut esfuerzo_mejor: i32 = 0;
 
         for d in 1..=max_depth {
+            // Blindaje de la profundidad 1 (ver `blindar_stop`): sin esto, un
+            // "stop" que llega en el primer milisegundo abortaba antes de
+            // puntuar una sola jugada de raiz y se devolvia el fallback de
+            // generacion (a2a3 en la posicion inicial). A partir de d=2 el
+            // corte es normal, porque ya hay una jugada buscada que devolver.
+            self.blindar_stop = d == 1;
             self.reiniciar_nnue(b);
             let mut moves = generate_legal(b);
             if let Some(filtro) = &self.root_moves_filtro {
@@ -3418,6 +3432,10 @@ impl Searcher {
                 }
             }
         }
+        // El blindaje es estrictamente local a la iteracion 1; no puede
+        // quedar activo y volverse un "stop ignorado" en la busqueda de la
+        // jugada siguiente (el Searcher de un solo hilo se reutiliza).
+        self.blindar_stop = false;
         // La raiz nunca pasa por negamax (el loop de arriba la maneja
         // aparte), asi que sin esto la TT no tiene entrada para ella y
         // extraer_pv() no puede ni arrancar a caminarla. Guardarla aca no
@@ -3564,6 +3582,38 @@ pub fn buscar_lazy_smp(
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    /// BUG: un "stop" (o cualquier comando que aborte la busqueda) que llega
+    /// ANTES de que termine la profundidad 1 dejaba `mejor_mv` en el
+    /// fallback, que es la PRIMERA jugada en orden de generacion -- a2a3 en
+    /// la posicion inicial. O sea: "go" seguido de "stop" inmediato hacia
+    /// jugar a2a3. Ocurre de verdad cuando un GUI corta al instante (usuario
+    /// aprieta parar, perdida por tiempo, cambio de posicion). El contrato
+    /// UCI es devolver la mejor jugada ENCONTRADA, y para eso la
+    /// profundidad 1 tiene que completarse siempre: cuesta microsegundos.
+    #[test]
+    fn stop_inmediato_devuelve_jugada_buscada_no_la_primera_generada() {
+        let b = Board::from_fen("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2")
+            .expect("fen valido");
+        // Bandera de stop ya levantada ANTES de arrancar: el caso extremo.
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut s = Searcher::new(16);
+        s.set_external_stop(Some(Arc::clone(&flag)));
+        let (mv, _sc, prof) = s.search_time(&b, Some(5_000), 64, |_, _, _, _, _| {});
+        let mv = mv.expect("siempre debe haber jugada");
+        assert!(
+            prof >= 1,
+            "la profundidad 1 debe completarse pese al stop, se obtuvo {}",
+            prof
+        );
+        // a2a3 es la primera jugada legal generada en esta posicion: si sale
+        // esa, es el fallback sin buscar, no una eleccion de la busqueda.
+        assert_ne!(
+            mv.to_uci(),
+            "a2a3",
+            "devolvio el fallback de generacion en vez de una jugada buscada"
+        );
+    }
 
     #[test]
     fn score_mate_tt_roundtrip_en_distintos_plies() {
