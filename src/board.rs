@@ -104,7 +104,7 @@ impl Board {
         self.ep_hash_file().is_some()
     }
 
-    fn recompute_zobrist(&mut self) {
+    pub(crate) fn recompute_zobrist(&mut self) {
         let k = keys();
         let mut z = 0u64;
         for c in 0..2 {

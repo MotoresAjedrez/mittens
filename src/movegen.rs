@@ -301,7 +301,13 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
         // evasiones, que incluyen bloqueos silenciosos), pero se deja
         // correcto por si se reutiliza en otro contexto.
         let mut moves = generate_pseudo_legal_captures(b);
-        moves.retain(|mv| camino_lento(mv));
+        moves.retain(|mv| {
+            if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
+                casilla_segura_para_rey(b, king_sq, mv.to, us)
+            } else {
+                camino_lento(mv)
+            }
+        });
         return moves;
     }
 
@@ -314,13 +320,58 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
 
     let mut moves = generate_pseudo_legal_captures(b);
     moves.retain(|mv| {
-        if bit(mv.from) & pinned == 0 && mv.from != king_sq && mv.flag != MoveFlag::EnPassant {
-            true
-        } else {
+        if mv.flag == MoveFlag::EnPassant {
             camino_lento(mv)
+        } else if mv.from == king_sq {
+            casilla_segura_para_rey(b, king_sq, mv.to, us)
+        } else {
+            bit(mv.from) & pinned == 0 || camino_lento(mv)
         }
     });
     moves
+}
+
+/// ¿La casilla `to` es segura para el rey de `us` que actualmente está en
+/// `king_sq`? Equivalente EXACTO a `!b.make_move(mv).in_check(us)` para una
+/// jugada de rey (normal o de captura), pero sin copiar el tablero ni
+/// recalcular zobrist/derivados:
+///  - la ocupación se ajusta quitando al rey de su casilla y poniéndolo en
+///    `to` (imprescindible: si no se quita, el propio rey se tapa a sí mismo
+///    de un jaque deslizante y una huida por la línea del ataque parecería
+///    segura);
+///  - si `to` estaba ocupada por una pieza enemiga, esa pieza queda capturada
+///    y no puede defender la casilla, así que se excluye del conjunto de
+///    atacantes (el rey enemigo nunca puede estar en `to`, y un peón/caballo
+///    capturado tampoco defiende su propia casilla).
+///
+/// Vale igual estando en jaque o no: la única fuente de verdad es "¿`to` está
+/// atacada con el rey fuera del tablero?".
+#[inline]
+fn casilla_segura_para_rey(b: &Board, king_sq: Square, to: Square, us: Color) -> bool {
+    let them = us.opposite();
+    let p = &b.pieces[them as usize];
+    let sin_victima = !bit(to);
+    let occ = (b.occupied & !bit(king_sq)) | bit(to);
+
+    if pawn_attacks(us, to) & p[PieceType::Pawn as usize] & sin_victima != 0 {
+        return false;
+    }
+    if knight_attacks(to) & p[PieceType::Knight as usize] & sin_victima != 0 {
+        return false;
+    }
+    if king_attacks(to) & p[PieceType::King as usize] != 0 {
+        return false;
+    }
+    let alfil_dama =
+        (p[PieceType::Bishop as usize] | p[PieceType::Queen as usize]) & sin_victima;
+    if alfil_dama != 0 && bishop_attacks(to, occ) & alfil_dama != 0 {
+        return false;
+    }
+    let torre_dama = (p[PieceType::Rook as usize] | p[PieceType::Queen as usize]) & sin_victima;
+    if torre_dama != 0 && rook_attacks(to, occ) & torre_dama != 0 {
+        return false;
+    }
+    true
 }
 
 /// Filtra las jugadas pseudo-legales: descarta las que dejan al propio rey en jaque.
@@ -349,12 +400,21 @@ pub fn generate_legal(b: &Board) -> MoveList {
     };
 
     if b.in_check(us) {
-        // Evasion de jaque (posibles jaques dobles, bloqueos, etc.): el
-        // caso menos frecuente y mas delicado -- se deja el camino lento,
-        // siempre correcto, sin ganancia medible de nps (pocas jugadas
-        // pseudo-legales cuando el rey esta en jaque).
+        // Evasion de jaque (posibles jaques dobles, bloqueos, etc.). Las
+        // jugadas del REY -- que son la mayoria de las evasiones y las mas
+        // caras de legalizar por el camino lento -- se resuelven con el test
+        // directo de casilla segura; el resto (bloqueos y capturas del
+        // atacante) sigue por el camino lento, siempre correcto.
+        // gen_castling no produce nada estando en jaque, asi que aqui no hay
+        // enroques que considerar.
         let mut moves = generate_pseudo_legal(b);
-        moves.retain(|mv| camino_lento(mv));
+        moves.retain(|mv| {
+            if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
+                casilla_segura_para_rey(b, king_sq, mv.to, us)
+            } else {
+                camino_lento(mv)
+            }
+        });
         return moves;
     }
 
@@ -366,22 +426,20 @@ pub fn generate_legal(b: &Board) -> MoveList {
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
 
     let mut moves = generate_pseudo_legal(b);
-    moves.retain(|mv| {
-        if bit(mv.from) & pinned == 0
-            && mv.from != king_sq
-            && !matches!(
-                mv.flag,
-                MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
-            )
-        {
-            // Pieza no clavada, no es el rey, no es al paso/enroque:
-            // siempre legal (el rey no esta en jaque en esta rama, y mover
-            // una pieza no clavada no puede exponerlo).
-            true
-        } else {
-            // Casos poco comunes: camino lento, siempre correcto.
-            camino_lento(mv)
-        }
+    moves.retain(|mv| match mv.flag {
+        // gen_castling ya verifico TODAS las condiciones de legalidad del
+        // enroque (rey sin jaque, casillas de paso y destino no atacadas,
+        // camino libre, rey y torre en su sitio): volver a hacer make_move +
+        // in_check para confirmarlo era trabajo puramente redundante.
+        MoveFlag::CastleKing | MoveFlag::CastleQueen => true,
+        // Al paso: puede destapar un jaque horizontal quitando DOS peones de
+        // la misma fila; es raro y no lo cubre el mapa de clavadas.
+        MoveFlag::EnPassant => camino_lento(mv),
+        _ if mv.from == king_sq => casilla_segura_para_rey(b, king_sq, mv.to, us),
+        // Pieza no clavada, no es el rey: siempre legal (el rey no esta en
+        // jaque en esta rama, y mover una pieza no clavada no puede exponerlo).
+        _ if bit(mv.from) & pinned == 0 => true,
+        _ => camino_lento(mv),
     });
     moves
 }

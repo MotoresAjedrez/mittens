@@ -8,6 +8,7 @@ mod neural;
 mod perft;
 mod polyglot;
 mod polyglot_random;
+mod pruebas_consistencia;
 mod search;
 mod see;
 mod syzygy;
