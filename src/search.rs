@@ -494,6 +494,34 @@ fn tt_empaquetar(entry: &TTEntry, key: u64, generation: u8) -> u64 {
     mv | (score << 18) | (depth << 34) | (flag << 41) | (generacion << 43) | TT_OCUPADO | (verif << 49)
 }
 
+/// Datos del OCUPANTE de un casillero de la TT compartida que necesita la
+/// regla de reemplazo, decodificados SIN exigir que la clave coincida.
+///
+/// `tt_desempaquetar` devuelve None cuando los bits de verificacion no
+/// coinciden (es lo correcto para LEER: esa entrada es de otra posicion).
+/// Pero para DECIDIR EL REEMPLAZO hace falta saber que hay en el casillero
+/// aunque sea de otra posicion -- si no, toda colision de clave parece un
+/// casillero vacio y se pisa siempre, que es justo lo contrario de la
+/// politica documentada en `tt_store`.
+struct OcupanteTT {
+    depth: i32,
+    flag: TTFlag,
+    generation: u8,
+    misma_clave: bool,
+}
+
+fn tt_ocupante(paquete: u64, key: u64) -> Option<OcupanteTT> {
+    if paquete & TT_OCUPADO == 0 {
+        return None;
+    }
+    Some(OcupanteTT {
+        depth: ((paquete >> 34) & 0x7F) as i32,
+        flag: tt_flag_desde_u64((paquete >> 41) & 0x3),
+        generation: ((paquete >> 43) & 0x1F) as u8,
+        misma_clave: ((paquete >> 49) & 0x7FFF) == ((key >> (64 - 15)) & 0x7FFF),
+    })
+}
+
 fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
     if paquete & TT_OCUPADO == 0 {
         return None;
@@ -1203,13 +1231,22 @@ impl Searcher {
         // colision de otra clave se trata igual que una de la MISMA clave:
         // solo reemplaza si es al menos tan profunda (o si la entrada previa
         // es de una generacion vieja, que siempre se descarta).
-        let reemplazar = |slot: Option<TTEntry>| match slot {
+        //
+        // OJO (bug corregido): esta regla se evaluaba sobre el resultado de
+        // `tt_desempaquetar`, que devuelve None cuando los bits de
+        // verificacion NO coinciden. Es decir: en la TT COMPARTIDA -- la
+        // unica que se usa en produccion -- toda colision de otra clave
+        // parecia un casillero VACIO y se pisaba siempre, sin mirar la
+        // profundidad. La politica descrita arriba solo estaba viva en la TT
+        // Local (un solo hilo, camino de tests). Ahora el ocupante se decodifica
+        // con `tt_ocupante`, que no exige que la clave coincida.
+        let reemplazar = |slot: Option<OcupanteTT>| match slot {
             None => true,
             Some(existing) if existing.generation != generacion => true,
             Some(existing) => {
                 depth > existing.depth
                     || (depth == existing.depth
-                        && (existing.key != key
+                        && (!existing.misma_clave
                             || (flag == TTFlag::Exact && existing.flag != TTFlag::Exact)))
             }
         };
@@ -1224,7 +1261,13 @@ impl Searcher {
         let idx = self.tt_index(key);
         match &mut self.tt {
             TablaTransposicion::Local(tt) => {
-                if reemplazar(tt[idx]) {
+                let ocupante = tt[idx].map(|e| OcupanteTT {
+                    depth: e.depth,
+                    flag: e.flag,
+                    generation: e.generation,
+                    misma_clave: e.key == key,
+                });
+                if reemplazar(ocupante) {
                     tt[idx] = Some(entry);
                 }
             }
@@ -1236,7 +1279,7 @@ impl Searcher {
                 // completa al leer, asi que un casillero mal reemplazado
                 // simplemente se descarta despues como si fuera una
                 // colision de otra posicion, igual que cualquier TT normal.
-                let actual = tt_desempaquetar(tt[idx].load(Ordering::Relaxed), key);
+                let actual = tt_ocupante(tt[idx].load(Ordering::Relaxed), key);
                 if reemplazar(actual) {
                     tt[idx].store(tt_empaquetar(&entry, key, generacion), Ordering::Relaxed);
                 }
@@ -3718,6 +3761,33 @@ mod regression_tests {
         assert_eq!(tt_desempaquetar_move(tt_empaquetar_move(None)), None);
     }
 
+    // La politica de reemplazo documentada en tt_store ("una colision de otra
+    // clave se trata igual que una de la MISMA clave: solo reemplaza si es al
+    // menos tan profunda") debe valer en LAS DOS tablas. Este test la exige
+    // en la COMPARTIDA, que es la unica que se usa en produccion (main.rs y
+    // lib.rs siempre construyen construir_tt()).
+    #[test]
+    fn tt_compartida_colision_menos_profunda_no_pisa() {
+        let (tt, mask) = construir_tt(1);
+        let mut s = Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, true);
+        // Misma posicion en la tabla, bits de verificacion (49..64) distintos.
+        let k1 = (0x1234u64 & mask as u64) | (0x1111u64 << 49);
+        let k2 = (0x1234u64 & mask as u64) | (0xABCDu64 << 49);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        // Menos profunda (tipica escritura de quiescence, depth=0): NO debe
+        // desalojar la entrada profunda de negamax.
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        assert_eq!(
+            s.tt_probe(k1).map(|e| e.depth),
+            Some(12),
+            "una colision menos profunda desalojo la entrada profunda"
+        );
+        // Al menos tan profunda: SI debe pisar.
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
+        assert!(s.tt_probe(k1).is_none());
+    }
+
     #[test]
     fn tt_colision_de_otra_clave_se_reemplaza() {
         // Una colision de OTRA clave solo pisa si es al menos tan profunda:
@@ -3776,9 +3846,14 @@ mod regression_tests {
         let k1 = 0x1234u64;
         let k2 = (k1 & mask as u64) | (0xABCDu64 << 49);
         s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        // Igual que en la TT Local: una colision MENOS profunda no desaloja
+        // (antes si lo hacia, ver tt_ocupante); una al menos tan profunda si.
         s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
+        assert!(s.tt_probe(k2).is_none());
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
         assert!(s.tt_probe(k1).is_none());
-        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(1));
+        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
 
     #[test]
