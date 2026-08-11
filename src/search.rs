@@ -3564,6 +3564,89 @@ mod regression_tests {
         }
     }
 
+    // Round-trip COMPLETO por la TT compartida (empaquetado real en un u64):
+    // el test viejo de mate solo probaba score_to_tt/score_from_tt aislados,
+    // sin pasar por el empaquetado a i16 ni por el casillero atomico. Aca se
+    // guarda de verdad en la tabla y se recupera, para cada ply y cada tipo
+    // de score (mate a favor, mate en contra, score normal, +-INFINITO).
+    #[test]
+    fn tt_compartida_roundtrip_scores_de_mate_por_ply() {
+        let (tt, mask) = construir_tt(1);
+        let mut s = Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, true);
+        let mut clave = 0x1u64;
+        for ply in [0u32, 1, 7, 31, 63, 127, 175] {
+            for score in [
+                MATE - 1,
+                MATE - 12,
+                MATE - 999,
+                -MATE + 1,
+                -MATE + 9,
+                -MATE + 999,
+                0,
+                123,
+                -4567,
+                INFINITO,
+                -INFINITO,
+            ] {
+                clave = clave.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+                s.clear_hash();
+                s.tt_store(clave, 5, score, ply, TTFlag::Exact, None);
+                let e = s
+                    .tt_probe(clave)
+                    .unwrap_or_else(|| panic!("no se recupero la entrada (ply={ply}, score={score})"));
+                assert_eq!(
+                    score_from_tt(e.score, ply),
+                    score,
+                    "round-trip roto por la TT compartida: ply={ply} score={score}"
+                );
+            }
+        }
+    }
+
+    // Round-trip de TODAS las combinaciones de jugada por el empaquetado de
+    // 18 bits de la TT: 64x64 casilleros x 6 flags x (sin promocion + las 6
+    // piezas). Si algun campo se pisa con otro, este test lo caza.
+    #[test]
+    fn tt_roundtrip_de_todas_las_jugadas_posibles() {
+        let flags = [
+            MoveFlag::Quiet,
+            MoveFlag::Capture,
+            MoveFlag::DoublePush,
+            MoveFlag::EnPassant,
+            MoveFlag::CastleKing,
+            MoveFlag::CastleQueen,
+        ];
+        let promos = [
+            None,
+            Some(PieceType::Pawn),
+            Some(PieceType::Knight),
+            Some(PieceType::Bishop),
+            Some(PieceType::Rook),
+            Some(PieceType::Queen),
+            Some(PieceType::King),
+        ];
+        for from in 0u8..64 {
+            for to in 0u8..64 {
+                if from == to {
+                    continue; // sentinel de "sin jugada", no es una jugada real
+                }
+                for flag in flags {
+                    for promotion in promos {
+                        let mv = Move { from, to, promotion, flag };
+                        let empaquetada = tt_empaquetar_move(Some(mv));
+                        assert!(empaquetada <= 0x3FFFF, "la jugada no entra en 18 bits: {mv:?}");
+                        assert_eq!(
+                            tt_desempaquetar_move(empaquetada),
+                            Some(mv),
+                            "round-trip de jugada roto: {mv:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(tt_desempaquetar_move(tt_empaquetar_move(None)), None);
+    }
+
     #[test]
     fn tt_colision_de_otra_clave_se_reemplaza() {
         // Una colision de OTRA clave solo pisa si es al menos tan profunda:
