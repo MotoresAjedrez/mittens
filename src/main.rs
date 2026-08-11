@@ -978,18 +978,7 @@ fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead
     } else {
         20_000
     };
-    // Reparto base. `movestogo <= 0` = muerte subita (el GUI no manda
-    // movestogo): antes se asumia 30 jugadas por delante, lo que en un
-    // 10s+0.1s deja ~330ms por jugada y termina regalando reloj sin usar.
-    // Con incremento la partida se auto-sostiene, asi que se reparte mas
-    // agresivo (1/22) y ademas se suma el incremento completo menos un
-    // pelin; sin incremento se mantiene un reparto conservador.
-    let divisor = if movestogo <= 0 {
-        if inc > 0 { 22 } else { 28 }
-    } else {
-        movestogo as u64
-    };
-    let base = disponible / divisor.max(1);
+    let base = disponible / movestogo.max(1) as u64;
     let objetivo = base.saturating_add(inc.saturating_mul(8) / 10);
     objetivo.max(1).min(techo).min(disponible.max(1))
 }
@@ -1462,7 +1451,7 @@ fn uci_loop() {
                             .position(|&p| p == "movestogo")
                             .and_then(|j| partes.get(j + 1))
                             .and_then(|s| s.parse().ok())
-                            .unwrap_or(0); // 0 = muerte subita (sin movestogo)
+                            .unwrap_or(30);
                         let (mio_i, inc_i) = if board.turn == types::Color::White {
                             (wtime, winc)
                         } else {
