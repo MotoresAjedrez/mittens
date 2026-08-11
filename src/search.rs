@@ -1420,11 +1420,16 @@ impl Searcher {
         if let Some(mut entry) = self.tt_probe(key) {
             entry.score = score_from_tt(entry.score, ply);
             tt_mv = entry.best;
-            match entry.flag {
-                TTFlag::Exact => return Ok(entry.score),
-                TTFlag::Beta if entry.score >= beta => return Ok(entry.score),
-                TTFlag::Alpha if entry.score <= alpha => return Ok(entry.score),
-                _ => {}
+            // Misma guarda de la regla de 50 que en negamax (ver alli): con
+            // el contador alto, un score guardado con el contador bajo puede
+            // prometer un resultado que la regla de 50 ya no permite.
+            if b.halfmove_clock < 90 {
+                match entry.flag {
+                    TTFlag::Exact => return Ok(entry.score),
+                    TTFlag::Beta if entry.score >= beta => return Ok(entry.score),
+                    TTFlag::Alpha if entry.score <= alpha => return Ok(entry.score),
+                    _ => {}
+                }
             }
         }
         let en_jaque = b.in_check(b.turn);
@@ -1714,7 +1719,17 @@ impl Searcher {
             // guardada que puede venir de otra ventana o de otro camino. En
             // esos nodos la entrada solo aporta `tt_move` para el orden.
             let nodo_pv = beta > alpha + 1;
-            if entry.depth >= depth && !nodo_pv {
+            // GUARDA DE LA REGLA DE 50 (faltaba): el zobrist NO incluye el
+            // halfmove_clock, asi que la MISMA entrada de TT sirve a la misma
+            // posicion con el contador de la regla de 50 en 5 o en 95. Un
+            // "gano en N" guardado con el contador bajo es sencillamente
+            // falso cuando quedan pocas jugadas reversibles: la partida es
+            // tablas antes de que ese plan se complete. Stockfish desactiva
+            // el corte por TT con rule50_count() >= 90 por exactamente este
+            // motivo; aca no habia ninguna guarda. Solo se pierde el ATAJO:
+            // la busqueda real de ese nodo si respeta la regla (el chequeo
+            // halfmove_clock >= 100 esta al entrar a negamax y a quiescence).
+            if entry.depth >= depth && !nodo_pv && b.halfmove_clock < 90 {
                 match entry.flag {
                     TTFlag::Exact => return Ok(entry.score),
                     TTFlag::Beta if entry.score >= beta => return Ok(entry.score),
@@ -2468,11 +2483,17 @@ impl Searcher {
             // negativo rara vez compensa aunque se reduzca por LMR -- se
             // descarta directo sin bajar al hijo.
             const SEE_PRUNE_PROF_MAX: i32 = 7;
-            // Margen LINEAL (estandar estilo Stockfish, ~-85*depth/3): el
-            // margen cuadratico anterior (-20*depth^2) daba -980 a depth 7,
-            // casi nunca podaba. Lineal: -85*7/3 ~= -198 a depth 7 -- poda
-            // capturas claramente perdedoras sin tocar las dudosas.
-            const SEE_PRUNE_MARGEN_POR_PLY: i32 = -85;
+            // Margen LINEAL. OJO CON LA CALIBRACION: la version anterior
+            // usaba -85*depth/3 (== -28*depth) diciendo que era "estilo
+            // Stockfish", pero la constante real de Stockfish para capturas
+            // es see_ge(move, -203*depth) y la de Ethereal es -20*depth^2.
+            // Con -28*depth el motor descartaba, a partir de profundidad 2,
+            // CUALQUIER captura que perdiera mas de ~0.6-2.0 peones (a depth
+            // 7 el umbral era -198 contra -980 de Ethereal y -1421 de
+            // Stockfish): sacrificios de peon o de calidad desaparecian del
+            // arbol en todo nodo no-PV. Se pasa a -100*depth, entre ambas
+            // referencias y ~3.5x menos agresivo que antes.
+            const SEE_PRUNE_MARGEN_POR_PLY: i32 = -100;
             if !es_pv
                 && !en_jaque
                 && depth <= SEE_PRUNE_PROF_MAX
@@ -2493,7 +2514,7 @@ impl Searcher {
                         crate::see::see(b, mv),
                         "SEE cacheado desalineado con la jugada en idx={idx} (ver see_negamax)"
                     );
-                    see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
+                    see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth
                 }
             {
                 if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
@@ -3078,6 +3099,15 @@ impl Searcher {
             0 => None,
             v => Some(v),
         };
+        // ¿Hay un RELOJ REAL detras de este presupuesto? main.rs solo publica
+        // un techo duro (fijar_tiempo_maximo) cuando el `go` trae
+        // wtime/btime. Con `go movetime X` no hay techo: el presupuesto ES el
+        // limite y el tiempo que no se usa NO se ahorra para despues, se
+        // pierde. Por eso el corte blando (que existe para GUARDAR reloj para
+        // las jugadas siguientes) solo tiene sentido con reloj real; con
+        // movetime fijo cortar al 55-85% del presupuesto era regalar entre un
+        // 15% y un 45% del tiempo de pensar en cada jugada.
+        let hay_reloj_real = self.tiempo_maximo_ms.or(techo_global).is_some();
         let maximo_ms = match (movetime_ms, self.tiempo_maximo_ms.or(techo_global)) {
             (Some(opt), Some(max)) => Some(max.max(opt)),
             (Some(opt), None) => Some(opt),
@@ -3359,6 +3389,7 @@ impl Searcher {
             let factor = factor.clamp(40, 200);
             if let Some(ms) = optimo_ms
                 && ms > 25
+                && hay_reloj_real
             {
                 let umbral = ms.saturating_mul(fraccion_corte) / 100;
                 let umbral = umbral.saturating_mul(factor) / 100;

@@ -1134,15 +1134,28 @@ fn uci_loop() {
         }
         let partes: Vec<&str> = line.split_whitespace().collect();
 
-        // "stop" se maneja aparte. "isready" debe esperar a que termine una
-        // busqueda activa para cumplir UCI; todo lo demas primero se asegura de
-        // que no haya una busqueda activa antes de tocar board/searcher.
+        // "stop" se maneja aparte. Todo lo demas primero se asegura de que no
+        // haya una busqueda activa antes de tocar board/searcher.
         if partes[0] == "stop" {
             detener_y_recuperar(&mut activa, &mut searcher_slot);
             continue;
         }
+        // "isready" NO debe interrumpir la busqueda. El texto del protocolo
+        // UCI es explicito: "this command ... can be sent also when the engine
+        // is calculating in which case the engine should also immediately
+        // answer with readyok WITHOUT stopping the search".
+        //
+        // BUG CORREGIDO: antes esta rama llamaba a detener_y_recuperar, o sea
+        // que cualquier GUI/arbitro que mande "isready" mientras el motor
+        // piensa (varios lo hacen como chequeo de vida, y esta permitido)
+        // ABORTABA la busqueda en curso. El hilo de busqueda contestaba
+        // "bestmove" en el acto, con la profundidad que hubiera alcanzado
+        // hasta ese milisegundo -- en la practica, jugar de inmediato durante
+        // toda la partida. No se nota probando con python-chess ni con
+        // cutechess (no mandan isready mientras se piensa), pero si con otros
+        // arbitros, y es candidato serio a explicar un resultado de torneo
+        // externo muy por debajo de la fuerza medida en casa.
         if partes[0] == "isready" {
-            detener_y_recuperar(&mut activa, &mut searcher_slot);
             println!("readyok");
             io::stdout().flush().ok();
             continue;

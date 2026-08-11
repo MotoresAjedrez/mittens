@@ -1142,15 +1142,18 @@ pub fn uci_loop() {
         }
         let partes: Vec<&str> = line.split_whitespace().collect();
 
-        // "stop" se maneja aparte. "isready" debe esperar a que termine una
-        // busqueda activa para cumplir UCI; todo lo demas primero se asegura de
-        // que no haya una busqueda activa antes de tocar board/searcher.
+        // "stop" se maneja aparte. Todo lo demas primero se asegura de que no
+        // haya una busqueda activa antes de tocar board/searcher.
         if partes[0] == "stop" {
             detener_y_recuperar(&mut activa, &mut searcher_slot);
             continue;
         }
+        // "isready" NO debe interrumpir la busqueda (ver el mismo fix y su
+        // explicacion en main.rs: el protocolo UCI exige contestar readyok de
+        // inmediato SIN detener el calculo). Este uci_loop es una copia del de
+        // main.rs para el uso como libreria (iOS/Android), asi que arrastraba
+        // exactamente el mismo bug.
         if partes[0] == "isready" {
-            detener_y_recuperar(&mut activa, &mut searcher_slot);
             println!("readyok");
             io::stdout().flush().ok();
             continue;
