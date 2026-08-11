@@ -1081,6 +1081,7 @@ pub fn uci_loop() {
     // que solo vive unos milisegundos. Es experimental y apagado por defecto;
     // el modo normal conserva stop asíncrono sin ninguna variación.
     let mut sync_ultrabullet = false;
+    let mut multipv: usize = 1;
     if let Ok(p) = std::env::var("MIMOTOR_PERSONALIDAD")
         && let Some(pers) = eval::personalidad_desde_texto(&p)
     {
@@ -1148,11 +1149,21 @@ pub fn uci_loop() {
             detener_y_recuperar(&mut activa, &mut searcher_slot);
             continue;
         }
-        // "isready" NO debe interrumpir la busqueda (ver el mismo fix y su
-        // explicacion en main.rs: el protocolo UCI exige contestar readyok de
-        // inmediato SIN detener el calculo). Este uci_loop es una copia del de
-        // main.rs para el uso como libreria (iOS/Android), asi que arrastraba
-        // exactamente el mismo bug.
+        // "isready" NO debe interrumpir la busqueda. El texto del protocolo
+        // UCI es explicito: "this command ... can be sent also when the engine
+        // is calculating in which case the engine should also immediately
+        // answer with readyok WITHOUT stopping the search".
+        //
+        // BUG CORREGIDO: antes esta rama llamaba a detener_y_recuperar, o sea
+        // que cualquier GUI/arbitro que mande "isready" mientras el motor
+        // piensa (varios lo hacen como chequeo de vida, y esta permitido)
+        // ABORTABA la busqueda en curso. El hilo de busqueda contestaba
+        // "bestmove" en el acto, con la profundidad que hubiera alcanzado
+        // hasta ese milisegundo -- en la practica, jugar de inmediato durante
+        // toda la partida. No se nota probando con python-chess ni con
+        // cutechess (no mandan isready mientras se piensa), pero si con otros
+        // arbitros, y es candidato serio a explicar un resultado de torneo
+        // externo muy por debajo de la fuerza medida en casa.
         if partes[0] == "isready" {
             println!("readyok");
             io::stdout().flush().ok();
@@ -1182,6 +1193,7 @@ pub fn uci_loop() {
                 println!("option name QSearchNNUE type check default true");
                 println!("option name NNUEClassicalDepth type spin default 0 min 0 max 4");
                 println!("option name SyncUltraBullet type check default false");
+                println!("option name MultiPV type spin default 1 min 1 max 10");
                 println!("uciok");
                 io::stdout().flush().ok();
             }
@@ -1260,6 +1272,10 @@ pub fn uci_loop() {
                     } else if nombre.eq_ignore_ascii_case("syncultrabullet") {
                         if let Some(v) = valor {
                             sync_ultrabullet = v.eq_ignore_ascii_case("true");
+                        }
+                    } else if nombre.eq_ignore_ascii_case("multipv") {
+                        if let Some(n) = valor.and_then(|v| v.parse::<usize>().ok()) {
+                            multipv = n.clamp(1, 10);
                         }
                     } else if nombre.eq_ignore_ascii_case("nnuepath")
                         || nombre.eq_ignore_ascii_case("nnpath")
@@ -1458,6 +1474,8 @@ pub fn uci_loop() {
                 // movetime explicito, o wtime/btime(+winc/binc/movestogo), o
                 // "go infinite" (sin limite propio, corta solo con "stop").
                 let mut movetime: Option<u64> = None;
+                // Solo se pone cuando el `go` trae reloj (wtime/btime); con
+                // `go movetime` o `go depth` no hay dos presupuestos.
                 let mut movetime_maximo: Option<u64> = None;
                 if let Some(i) = partes.iter().position(|&p| p == "movetime") {
                     movetime = partes.get(i + 1).and_then(|s| s.parse().ok());
@@ -1503,6 +1521,8 @@ pub fn uci_loop() {
                             movestogo,
                             move_overhead_ms,
                         ));
+                        // Techo duro para el time management de dos
+                        // presupuestos (ver Searcher::tiempo_maximo_ms).
                         movetime_maximo = Some(calcular_movetime_maximo(
                             mio_i,
                             move_overhead_ms,
@@ -1542,6 +1562,7 @@ pub fn uci_loop() {
                 // "searchmoves", no MultiPV: ahi el usuario quiere analisis).
                 if !infinito
                     && movetime.is_some()
+                    && multipv <= 1
                     && searchmoves_filtro.is_none()
                 {
                     let legales = movegen::generate_legal(&board);
@@ -1556,6 +1577,101 @@ pub fn uci_loop() {
                 let stop_flag = Arc::new(AtomicBool::new(false));
                 let board_copy = board;
                 let hist_copy = game_history.clone();
+
+                // MultiPV: Mittens no tiene un algoritmo de multi-linea real
+                // (compartir el ply de raiz entre N lineas simultaneas). En
+                // su lugar se simula con N busquedas SECUENCIALES completas,
+                // cada una excluyendo (via root_moves_filtro) las jugadas de
+                // raiz ya encontradas en las anteriores -- el mismo truco que
+                // "searchmoves" ya permitia hacer desde afuera, ahora nativo
+                // y repartiendo el movetime total entre las N pasadas. Es
+                // sincrono (no soporta "stop" a mitad de camino ni "ponder")
+                // porque su uso previsto es analisis con movetime fijo, no
+                // partidas en vivo -- el camino normal (MultiPV=1, el
+                // default) no se toca y sigue siendo totalmente asincrono.
+                if multipv > 1 {
+                    let modo_lmr = searcher_slot.as_ref().unwrap().modo_lmr;
+                    let universo: Vec<Move> = match &searchmoves_filtro {
+                        Some(f) => f.clone(),
+                        None => movegen::generate_legal(&board_copy).to_vec(),
+                    };
+                    let tiempo_por_linea = movetime.map(|t| (t / multipv as u64).max(1));
+                    let mut excluidas: Vec<Move> = Vec::new();
+                    // (score, profundidad, nodos, pv)
+                    let mut lineas: Vec<(i32, i32, u64, Vec<Move>)> = Vec::new();
+                    for _ in 0..multipv {
+                        let candidatas: Vec<Move> = universo
+                            .iter()
+                            .copied()
+                            .filter(|m| !excluidas.contains(m))
+                            .collect();
+                        if candidatas.is_empty() {
+                            break;
+                        }
+                        let (mv, sc, nodos, prof, pv) = if n_hilos > 1 {
+                            let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
+                                &board_copy,
+                                tiempo_por_linea,
+                                64,
+                                n_hilos,
+                                &smp_tt,
+                                &smp_generacion,
+                                smp_tt_mask,
+                                modo_lmr,
+                                qsearch_nnue,
+                                nnue_classical_depth,
+                                &hist_copy,
+                                Arc::new(AtomicBool::new(false)),
+                                Some(candidatas),
+                            );
+                            let prof = resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
+                            // La TT compartida ya tiene el resultado: se
+                            // reconstruye la PV envolviendola en un Searcher
+                            // liviano solo para leerla (no busca nada).
+                            let lector = Searcher::new_con_tt_compartida(
+                                Arc::clone(&smp_tt),
+                                smp_tt_mask,
+                                modo_lmr,
+                            );
+                            let pv = lector.extraer_pv(&board_copy, 10);
+                            (mv, sc, nodos, prof, pv)
+                        } else {
+                            let mut s = searcher_slot.take().expect("searcher multipv");
+                            s.set_game_history(hist_copy.clone());
+                            s.root_moves_filtro = Some(candidatas);
+                            let (mv, sc, prof) =
+                                s.search_time(&board_copy, tiempo_por_linea, 64, |_, _, _, _, _| {});
+                            let nodos = s.nodes;
+                            let pv = s.extraer_pv(&board_copy, 10);
+                            searcher_slot = Some(s);
+                            (mv, sc, nodos, prof, pv)
+                        };
+                        let Some(mv) = mv else { break };
+                        excluidas.push(mv);
+                        let pv = if pv.first() == Some(&mv) { pv } else { vec![mv] };
+                        lineas.push((sc, prof, nodos, pv));
+                    }
+                    lineas.sort_by(|a, b| b.0.cmp(&a.0));
+                    for (i, (sc, prof, nodos, pv)) in lineas.iter().enumerate() {
+                        let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
+                        println!(
+                            "info depth {} multipv {} score {} nodes {} pv {}",
+                            prof,
+                            i + 1,
+                            formatear_score_uci(*sc),
+                            nodos,
+                            pv_txt
+                        );
+                    }
+                    io::stdout().flush().ok();
+                    let bestmove = lineas.first().and_then(|(_, _, _, pv)| pv.first().copied());
+                    println!(
+                        "bestmove {}",
+                        bestmove.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+                    );
+                    io::stdout().flush().ok();
+                    continue;
+                }
 
                 // A relojes extremadamente cortos el overhead de crear y
                 // despertar el hilo UCI pesa tanto como una fracción de la
@@ -1623,7 +1739,10 @@ pub fn uci_loop() {
                         let nps = nodos.saturating_mul(1000) / ms;
                         // La TT compartida ya tiene el resultado de todos los
                         // hilos: se reconstruye la PV envolviendola en un
-                        // Searcher liviano solo para leerla (no busca nada).
+                        // Searcher liviano solo para leerla (no busca nada),
+                        // igual que en el camino MultiPV. Se usa el mismo
+                        // tablero raiz para todos los hilos, asi que la
+                        // caminata de la TT es coherente con el hilo 0.
                         let lector =
                             Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, modo_lmr);
                         let pv = lector.extraer_pv(&board_copy, profundidad.max(1) as usize);
@@ -1729,4 +1848,85 @@ mod tests {
         assert!(parse_uci_move(&b, "e2e4x").is_none());
         assert!(parse_uci_move(&b, "e2e4").is_some());
     }
+}
+
+/// Punto de entrada de la linea de comandos. Vive en la LIBRERIA, no en el
+/// binario: `src/main.rs` es solo un envoltorio de una linea que llama aca.
+///
+/// Historia: hasta esta version, `src/main.rs` y `src/lib.rs` eran dos copias
+/// completas del mismo codigo (~1800 lineas cada una) porque la libreria no
+/// exponia un `rlib` que el binario pudiera enlazar. Cada arreglo habia que
+/// aplicarlo DOS veces y ya habian divergido de hecho (la copia de lib.rs se
+/// habia quedado sin MultiPV). Ahora hay una sola copia.
+pub fn run_cli() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "perft" => {
+                run_perft_suite();
+                return;
+            }
+            "divide" if args.len() > 3 => {
+                let depth: u32 = args[2].parse().expect("profundidad invalida");
+                let fen = args[3..].join(" ");
+                run_divide(&fen, depth);
+                return;
+            }
+            "bench" => {
+                let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
+                run_bench(depth);
+                return;
+            }
+            "matetest" => {
+                run_mate_tests();
+                return;
+            }
+            "aperturatest" => {
+                run_prueba_apertura();
+                return;
+            }
+            "cxb4test" => {
+                run_cxb4_bug();
+                return;
+            }
+            "seetest" => {
+                run_see_tests();
+                return;
+            }
+            "endgametest" => {
+                run_endgame_tests();
+                return;
+            }
+            "repetitiontest" => {
+                run_repetition_tests();
+                return;
+            }
+            "lmrdiag" => {
+                let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
+                run_lmr_diagnostico(depth);
+                return;
+            }
+            "singulartest" => {
+                let depth: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
+                run_singular_diagnostico(depth);
+                return;
+            }
+            "simple" if args.len() >= 3 => {
+                let (movetime, fen_inicio) = match args.get(2).and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) if args.len() >= 4 => (ms, 3usize),
+                    _ => (2000u64, 2usize),
+                };
+                let fen = args[fen_inicio..].join(" ");
+                run_simple(&fen, movetime);
+                return;
+            }
+            "smpbench" => {
+                let movetime: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
+                run_smp_bench(movetime);
+                return;
+            }
+            _ => {}
+        }
+    }
+    uci_loop();
 }
