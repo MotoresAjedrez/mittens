@@ -2466,11 +2466,17 @@ impl Searcher {
             // negativo rara vez compensa aunque se reduzca por LMR -- se
             // descarta directo sin bajar al hijo.
             const SEE_PRUNE_PROF_MAX: i32 = 7;
-            // Margen LINEAL (estandar estilo Stockfish, ~-85*depth/3): el
-            // margen cuadratico anterior (-20*depth^2) daba -980 a depth 7,
-            // casi nunca podaba. Lineal: -85*7/3 ~= -198 a depth 7 -- poda
-            // capturas claramente perdedoras sin tocar las dudosas.
-            const SEE_PRUNE_MARGEN_POR_PLY: i32 = -85;
+            // Margen LINEAL. OJO CON LA CALIBRACION: la version anterior
+            // usaba -85*depth/3 (== -28*depth) diciendo que era "estilo
+            // Stockfish", pero la constante real de Stockfish para capturas
+            // es see_ge(move, -203*depth) y la de Ethereal es -20*depth^2.
+            // Con -28*depth el motor descartaba, a partir de profundidad 2,
+            // CUALQUIER captura que perdiera mas de ~0.6-2.0 peones (a depth
+            // 7 el umbral era -198 contra -980 de Ethereal y -1421 de
+            // Stockfish): sacrificios de peon o de calidad desaparecian del
+            // arbol en todo nodo no-PV. Se pasa a -100*depth, entre ambas
+            // referencias y ~3.5x menos agresivo que antes.
+            const SEE_PRUNE_MARGEN_POR_PLY: i32 = -100;
             if !es_pv
                 && !en_jaque
                 && depth <= SEE_PRUNE_PROF_MAX
@@ -2491,7 +2497,7 @@ impl Searcher {
                         crate::see::see(b, mv),
                         "SEE cacheado desalineado con la jugada en idx={idx} (ver see_negamax)"
                     );
-                    see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth / 3
+                    see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth
                 }
             {
                 if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
