@@ -2542,13 +2542,25 @@ impl Searcher {
             let child_prev2 = prev;
             // ext puede valer -2, 0, +1 o +2 (ver ext_singular arriba). El
             // bloque singular solo corre con depth >= SE_PROF_MIN (8), asi que
-            // el peor caso es depth - 1 - 2 = depth - 3 >= 5: siempre positivo.
+            // el peor caso CON ext negativo es depth - 1 - 2 = depth - 3 >= 5.
+            //
+            // BUG CORREGIDO: la cota de esta assertion era `>= 1`, que es
+            // sencillamente falsa en el caso NORMAL (ext == 0). Un nodo con
+            // depth == 1 -- el mas comun de todo el arbol -- recurre con
+            // depth - 1 + 0 == 0, que es exactamente como se entra a la
+            // quiescence: correcto y esperado. La assertion hacia panic ahi.
+            // Como es un debug_assert no afecta al binario de release (queda
+            // compilada fuera), pero rompia 6 tests de `cargo test` en debug
+            // (bench_nps_depth12, smp_tt_generacion_compartida..., los tres de
+            // reproduccion_h5c5 y el microbench), dejando la suite en rojo.
+            // La cota real que se quiere vigilar es que ext negativo nunca
+            // lleve la profundidad hija por debajo de 0.
             let ext = if jugada_singular == Some(*mv) {
                 ext_singular
             } else {
                 0
             };
-            debug_assert!(depth - 1 + ext >= 1, "profundidad hija invalida tras ext");
+            debug_assert!(depth - 1 + ext >= 0, "profundidad hija invalida tras ext");
             // Para LMR usamos la profundidad de la posible re-búsqueda
             // completa, no la reducida: si falla alto no debe heredar una
             // evaluación clásica donde aún se requiere la NNUE.
