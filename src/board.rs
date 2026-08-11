@@ -458,11 +458,9 @@ impl Board {
     pub fn attack_map(&self, by_color: Color) -> Bitboard {
         let p = &self.pieces[by_color as usize];
         let mut map: Bitboard = EMPTY;
-        // Peones: mismas tablas precalculadas que is_square_attacked_by.
-        let mut pawns = p[PieceType::Pawn as usize];
-        while pawns != 0 {
-            map |= pawn_attacks(by_color, pop_lsb(&mut pawns));
-        }
+        // Peones: los ocho de golpe con dos desplazamientos en vez de un
+        // lookup por peon (mismo resultado exacto).
+        map |= crate::bitboard::pawn_attacks_set(by_color, p[PieceType::Pawn as usize]);
         let mut knights = p[PieceType::Knight as usize];
         while knights != 0 {
             map |= knight_attacks(pop_lsb(&mut knights));
