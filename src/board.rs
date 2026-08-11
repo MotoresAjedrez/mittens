@@ -26,6 +26,20 @@ pub struct Board {
     pub zobrist: u64,
 }
 
+/// Derechos de enroque que SOBREVIVEN cuando la casilla es origen o destino
+/// de una jugada. Solo las cuatro esquinas (torres) y e1/e8 (reyes) quitan
+/// algo; el resto deja los cuatro derechos intactos. Los derechos del rey se
+/// siguen quitando aparte en make_move (moving_pt == King), asi que aqui solo
+/// hacen falta las esquinas.
+const MASCARA_ENROQUE: [u8; 64] = {
+    let mut t = [0xFu8; 64];
+    t[0] = 0xF & !CASTLE_WQ; // a1
+    t[7] = 0xF & !CASTLE_WK; // h1
+    t[56] = 0xF & !CASTLE_BQ; // a8
+    t[63] = 0xF & !CASTLE_BK; // h8
+    t
+};
+
 impl Board {
     pub fn empty() -> Board {
         Board {
@@ -104,7 +118,7 @@ impl Board {
         self.ep_hash_file().is_some()
     }
 
-    fn recompute_zobrist(&mut self) {
+    pub(crate) fn recompute_zobrist(&mut self) {
         let k = keys();
         let mut z = 0u64;
         for c in 0..2 {
@@ -444,11 +458,9 @@ impl Board {
     pub fn attack_map(&self, by_color: Color) -> Bitboard {
         let p = &self.pieces[by_color as usize];
         let mut map: Bitboard = EMPTY;
-        // Peones: mismas tablas precalculadas que is_square_attacked_by.
-        let mut pawns = p[PieceType::Pawn as usize];
-        while pawns != 0 {
-            map |= pawn_attacks(by_color, pop_lsb(&mut pawns));
-        }
+        // Peones: los ocho de golpe con dos desplazamientos en vez de un
+        // lookup por peon (mismo resultado exacto).
+        map |= crate::bitboard::pawn_attacks_set(by_color, p[PieceType::Pawn as usize]);
         let mut knights = p[PieceType::Knight as usize];
         while knights != 0 {
             map |= knight_attacks(pop_lsb(&mut knights));
@@ -473,13 +485,27 @@ impl Board {
         self.is_square_attacked_by(self.king_square(color), color.opposite())
     }
 
+    /// Quita la pieza y mantiene AL DIA el estado derivado (occupied_co /
+    /// occupied). Antes make_move recalculaba los tres bitboards derivados
+    /// desde cero al final (recompute_derived: releer los 12 bitboards de tipo
+    /// y unirlos) aunque la jugada tocara como mucho 4 casillas. Actualizarlos
+    /// aqui es exacto -- una casilla solo cambia de ocupacion cuando pasa por
+    /// remove_piece/add_piece -- y elimina ese barrido por jugada.
+    #[inline(always)]
     fn remove_piece(&mut self, color: Color, pt: PieceType, sq: Square) {
-        self.pieces[color as usize][pt as usize] &= !bit(sq);
+        let b = bit(sq);
+        self.pieces[color as usize][pt as usize] &= !b;
+        self.occupied_co[color as usize] &= !b;
+        self.occupied &= !b;
         self.zobrist ^= keys().piece_square[color as usize][pt as usize][sq as usize];
     }
 
+    #[inline(always)]
     fn add_piece(&mut self, color: Color, pt: PieceType, sq: Square) {
-        self.pieces[color as usize][pt as usize] |= bit(sq);
+        let b = bit(sq);
+        self.pieces[color as usize][pt as usize] |= b;
+        self.occupied_co[color as usize] |= b;
+        self.occupied |= b;
         self.zobrist ^= keys().piece_square[color as usize][pt as usize][sq as usize];
     }
 
@@ -578,19 +604,11 @@ impl Board {
                 Color::Black => !(CASTLE_BK | CASTLE_BQ),
             };
         }
-        let touches = |sq: Square, cr: &mut u8| {
-            if sq == make_square(0, 0) {
-                *cr &= !CASTLE_WQ;
-            } else if sq == make_square(7, 0) {
-                *cr &= !CASTLE_WK;
-            } else if sq == make_square(0, 7) {
-                *cr &= !CASTLE_BQ;
-            } else if sq == make_square(7, 7) {
-                *cr &= !CASTLE_BK;
-            }
-        };
-        touches(mv.from, &mut new_cr);
-        touches(mv.to, &mut new_cr);
+        // Tabla en vez de la cadena de 4 comparaciones por casilla: cada
+        // casilla guarda los derechos que SOBREVIVEN si esa casilla es origen
+        // o destino de la jugada (solo a1/h1/a8/h8 quitan algo). Dos lecturas
+        // de tabla sustituyen hasta ocho comparaciones por jugada.
+        new_cr &= MASCARA_ENROQUE[mv.from as usize] & MASCARA_ENROQUE[mv.to as usize];
         if new_cr != old_cr {
             b.zobrist ^= k.castling[old_cr as usize];
             b.zobrist ^= k.castling[new_cr as usize];
@@ -603,7 +621,11 @@ impl Board {
         b.turn = them;
         b.zobrist ^= k.side_to_move;
 
-        b.recompute_derived();
+        // Sin recompute_derived: occupied/occupied_co ya vienen al dia desde
+        // remove_piece/add_piece.
+        debug_assert_eq!(b.occupied_co[0], b.pieces[0].iter().fold(0, |a, &x| a | x));
+        debug_assert_eq!(b.occupied_co[1], b.pieces[1].iter().fold(0, |a, &x| a | x));
+        debug_assert_eq!(b.occupied, b.occupied_co[0] | b.occupied_co[1]);
         if let Some(file) = b.ep_hash_file() {
             b.zobrist ^= k.en_passant_file[file];
         }

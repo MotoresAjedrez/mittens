@@ -183,6 +183,22 @@ pub fn pawn_attacks(color: crate::types::Color, sq: Square) -> Bitboard {
     tables().pawn_attacks[color as usize][sq as usize]
 }
 
+pub const FILE_A: Bitboard = 0x0101_0101_0101_0101;
+pub const FILE_H: Bitboard = 0x8080_8080_8080_8080;
+
+/// Ataques de peón de TODO un conjunto de peones a la vez, con dos
+/// desplazamientos en vez de un lookup por peón. Un peón blanco en `sq`
+/// ataca `sq+7` (columna-1) y `sq+9` (columna+1); enmascarar la columna a / h
+/// antes de desplazar evita el envolvimiento de columna. Idéntico bit a bit a
+/// unir `pawn_attacks(color, sq)` sobre cada peón (verificado en tests).
+#[inline(always)]
+pub fn pawn_attacks_set(color: crate::types::Color, pawns: Bitboard) -> Bitboard {
+    match color {
+        crate::types::Color::White => ((pawns & !FILE_A) << 7) | ((pawns & !FILE_H) << 9),
+        crate::types::Color::Black => ((pawns & !FILE_A) >> 9) | ((pawns & !FILE_H) >> 7),
+    }
+}
+
 /// Recorta un rayo precalculado justo después del primer bloqueo. Recibir la
 /// tabla por referencia evita consultar el OnceLock por cada dirección; los
 /// índices y el sentido son constantes en rook_attacks/bishop_attacks, así el
@@ -494,6 +510,35 @@ mod magic_tests {
                     "alfil sq={} occ={:#x}",
                     sq,
                     occ
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pawn_set_tests {
+    use super::*;
+    use crate::types::Color;
+
+    #[test]
+    fn pawn_attacks_set_equivale_al_bucle() {
+        let mut rng: u64 = 0xABCD_1234_5678_9EF0;
+        for _ in 0..20_000 {
+            // Peones solo en las filas 2..7 (nunca en 1 ni en 8).
+            let pawns = xorshift(&mut rng) & 0x00FF_FFFF_FFFF_FF00;
+            for color in [Color::White, Color::Black] {
+                let mut esperado = 0u64;
+                let mut bb = pawns;
+                while bb != 0 {
+                    esperado |= pawn_attacks(color, pop_lsb(&mut bb));
+                }
+                assert_eq!(
+                    pawn_attacks_set(color, pawns),
+                    esperado,
+                    "color={:?} pawns={:#x}",
+                    color,
+                    pawns
                 );
             }
         }

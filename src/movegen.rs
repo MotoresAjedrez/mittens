@@ -141,6 +141,18 @@ fn push_pawn_move(moves: &mut MoveList, from: Square, to: Square, is_promo: bool
 }
 
 fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
+    // Primero lo mas barato: si el bando ya perdio los dos derechos de
+    // enroque no hay NADA que generar. Antes se llamaba a in_check() -- un
+    // barrido completo de ataques al rey -- en cada nodo aunque los derechos
+    // estuvieran perdidos hacia veinte jugadas, que es el caso de casi todo
+    // el medio juego y todo el final.
+    let derechos = match us {
+        Color::White => CASTLE_WK | CASTLE_WQ,
+        Color::Black => CASTLE_BK | CASTLE_BQ,
+    };
+    if b.castling_rights & derechos == 0 {
+        return;
+    }
     // El enroque SIEMPRE es ilegal con el rey en jaque (regla FIDE): si el
     // rey esta en jaque, todos los chequeos de casillas atacadas de abajo son
     // trabajo desperdiciado -- las jugadas generadas se descartarian igual en
@@ -301,7 +313,13 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
         // evasiones, que incluyen bloqueos silenciosos), pero se deja
         // correcto por si se reutiliza en otro contexto.
         let mut moves = generate_pseudo_legal_captures(b);
-        moves.retain(|mv| camino_lento(mv));
+        moves.retain(|mv| {
+            if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
+                casilla_segura_para_rey(b, king_sq, mv.to, us)
+            } else {
+                camino_lento(mv)
+            }
+        });
         return moves;
     }
 
@@ -315,12 +333,58 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
     let mut moves = generate_pseudo_legal_captures(b);
     moves.retain(|mv| {
         if bit(mv.from) & pinned == 0 && mv.from != king_sq && mv.flag != MoveFlag::EnPassant {
-            true
+            return true;
+        }
+        if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
+            casilla_segura_para_rey(b, king_sq, mv.to, us)
         } else {
             camino_lento(mv)
         }
     });
     moves
+}
+
+/// ¿La casilla `to` es segura para el rey de `us` que actualmente está en
+/// `king_sq`? Equivalente EXACTO a `!b.make_move(mv).in_check(us)` para una
+/// jugada de rey (normal o de captura), pero sin copiar el tablero ni
+/// recalcular zobrist/derivados:
+///  - la ocupación se ajusta quitando al rey de su casilla y poniéndolo en
+///    `to` (imprescindible: si no se quita, el propio rey se tapa a sí mismo
+///    de un jaque deslizante y una huida por la línea del ataque parecería
+///    segura);
+///  - si `to` estaba ocupada por una pieza enemiga, esa pieza queda capturada
+///    y no puede defender la casilla, así que se excluye del conjunto de
+///    atacantes (el rey enemigo nunca puede estar en `to`, y un peón/caballo
+///    capturado tampoco defiende su propia casilla).
+///
+/// Vale igual estando en jaque o no: la única fuente de verdad es "¿`to` está
+/// atacada con el rey fuera del tablero?".
+#[inline]
+fn casilla_segura_para_rey(b: &Board, king_sq: Square, to: Square, us: Color) -> bool {
+    let them = us.opposite();
+    let p = &b.pieces[them as usize];
+    let sin_victima = !bit(to);
+    let occ = (b.occupied & !bit(king_sq)) | bit(to);
+
+    if pawn_attacks(us, to) & p[PieceType::Pawn as usize] & sin_victima != 0 {
+        return false;
+    }
+    if knight_attacks(to) & p[PieceType::Knight as usize] & sin_victima != 0 {
+        return false;
+    }
+    if king_attacks(to) & p[PieceType::King as usize] != 0 {
+        return false;
+    }
+    let alfil_dama =
+        (p[PieceType::Bishop as usize] | p[PieceType::Queen as usize]) & sin_victima;
+    if alfil_dama != 0 && bishop_attacks(to, occ) & alfil_dama != 0 {
+        return false;
+    }
+    let torre_dama = (p[PieceType::Rook as usize] | p[PieceType::Queen as usize]) & sin_victima;
+    if torre_dama != 0 && rook_attacks(to, occ) & torre_dama != 0 {
+        return false;
+    }
+    true
 }
 
 /// Filtra las jugadas pseudo-legales: descarta las que dejan al propio rey en jaque.
@@ -349,12 +413,21 @@ pub fn generate_legal(b: &Board) -> MoveList {
     };
 
     if b.in_check(us) {
-        // Evasion de jaque (posibles jaques dobles, bloqueos, etc.): el
-        // caso menos frecuente y mas delicado -- se deja el camino lento,
-        // siempre correcto, sin ganancia medible de nps (pocas jugadas
-        // pseudo-legales cuando el rey esta en jaque).
+        // Evasion de jaque (posibles jaques dobles, bloqueos, etc.). Las
+        // jugadas del REY -- que son la mayoria de las evasiones y las mas
+        // caras de legalizar por el camino lento -- se resuelven con el test
+        // directo de casilla segura; el resto (bloqueos y capturas del
+        // atacante) sigue por el camino lento, siempre correcto.
+        // gen_castling no produce nada estando en jaque, asi que aqui no hay
+        // enroques que considerar.
         let mut moves = generate_pseudo_legal(b);
-        moves.retain(|mv| camino_lento(mv));
+        moves.retain(|mv| {
+            if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
+                casilla_segura_para_rey(b, king_sq, mv.to, us)
+            } else {
+                camino_lento(mv)
+            }
+        });
         return moves;
     }
 
@@ -374,16 +447,90 @@ pub fn generate_legal(b: &Board) -> MoveList {
                 MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
             )
         {
-            // Pieza no clavada, no es el rey, no es al paso/enroque:
-            // siempre legal (el rey no esta en jaque en esta rama, y mover
-            // una pieza no clavada no puede exponerlo).
-            true
-        } else {
-            // Casos poco comunes: camino lento, siempre correcto.
-            camino_lento(mv)
+            // Camino comun (la gran mayoria de las jugadas): pieza no clavada,
+            // no es el rey, no es al paso/enroque -- siempre legal (el rey no
+            // esta en jaque en esta rama, y mover una pieza no clavada no
+            // puede exponerlo). Se deja PRIMERO y sin tocar: cualquier rama
+            // extra antes de este test se paga en todas las jugadas.
+            return true;
+        }
+        match mv.flag {
+            // gen_castling ya verifico TODAS las condiciones de legalidad del
+            // enroque (rey sin jaque, casillas de paso y destino no atacadas,
+            // camino libre, rey y torre en su sitio): volver a hacer
+            // make_move + in_check era trabajo puramente redundante.
+            MoveFlag::CastleKing | MoveFlag::CastleQueen => true,
+            // Al paso: puede destapar un jaque horizontal quitando DOS peones
+            // de la misma fila; no lo cubre el mapa de clavadas.
+            MoveFlag::EnPassant => camino_lento(mv),
+            _ if mv.from == king_sq => casilla_segura_para_rey(b, king_sq, mv.to, us),
+            _ => camino_lento(mv),
         }
     });
     moves
+}
+
+/// ¿Existe al menos UNA jugada legal? Equivalente a
+/// `!generate_legal(b).is_empty()` pero con salida temprana: no legaliza la
+/// lista completa ni la materializa.
+///
+/// Se usa para distinguir "posición tranquila" de "ahogado / mate" en las
+/// hojas de quiescence, donde antes se pagaba un `generate_legal` entero
+/// (generar TODAS las pseudo-legales y legalizarlas una por una) solo para
+/// mirar si la lista quedaba vacía. Se prueban primero las jugadas de rey,
+/// que son las más baratas de verificar y casi siempre resuelven el caso.
+pub fn existe_jugada_legal(b: &Board) -> bool {
+    use crate::bitboard::pinned_pieces;
+
+    let us = b.turn;
+    let them = us.opposite();
+    let king_sq = b.king_square(us);
+
+    let mut objetivos = king_attacks(king_sq) & !b.occupied_co[us as usize];
+    while objetivos != 0 {
+        let to = pop_lsb(&mut objetivos);
+        if casilla_segura_para_rey(b, king_sq, to, us) {
+            return true;
+        }
+    }
+
+    let en_jaque = b.in_check(us);
+    let pinned = if en_jaque {
+        EMPTY
+    } else {
+        let own = b.occupied_co[us as usize];
+        pinned_pieces(
+            king_sq,
+            own,
+            b.pieces[them as usize][PieceType::Rook as usize]
+                | b.pieces[them as usize][PieceType::Queen as usize],
+            b.pieces[them as usize][PieceType::Bishop as usize]
+                | b.pieces[them as usize][PieceType::Queen as usize],
+            b.occupied,
+        )
+    };
+
+    for mv in generate_pseudo_legal(b) {
+        if mv.from == king_sq {
+            // El enroque sale ya legalizado de gen_castling. (De hecho nunca
+            // puede ser la ÚNICA jugada legal: enrocar exige que la casilla
+            // intermedia f1/d1 esté vacía y no atacada, lo que hace legal
+            // también Rf1/Rd1, que el barrido de arriba ya habría aceptado.
+            // Se acepta aquí igual para no depender de ese razonamiento.)
+            if matches!(mv.flag, MoveFlag::CastleKing | MoveFlag::CastleQueen) {
+                return true;
+            }
+            // Las demás jugadas de rey ya se probaron en el barrido de arriba.
+            continue;
+        }
+        if !en_jaque && mv.flag != MoveFlag::EnPassant && bit(mv.from) & pinned == 0 {
+            return true;
+        }
+        if !b.make_move(&mv).in_check(us) {
+            return true;
+        }
+    }
+    false
 }
 
 /// ¿`mv` es una jugada LEGAL en `b`? Validador directo, sin generar la lista
