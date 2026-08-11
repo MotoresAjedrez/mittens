@@ -222,6 +222,23 @@ fn corrhist_update(entry: &mut i32, diff: i32, depth: i32) {
 /// Techo de las tablas de historia (mismo orden de magnitud que Stockfish).
 const MAX_HIST: i32 = 16384;
 
+/// Bonus/malus de historia por profundidad.
+///
+/// FIX DE ESCALA (sesion cand_busqueda_fable): antes era `depth * depth`
+/// (25 a profundidad 5, 100 a profundidad 10), una magnitud minuscula
+/// frente al techo MAX_HIST=16384 -- pero los CONSUMIDORES de estas tablas
+/// estan calibrados a escala Stockfish: la poda por historia exige
+/// `stat_score < -4000*depth` y el ajuste proporcional de LMR divide por
+/// 8000. Con bonus de 25-100 por corte las entradas casi nunca llegaban a
+/// esas magnitudes, asi que ambas tecnicas existian en el codigo pero casi
+/// NUNCA disparaban (muertas por escala). Formula estandar tipo Stockfish:
+/// lineal en depth con tope, para que unas decenas de cortes ya muevan una
+/// entrada al rango que los umbrales esperan.
+#[inline]
+fn hist_bonus(depth: i32) -> i32 {
+    (160 * depth - 100).clamp(20, 1600)
+}
+
 /// Actualizacion con GRAVEDAD de una tabla de historia, mismo patron que
 /// `corrhist_update`: el bonus se amortigua a medida que la entrada se aleja
 /// de cero, asi la tabla se satura suavemente en vez de crecer sin limite.
@@ -1059,7 +1076,7 @@ impl Searcher {
             // dando SEE, esto solo afina entre capturas de valor parecido.
             hist_update(
                 &mut self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, &mv))],
-                depth * depth,
+                hist_bonus(depth),
             );
             return; // no tocan killers/history/counter/cont (son para quiets)
         }
@@ -1074,19 +1091,19 @@ impl Searcher {
         if casilla_amenazada(b, mv.to) {
             hist_update(
                 &mut self.history_amenaza[mv.from as usize][mv.to as usize],
-                depth * depth,
+                hist_bonus(depth),
             );
         } else {
-            hist_update(&mut self.history[mv.from as usize][mv.to as usize], depth * depth);
+            hist_update(&mut self.history[mv.from as usize][mv.to as usize], hist_bonus(depth));
         }
         if let Some((prev_pt, prev_to)) = prev {
             let idx = cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize);
-            hist_update(&mut self.cont_history[idx], depth * depth);
+            hist_update(&mut self.cont_history[idx], hist_bonus(depth));
             self.counter_moves[prev_pt * 64 + prev_to] = Some(mv);
         }
         if let Some((p2_pt, p2_to)) = prev2 {
             let idx = cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize);
-            hist_update(&mut self.cont_history_2[idx], depth * depth);
+            hist_update(&mut self.cont_history_2[idx], hist_bonus(depth));
         }
     }
 
@@ -1313,7 +1330,13 @@ impl Searcher {
             }
             None => 0,
         };
-        -(h + ch + ch2)
+        // Escalado /16: con el fix de escala de hist_bonus las tablas ahora
+        // se mueven de verdad en el rango +-16384, y la suma cruda (hasta
+        // +-49k) invadiria los carriles de capturas buenas (-10k..-17k) y
+        // killers (-3000). Dividida por 16 queda acotada a ~+-3072, ordenando
+        // los quiets entre si con buena granularidad sin sacar a ninguno de
+        // su carril salvo casos extremos.
+        -((h + ch + ch2) / 16)
     }
 
     /// Igual que order_moves pero ademas usa killers/history (por ply) para
@@ -2704,7 +2727,7 @@ impl Searcher {
                 // una captura o una quiet), porque las capturas buscadas antes
                 // sin exito fallaron igual en ambos casos.
                 {
-                    let malus = depth * depth;
+                    let malus = hist_bonus(depth);
                     let pt_cortante = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let cortante = if mv.is_capture() {
                         Some((pt_cortante as u8, mv.to, victima_de(b, mv) as u8))
@@ -2722,7 +2745,7 @@ impl Searcher {
                     }
                 }
                 if !mv.is_capture() && mv.promotion.is_none() {
-                    let malus = depth * depth;
+                    let malus = hist_bonus(depth);
                     for &(qf, qt, amenazada) in &quiets_buscados[..n_quiets_buscados] {
                         if (qf, qt) != (mv.from, mv.to) {
                             if amenazada {
