@@ -31,6 +31,36 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 use types::{Move, MoveFlag, PieceType};
 
+/// Factor por el que la evaluacion INTERNA supera la escala estandar de UCI,
+/// en la que 100 cp = un peon. Medido contra Stockfish 18 sobre 16 posiciones
+/// a 1.5s/posicion, filtrando al rango donde la eval sigue siendo lineal
+/// (|eval| entre 30 y 700 cp): el ratio mediano mittens/stockfish es 1.56, y
+/// sube hacia ~1.9 en posiciones ya muy ganadas. Se toma 1.6 porque cuadra el
+/// rango normal, que es donde de verdad se leen las evaluaciones; las
+/// ventajas decisivas seguiran reportandose algo altas.
+///
+/// El origen de la inflacion es que `evaluate_with_state` suma la clasica
+/// COMPLETA y la red bullet COMPLETA (ambas evaluan la posicion entera), asi
+/// que el material se cuenta dos veces. Eso NO es un bug de fuerza: medido,
+/// el modo "red pura" busca ~1.4 plies menos hondo a 3s y un h2h previo lo
+/// dio peor (55.0% contra 63.3%). Los margenes de poda se afinaron dentro de
+/// esta escala y son consistentes con ella.
+///
+/// Por eso este ajuste es SOLO de presentacion: se aplica al imprimir y a
+/// nada mas. La busqueda, los margenes y las ventanas de aspiracion siguen
+/// trabajando en la escala interna intacta, asi que no puede mover un Elo.
+/// Se desactiva con MIMOTOR_ESCALA_UCI=1.0.
+fn escala_uci() -> f64 {
+    static CACHE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MIMOTOR_ESCALA_UCI")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.1..=10.0).contains(v))
+            .unwrap_or(1.6)
+    })
+}
+
 /// Formatea el score para el campo "info score" del protocolo UCI: cerca del
 /// limite de mate (search::MATE) se reporta como "mate N" (N = jugadas hasta
 /// el mate, negativo si el que mueve va a ser matado), como exige el estandar
@@ -45,7 +75,9 @@ fn formatear_score_uci(score: i32) -> String {
         let plies = search::MATE + score;
         format!("mate -{}", (plies + 1) / 2)
     } else {
-        format!("cp {}", score)
+        // Normalizado a "100 = un peon" (ver escala_uci). La rama de mate no
+        // se toca: "mate N" cuenta jugadas, no centipeones.
+        format!("cp {}", (score as f64 / escala_uci()).round() as i32)
     }
 }
 
