@@ -204,6 +204,9 @@ fn run_smp_bench(movetime_ms: u64) {
     for n in [1usize, 2, 4, 6, 8] {
         let (tt, tt_mask) = search::construir_tt(64);
         let generacion = AtomicU8::new(0);
+        // Bench de una sola medicion por config: pool nuevo cada vez, que es
+        // justo lo que se quiere aca (arrancar sin history heredado).
+        let mut pool = search::PoolMemoriaSMP::nuevo();
         let t0 = Instant::now();
         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
             &b,
@@ -219,6 +222,7 @@ fn run_smp_bench(movetime_ms: u64) {
             &[],
             Arc::new(AtomicBool::new(false)),
             None,
+            &mut pool,
         );
         let dt = t0.elapsed();
         let nps = nodos as f64 / dt.as_secs_f64().max(0.0001);
@@ -960,11 +964,12 @@ fn run_see_tests() {
 /// Handle de una busqueda corriendo en su propio hilo (spawneada al recibir
 /// "go") + la bandera compartida para pedirle que pare ("stop"). El hilo
 /// devuelve el Searcher de un solo hilo si lo tomo prestado (para
-/// recuperarlo y seguir usandolo en la siguiente jugada), o None si la
-/// busqueda fue Lazy SMP (esos Searchers son desechables, no hay uno
-/// persistente que recuperar -- solo la TT compartida, que vive aparte).
+/// recuperarlo y seguir usandolo en la siguiente jugada), o el pool de
+/// memorias si la busqueda fue Lazy SMP (los Searchers de los hilos son
+/// desechables, pero sus tablas de history NO: viajan al hilo y vuelven aca
+/// para la jugada siguiente -- ver PoolMemoriaSMP).
 struct BusquedaActiva {
-    handle: std::thread::JoinHandle<Option<Searcher>>,
+    handle: std::thread::JoinHandle<(Option<Searcher>, Option<search::PoolMemoriaSMP>)>,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -975,11 +980,20 @@ struct BusquedaActiva {
 /// "isready" -- un GUI que cumple el protocolo siempre manda "stop" antes de
 /// "position"/"go"/"ucinewgame" nuevos, pero esto evita un panic si alguno
 /// no lo hace.
-fn detener_y_recuperar(activa: &mut Option<BusquedaActiva>, searcher_slot: &mut Option<Searcher>) {
+fn detener_y_recuperar(
+    activa: &mut Option<BusquedaActiva>,
+    searcher_slot: &mut Option<Searcher>,
+    pool_slot: &mut Option<search::PoolMemoriaSMP>,
+) {
     if let Some(a) = activa.take() {
         a.stop_flag.store(true, Ordering::Relaxed);
-        if let Ok(Some(s)) = a.handle.join() {
-            *searcher_slot = Some(s);
+        if let Ok((s, pool)) = a.handle.join() {
+            if let Some(s) = s {
+                *searcher_slot = Some(s);
+            }
+            if let Some(pool) = pool {
+                *pool_slot = Some(pool);
+            }
         }
     }
 }
@@ -1130,6 +1144,10 @@ pub fn uci_loop() {
         .as_mut()
         .expect("searcher inicial")
         .set_nnue_classical_depth(nnue_classical_depth);
+    // Memoria de history/continuation/corrhist por hilo de Lazy SMP, que
+    // persiste entre jugadas de la misma partida igual que smp_tt. Antes cada
+    // "go" con Threads>1 creaba Searchers nuevos y perdia todo lo aprendido.
+    let mut pool_slot: Option<search::PoolMemoriaSMP> = Some(search::PoolMemoriaSMP::nuevo());
     let mut activa: Option<BusquedaActiva> = None;
 
     for line in stdin.lock().lines() {
@@ -1146,7 +1164,7 @@ pub fn uci_loop() {
         // "stop" se maneja aparte. Todo lo demas primero se asegura de que no
         // haya una busqueda activa antes de tocar board/searcher.
         if partes[0] == "stop" {
-            detener_y_recuperar(&mut activa, &mut searcher_slot);
+            detener_y_recuperar(&mut activa, &mut searcher_slot, &mut pool_slot);
             continue;
         }
         // "isready" NO debe interrumpir la busqueda. El texto del protocolo
@@ -1169,7 +1187,7 @@ pub fn uci_loop() {
             io::stdout().flush().ok();
             continue;
         }
-        detener_y_recuperar(&mut activa, &mut searcher_slot);
+        detener_y_recuperar(&mut activa, &mut searcher_slot, &mut pool_slot);
 
         match partes[0] {
             "uci" => {
@@ -1318,6 +1336,12 @@ pub fn uci_loop() {
                     // Liberar la tabla anterior antes de reservar la nueva:
                     // evita un pico de dos tablas completas durante Hash.
                     drop(searcher_slot.take());
+                    // El corrhist guarda correcciones de la evaluacion ACTIVA:
+                    // si cambia la evaluacion (personalidad/NNUE) queda tan
+                    // obsoleto como los scores de la TT, asi que se tira con ella.
+                    if let Some(p) = pool_slot.as_mut() {
+                        p.limpiar();
+                    }
                     let old_tt = std::mem::replace(&mut smp_tt, Arc::new(Vec::new()));
                     drop(old_tt);
                     // TT nueva => contador de aging desde cero.
@@ -1352,6 +1376,13 @@ pub fn uci_loop() {
                 board = Board::from_fen(STARTPOS).unwrap();
                 game_history.clear();
                 drop(searcher_slot.take());
+                // Partida nueva => el history aprendido en la anterior no
+                // aplica, igual que se tira la TT unas lineas mas abajo.
+                if let Some(p) = pool_slot.as_mut() {
+                    p.limpiar();
+                } else {
+                    pool_slot = Some(search::PoolMemoriaSMP::nuevo());
+                }
                 let old_tt = std::mem::replace(&mut smp_tt, Arc::new(Vec::new()));
                 drop(old_tt);
                 // TT nueva => contador de aging desde cero.
@@ -1465,7 +1496,7 @@ pub fn uci_loop() {
                             mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
                         );
                         io::stdout().flush().ok();
-                        Some(s)
+                        (Some(s), None)
                     });
                     activa = Some(BusquedaActiva { handle, stop_flag });
                     continue;
@@ -1623,6 +1654,11 @@ pub fn uci_loop() {
                                 &hist_copy,
                                 Arc::new(AtomicBool::new(false)),
                                 Some(candidatas),
+                                // Si un hilo de busqueda anterior murio y no
+                                // devolvio el pool, se arranca uno nuevo en vez
+                                // de tirar el motor: perder el history es
+                                // recuperable, un panic en medio de una partida no.
+                                pool_slot.get_or_insert_with(search::PoolMemoriaSMP::nuevo),
                             );
                             let prof = resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
                             // La TT compartida ya tiene el resultado: se
@@ -1716,6 +1752,10 @@ pub fn uci_loop() {
                     let generacion = Arc::clone(&smp_generacion);
                     let flag = Arc::clone(&stop_flag);
                     let filtro = searchmoves_filtro.clone();
+                    // El pool viaja al hilo de busqueda y vuelve por el join
+                    // (ver detener_y_recuperar), igual que el Searcher del
+                    // camino de un hilo: propiedad exclusiva, sin locks.
+                    let mut pool = pool_slot.take().unwrap_or_else(search::PoolMemoriaSMP::nuevo);
                     let handle = std::thread::spawn(move || {
                         let t0 = std::time::Instant::now();
                         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
@@ -1732,6 +1772,7 @@ pub fn uci_loop() {
                             &hist_copy,
                             flag,
                             filtro,
+                            &mut pool,
                         );
                         let profundidad =
                             resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
@@ -1756,7 +1797,7 @@ pub fn uci_loop() {
                             mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
                         );
                         io::stdout().flush().ok();
-                        None
+                        (None, Some(pool))
                     });
                     activa = Some(BusquedaActiva { handle, stop_flag });
                 } else {
@@ -1780,7 +1821,7 @@ pub fn uci_loop() {
                             mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
                         );
                         io::stdout().flush().ok();
-                        Some(s)
+                        (Some(s), None)
                     });
                     activa = Some(BusquedaActiva { handle, stop_flag });
                 }
@@ -1792,12 +1833,12 @@ pub fn uci_loop() {
                 // que herramientas de testeo (Cutechess, OpenBench, scripts
                 // de CCRL) a veces mandan directo por stdin en vez de
                 // relanzar el proceso con un argumento.
-                detener_y_recuperar(&mut activa, &mut searcher_slot);
+                detener_y_recuperar(&mut activa, &mut searcher_slot, &mut pool_slot);
                 let depth: i32 = partes.get(1).and_then(|s| s.parse().ok()).unwrap_or(13);
                 run_bench(depth);
             }
             "quit" => {
-                detener_y_recuperar(&mut activa, &mut searcher_slot);
+                detener_y_recuperar(&mut activa, &mut searcher_slot, &mut pool_slot);
                 break;
             }
             _ => {}

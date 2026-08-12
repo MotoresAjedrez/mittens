@@ -494,6 +494,34 @@ fn tt_empaquetar(entry: &TTEntry, key: u64, generation: u8) -> u64 {
     mv | (score << 18) | (depth << 34) | (flag << 41) | (generacion << 43) | TT_OCUPADO | (verif << 49)
 }
 
+/// Datos del OCUPANTE de un casillero de la TT compartida que necesita la
+/// regla de reemplazo, decodificados SIN exigir que la clave coincida.
+///
+/// `tt_desempaquetar` devuelve None cuando los bits de verificacion no
+/// coinciden (es lo correcto para LEER: esa entrada es de otra posicion).
+/// Pero para DECIDIR EL REEMPLAZO hace falta saber que hay en el casillero
+/// aunque sea de otra posicion -- si no, toda colision de clave parece un
+/// casillero vacio y se pisa siempre, que es justo lo contrario de la
+/// politica documentada en `tt_store`.
+struct OcupanteTT {
+    depth: i32,
+    flag: TTFlag,
+    generation: u8,
+    misma_clave: bool,
+}
+
+fn tt_ocupante(paquete: u64, key: u64) -> Option<OcupanteTT> {
+    if paquete & TT_OCUPADO == 0 {
+        return None;
+    }
+    Some(OcupanteTT {
+        depth: ((paquete >> 34) & 0x7F) as i32,
+        flag: tt_flag_desde_u64((paquete >> 41) & 0x3),
+        generation: ((paquete >> 43) & 0x1F) as u8,
+        misma_clave: ((paquete >> 49) & 0x7FFF) == ((key >> (64 - 15)) & 0x7FFF),
+    })
+}
+
 fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
     if paquete & TT_OCUPADO == 0 {
         return None;
@@ -770,6 +798,54 @@ impl Searcher {
             external_stop: None,
             blindar_stop: false,
         }
+    }
+
+    /// Se lleva las tablas que acumulan entre jugadas (ver TablasPersistentes).
+    /// CONSUME el Searcher: se usa justo antes de tirarlo al final de un hilo
+    /// de Lazy SMP, de modo que no puede quedar un Searcher a medio vaciar.
+    pub fn extraer_memoria(self) -> MemoriaHilo {
+        MemoriaHilo(Some(TablasPersistentes {
+            history: self.history,
+            history_amenaza: self.history_amenaza,
+            cont_history: self.cont_history,
+            cont_history_2: self.cont_history_2,
+            capture_history: self.capture_history,
+            counter_moves: self.counter_moves,
+            corr_pawn: self.corr_pawn,
+            corr_nonpawn: self.corr_nonpawn,
+            corr_cont: self.corr_cont,
+        }))
+    }
+
+    /// Reinstala tablas guardadas de una jugada anterior de ESTE mismo hilo.
+    /// Si algun tamaño no coincide con el que espera este binario (no deberia
+    /// pasar: son constantes de compilacion) se ignora la memoria entera y el
+    /// Searcher se queda con sus tablas en cero, que siempre es correcto.
+    pub fn instalar_memoria(&mut self, m: MemoriaHilo) {
+        let t = match m.0 {
+            Some(t) => t,
+            None => return,
+        };
+        let compatible = t.cont_history.len() == self.cont_history.len()
+            && t.cont_history_2.len() == self.cont_history_2.len()
+            && t.capture_history.len() == self.capture_history.len()
+            && t.counter_moves.len() == self.counter_moves.len()
+            && t.corr_pawn.len() == self.corr_pawn.len()
+            && t.corr_nonpawn[0].len() == self.corr_nonpawn[0].len()
+            && t.corr_nonpawn[1].len() == self.corr_nonpawn[1].len()
+            && t.corr_cont.len() == self.corr_cont.len();
+        if !compatible {
+            return;
+        }
+        self.history = t.history;
+        self.history_amenaza = t.history_amenaza;
+        self.cont_history = t.cont_history;
+        self.cont_history_2 = t.cont_history_2;
+        self.capture_history = t.capture_history;
+        self.counter_moves = t.counter_moves;
+        self.corr_pawn = t.corr_pawn;
+        self.corr_nonpawn = t.corr_nonpawn;
+        self.corr_cont = t.corr_cont;
     }
 
     /// Crea un Searcher que comparte la TT (Arc clonado, mismo mask) de otro
@@ -1203,13 +1279,22 @@ impl Searcher {
         // colision de otra clave se trata igual que una de la MISMA clave:
         // solo reemplaza si es al menos tan profunda (o si la entrada previa
         // es de una generacion vieja, que siempre se descarta).
-        let reemplazar = |slot: Option<TTEntry>| match slot {
+        //
+        // OJO (bug corregido): esta regla se evaluaba sobre el resultado de
+        // `tt_desempaquetar`, que devuelve None cuando los bits de
+        // verificacion NO coinciden. Es decir: en la TT COMPARTIDA -- la
+        // unica que se usa en produccion -- toda colision de otra clave
+        // parecia un casillero VACIO y se pisaba siempre, sin mirar la
+        // profundidad. La politica descrita arriba solo estaba viva en la TT
+        // Local (un solo hilo, camino de tests). Ahora el ocupante se decodifica
+        // con `tt_ocupante`, que no exige que la clave coincida.
+        let reemplazar = |slot: Option<OcupanteTT>| match slot {
             None => true,
             Some(existing) if existing.generation != generacion => true,
             Some(existing) => {
                 depth > existing.depth
                     || (depth == existing.depth
-                        && (existing.key != key
+                        && (!existing.misma_clave
                             || (flag == TTFlag::Exact && existing.flag != TTFlag::Exact)))
             }
         };
@@ -1224,7 +1309,13 @@ impl Searcher {
         let idx = self.tt_index(key);
         match &mut self.tt {
             TablaTransposicion::Local(tt) => {
-                if reemplazar(tt[idx]) {
+                let ocupante = tt[idx].map(|e| OcupanteTT {
+                    depth: e.depth,
+                    flag: e.flag,
+                    generation: e.generation,
+                    misma_clave: e.key == key,
+                });
+                if reemplazar(ocupante) {
                     tt[idx] = Some(entry);
                 }
             }
@@ -1236,7 +1327,7 @@ impl Searcher {
                 // completa al leer, asi que un casillero mal reemplazado
                 // simplemente se descarta despues como si fuera una
                 // colision de otra posicion, igual que cualquier TT normal.
-                let actual = tt_desempaquetar(tt[idx].load(Ordering::Relaxed), key);
+                let actual = tt_ocupante(tt[idx].load(Ordering::Relaxed), key);
                 if reemplazar(actual) {
                     tt[idx].store(tt_empaquetar(&entry, key, generacion), Ordering::Relaxed);
                 }
@@ -3472,6 +3563,108 @@ pub struct ResultadoHilo {
     pub nodos: u64,
 }
 
+/// Tablas de un Searcher que, por diseño, ACUMULAN informacion entre jugadas
+/// de la misma partida (a diferencia de killers, que solo valen dentro del
+/// arbol de una busqueda). Ver el comentario de `Searcher::history`: "history
+/// SI persiste entre jugadas de la partida, igual que la TT".
+///
+/// Con un solo hilo eso ya ocurria: el loop UCI guarda el Searcher en
+/// `searcher_slot` y lo reutiliza en cada "go". Con Lazy SMP no: cada llamada
+/// a `buscar_lazy_smp` creaba Searchers nuevos y los tiraba al terminar, asi
+/// que con Threads>1 el history/continuation/corrhist arrancaba EN CERO en
+/// cada jugada de la partida. Este tipo es el vehiculo para sacar esas tablas
+/// del Searcher del hilo antes de tirarlo y volver a meterlas en el Searcher
+/// del mismo indice de hilo en la jugada siguiente.
+///
+/// No contiene nada dependiente de la posicion, del reloj ni de la TT, asi
+/// que reinstalarlo nunca puede producir una busqueda invalida: en el peor
+/// caso el ordenamiento de jugadas arranca con estadisticas de la jugada
+/// anterior, que es exactamente el objetivo.
+pub struct TablasPersistentes {
+    history: Box<[[i32; 64]; 64]>,
+    history_amenaza: Box<[[i32; 64]; 64]>,
+    cont_history: Vec<i32>,
+    cont_history_2: Vec<i32>,
+    capture_history: Vec<i32>,
+    counter_moves: Vec<Option<Move>>,
+    corr_pawn: Vec<i32>,
+    corr_nonpawn: [Vec<i32>; 2],
+    corr_cont: Vec<i32>,
+}
+
+/// Memoria persistente de UN hilo de Lazy SMP entre llamadas a "go".
+/// `None` = todavia no hay nada guardado (primera jugada de la partida, o
+/// recien limpiado por "ucinewgame"): el hilo arranca con las tablas en cero
+/// que ya trae un Searcher recien creado.
+#[derive(Default)]
+pub struct MemoriaHilo(Option<TablasPersistentes>);
+
+/// Conjunto de memorias, una por indice de hilo de Lazy SMP.
+///
+/// PROPIEDAD EXCLUSIVA, SIN LOCKS: el pool vive en el loop UCI; en cada "go"
+/// cada `MemoriaHilo` se SACA del pool (mem::take) y se MUEVE al hilo que le
+/// corresponde, que la devuelve al terminar junto con su resultado. Mientras
+/// la busqueda corre, cada memoria tiene un unico dueño (su hilo) y el pool
+/// queda con huecos vacios, asi que no hay dos hilos que puedan tocar la
+/// misma tabla ni hace falta Mutex alguno.
+#[derive(Default)]
+pub struct PoolMemoriaSMP {
+    hilos: Vec<MemoriaHilo>,
+}
+
+impl PoolMemoriaSMP {
+    pub fn nuevo() -> PoolMemoriaSMP {
+        PoolMemoriaSMP { hilos: Vec::new() }
+    }
+
+    /// Olvida todo lo aprendido. Se llama en "ucinewgame": el history de una
+    /// partida no debe contaminar la siguiente.
+    pub fn limpiar(&mut self) {
+        self.hilos.clear();
+    }
+
+    /// Asegura que haya una ranura por hilo. Subir Threads con setoption crea
+    /// ranuras vacias (los hilos nuevos arrancan de cero, como siempre);
+    /// bajarlo deja las de mas sin usar, y si se vuelve a subir se reencuentran
+    /// con su historial -- en ningun caso se comparte una ranura entre hilos.
+    fn reservar(&mut self, n: usize) {
+        while self.hilos.len() < n {
+            self.hilos.push(MemoriaHilo::default());
+        }
+    }
+
+    fn tomar(&mut self, i: usize) -> MemoriaHilo {
+        std::mem::take(&mut self.hilos[i])
+    }
+
+    fn devolver(&mut self, i: usize, m: MemoriaHilo) {
+        if i < self.hilos.len() {
+            self.hilos[i] = m;
+        }
+    }
+
+    /// Solo para tests: cuantas ranuras tienen algo guardado.
+    pub fn ranuras_con_datos(&self) -> usize {
+        self.hilos.iter().filter(|m| m.0.is_some()).count()
+    }
+
+    /// Solo para tests: magnitud total del history guardado en todas las
+    /// ranuras. Cero significa "no se aprendio nada" (o se limpio).
+    pub fn magnitud_history(&self) -> i64 {
+        self.hilos
+            .iter()
+            .filter_map(|m| m.0.as_ref())
+            .map(|t| {
+                t.history
+                    .iter()
+                    .flat_map(|f| f.iter())
+                    .map(|v| (*v as i64).abs())
+                    .sum::<i64>()
+            })
+            .sum()
+    }
+}
+
 /// Busca `b` con `n_hilos` hilos nativos compartiendo TT, con el mismo
 /// presupuesto de reloj que una busqueda de un solo hilo (el paralelismo es
 /// para ver MAS nodos en el mismo tiempo, no para tardar mas). Variacion
@@ -3500,6 +3693,7 @@ pub fn buscar_lazy_smp(
     game_history: &[u64],
     external_stop: Arc<AtomicBool>,
     root_moves_filtro: Option<Vec<Move>>,
+    pool: &mut PoolMemoriaSMP,
 ) -> (Option<Move>, i32, u64, Vec<ResultadoHilo>) {
     // Aging compartido de la TT (ver set_tt_generacion): el contador vive en
     // el llamador (junto a smp_tt, que persiste entre jugadas) y avanza UNA
@@ -3508,8 +3702,11 @@ pub fn buscar_lazy_smp(
     // DISTINTA a la de jugadas anteriores y la regla de reemplazo de tt_store
     // puede expulsarlas de inmediato (aging vivo en Lazy SMP).
     let generacion = generacion_compartida.fetch_add(1, Ordering::Relaxed) & 0x1F;
+    // Una ranura de memoria persistente por hilo (ver PoolMemoriaSMP).
+    pool.reservar(n_hilos.max(1));
     if n_hilos <= 1 {
         let mut s = Searcher::new_con_tt_compartida(Arc::clone(tt), tt_mask, modo_lmr);
+        s.instalar_memoria(pool.tomar(0));
         s.set_tt_generacion(generacion);
         s.set_qsearch_nnue(qsearch_nnue);
         s.set_nnue_classical_depth(nnue_classical_depth);
@@ -3518,6 +3715,7 @@ pub fn buscar_lazy_smp(
         s.root_moves_filtro = root_moves_filtro;
         let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _, _| {});
         let nodos = s.nodes;
+        pool.devolver(0, s.extraer_memoria());
         return (
             mv,
             sc,
@@ -3539,8 +3737,12 @@ pub fn buscar_lazy_smp(
             let tt = Arc::clone(tt);
             let game_history = game_history.to_vec();
             let root_moves_filtro = root_moves_filtro.clone();
+            // La memoria del hilo i se MUEVE dentro de su hilo y vuelve con su
+            // resultado: durante la busqueda tiene un unico dueño, sin locks.
+            let memoria = pool.tomar(i);
             std::thread::spawn(move || {
                 let mut s = Searcher::new_con_tt_compartida(tt, tt_mask, modo_lmr);
+                s.instalar_memoria(memoria);
                 s.set_tt_generacion(generacion);
                 s.set_qsearch_nnue(qsearch_nnue);
                 s.set_nnue_classical_depth(nnue_classical_depth);
@@ -3555,19 +3757,28 @@ pub fn buscar_lazy_smp(
                 s.set_game_history(game_history);
                 let (mv, sc, prof) =
                     s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _, _| {});
-                ResultadoHilo {
-                    mv,
-                    score: sc,
-                    profundidad: prof,
-                    nodos: s.nodes,
-                }
+                let nodos = s.nodes;
+                (
+                    ResultadoHilo {
+                        mv,
+                        score: sc,
+                        profundidad: prof,
+                        nodos,
+                    },
+                    s.extraer_memoria(),
+                )
             })
         })
         .collect();
 
     let resultados: Vec<ResultadoHilo> = handles
         .into_iter()
-        .map(|h| h.join().expect("hilo de busqueda con panic"))
+        .enumerate()
+        .map(|(i, h)| {
+            let (r, memoria) = h.join().expect("hilo de busqueda con panic");
+            pool.devolver(i, memoria);
+            r
+        })
         .collect();
 
     let nodos_totales: u64 = resultados.iter().map(|r| r.nodos).sum();
@@ -3718,6 +3929,33 @@ mod regression_tests {
         assert_eq!(tt_desempaquetar_move(tt_empaquetar_move(None)), None);
     }
 
+    // La politica de reemplazo documentada en tt_store ("una colision de otra
+    // clave se trata igual que una de la MISMA clave: solo reemplaza si es al
+    // menos tan profunda") debe valer en LAS DOS tablas. Este test la exige
+    // en la COMPARTIDA, que es la unica que se usa en produccion (main.rs y
+    // lib.rs siempre construyen construir_tt()).
+    #[test]
+    fn tt_compartida_colision_menos_profunda_no_pisa() {
+        let (tt, mask) = construir_tt(1);
+        let mut s = Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, true);
+        // Misma posicion en la tabla, bits de verificacion (49..64) distintos.
+        let k1 = (0x1234u64 & mask as u64) | (0x1111u64 << 49);
+        let k2 = (0x1234u64 & mask as u64) | (0xABCDu64 << 49);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        // Menos profunda (tipica escritura de quiescence, depth=0): NO debe
+        // desalojar la entrada profunda de negamax.
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        assert_eq!(
+            s.tt_probe(k1).map(|e| e.depth),
+            Some(12),
+            "una colision menos profunda desalojo la entrada profunda"
+        );
+        // Al menos tan profunda: SI debe pisar.
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
+        assert!(s.tt_probe(k1).is_none());
+    }
+
     #[test]
     fn tt_colision_de_otra_clave_se_reemplaza() {
         // Una colision de OTRA clave solo pisa si es al menos tan profunda:
@@ -3776,9 +4014,14 @@ mod regression_tests {
         let k1 = 0x1234u64;
         let k2 = (k1 & mask as u64) | (0xABCDu64 << 49);
         s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        // Igual que en la TT Local: una colision MENOS profunda no desaloja
+        // (antes si lo hacia, ver tt_ocupante); una al menos tan profunda si.
         s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
+        assert!(s.tt_probe(k2).is_none());
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
         assert!(s.tt_probe(k1).is_none());
-        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(1));
+        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
 
     #[test]
@@ -3879,6 +4122,9 @@ mod regression_tests {
             gens
         };
 
+        // Un solo pool para las dos llamadas, como en el loop UCI real.
+        let mut pool = PoolMemoriaSMP::nuevo();
+
         // Llamada 1 (2 hilos): todos los Searchers siembran generacion 0 y
         // search_time la sube a 1 -- las entradas nuevas llevan generacion 1.
         buscar_lazy_smp(
@@ -3895,6 +4141,7 @@ mod regression_tests {
             &[],
             Arc::clone(&stop),
             None,
+            &mut pool,
         );
         let g1 = generaciones_presentes(&tt);
         assert!(
@@ -3919,6 +4166,7 @@ mod regression_tests {
             &[],
             Arc::clone(&stop),
             None,
+            &mut pool,
         );
         let g2 = generaciones_presentes(&tt);
         assert!(
@@ -3929,6 +4177,103 @@ mod regression_tests {
         assert!(
             !g1.contains(&2),
             "la generacion 2 no debe existir tras la primera llamada"
+        );
+    }
+
+    /// BUG: con Threads>1, `buscar_lazy_smp` creaba Searchers nuevos en cada
+    /// "go" y los tiraba al terminar, asi que el history/continuation/corrhist
+    /// arrancaba EN CERO en cada jugada de la partida -- justo lo contrario de
+    /// lo documentado en el campo `history` ("SI persiste entre jugadas de la
+    /// partida") y de lo que ya hacia el camino de un solo hilo, que reutiliza
+    /// el Searcher guardado en `searcher_slot`.
+    ///
+    /// Antes del arreglo el pool no existia; con el arreglo, tras un "go" cada
+    /// hilo deja su memoria en su ranura y la siguiente llamada la reinstala.
+    #[test]
+    fn lazy_smp_el_history_sobrevive_entre_llamadas_a_go() {
+        let b = Board::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 1")
+            .unwrap();
+        let (tt, mask) = construir_tt(16);
+        let generacion = AtomicU8::new(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pool = PoolMemoriaSMP::nuevo();
+
+        assert_eq!(
+            pool.ranuras_con_datos(),
+            0,
+            "un pool nuevo no tiene nada guardado"
+        );
+
+        let mut buscar = |pool: &mut PoolMemoriaSMP| {
+            buscar_lazy_smp(
+                &b,
+                Some(60),
+                6,
+                2,
+                &tt,
+                &generacion,
+                mask,
+                true,
+                true,
+                0,
+                &[],
+                Arc::clone(&stop),
+                None,
+                pool,
+            );
+        };
+
+        buscar(&mut pool);
+        assert_eq!(
+            pool.ranuras_con_datos(),
+            2,
+            "tras un go con 2 hilos, cada hilo debe haber devuelto su memoria"
+        );
+        let tras_primera = pool.magnitud_history();
+        assert!(
+            tras_primera > 0,
+            "la busqueda debe haber aprendido algo de history, vimos {}",
+            tras_primera
+        );
+
+        // Segunda llamada con el MISMO pool: el history no se reinicia, se
+        // sigue acumulando sobre lo aprendido en la jugada anterior.
+        buscar(&mut pool);
+        assert_eq!(pool.ranuras_con_datos(), 2);
+        assert!(
+            pool.magnitud_history() > 0,
+            "el history debe seguir vivo tras la segunda llamada"
+        );
+
+        // "ucinewgame" tiene que borrarlo: el history de una partida no debe
+        // contaminar la siguiente.
+        pool.limpiar();
+        assert_eq!(pool.ranuras_con_datos(), 0, "limpiar() olvida todo");
+        assert_eq!(pool.magnitud_history(), 0);
+    }
+
+    /// Round-trip de las tablas persistentes: lo que sale de un Searcher entra
+    /// intacto en otro. Es el mecanismo que usa el pool entre jugadas.
+    #[test]
+    fn memoria_de_hilo_va_y_vuelve_intacta() {
+        let mut origen = Searcher::new(1);
+        origen.history[12][34] = 4321;
+        origen.cont_history[7] = -99;
+        let memoria = origen.extraer_memoria();
+
+        let mut destino = Searcher::new(1);
+        assert_eq!(destino.history[12][34], 0, "arranca en cero");
+        destino.instalar_memoria(memoria);
+        assert_eq!(destino.history[12][34], 4321);
+        assert_eq!(destino.cont_history[7], -99);
+
+        // Una memoria vacia (primera jugada / recien limpiada) no toca nada.
+        let mut virgen = Searcher::new(1);
+        virgen.history[12][34] = 7;
+        virgen.instalar_memoria(MemoriaHilo::default());
+        assert_eq!(
+            virgen.history[12][34], 7,
+            "instalar una memoria vacia no debe borrar lo que ya habia"
         );
     }
 }
@@ -4103,6 +4448,7 @@ mod reproduccion_h5c5 {
         let (tt, mask) = construir_tt(64);
         let generacion = std::sync::atomic::AtomicU8::new(0);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pool = PoolMemoriaSMP::nuevo();
         for movetime in [20u64, 100, 500] {
             let (mv, _sc, _nodos, _res) = buscar_lazy_smp(
                 &b,
@@ -4118,6 +4464,7 @@ mod reproduccion_h5c5 {
                 &hist,
                 stop.clone(),
                 None,
+                &mut pool,
             );
             let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
             assert!(
@@ -4259,6 +4606,7 @@ mod reproduccion_h5c5 {
         let (tt, mask) = construir_tt(64);
         let generacion = std::sync::atomic::AtomicU8::new(0);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pool = PoolMemoriaSMP::nuevo();
         let (mv, _sc, _nodos, _res) = buscar_lazy_smp(
             &b,
             Some(100),
@@ -4273,6 +4621,7 @@ mod reproduccion_h5c5 {
             &hist,
             stop.clone(),
             None,
+            &mut pool,
         );
         let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
         assert!(
