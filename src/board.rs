@@ -207,6 +207,8 @@ impl Board {
                 cr |= derecho;
             }
         }
+        // Provisional: mas abajo, una vez colocadas las piezas, se sanean los
+        // derechos imposibles y se vuelve a asignar el valor definitivo.
         b.castling_rights = cr;
 
         // 4. Al paso
@@ -286,29 +288,43 @@ impl Board {
             }
         }
 
+        // Saneo silencioso de los derechos de enroque (criterio Stockfish).
+        //
+        // Muchas GUIs, libros de aperturas y bases de datos emiten FENs con el
+        // campo de enroque sin actualizar: dicen "KQkq" cuando el rey ya se
+        // movio o cuando la torre correspondiente ya no esta en su esquina.
+        // Rechazar esos FENs con error deja al motor inutilizable con esas
+        // herramientas, y aceptarlos tal cual corrompe la generacion de
+        // enroques y la clave zobrist. La salida es la de Stockfish: conservar
+        // un derecho SOLO si el rey esta en su casilla original Y la torre
+        // correspondiente en la suya; en caso contrario, descartar ese derecho
+        // en silencio. El motor es de ajedrez estandar puro (no hay soporte de
+        // Chess960/FRC en ninguna parte del codigo), asi que las casillas son
+        // las clasicas: e1/e8 para los reyes, a1/h1/a8/h8 para las torres.
+        //
+        // El saneo va ANTES de recompute_zobrist(), de modo que el hash de la
+        // posicion se calcula con los derechos ya saneados y coincide con el
+        // que produce el mantenimiento incremental de make_move.
         let tiene = |color, pt, sq| b.pieces[color as usize][pt as usize] & bit(sq) != 0;
-        if !tiene(Color::White, PieceType::King, make_square(4, 0))
-            && cr & (CASTLE_WK | CASTLE_WQ) != 0
-        {
-            return Err("enroque blanco sin rey en e1".to_string());
+        if !tiene(Color::White, PieceType::King, make_square(4, 0)) {
+            cr &= !(CASTLE_WK | CASTLE_WQ);
         }
-        if !tiene(Color::Black, PieceType::King, make_square(4, 7))
-            && cr & (CASTLE_BK | CASTLE_BQ) != 0
-        {
-            return Err("enroque negro sin rey en e8".to_string());
+        if !tiene(Color::Black, PieceType::King, make_square(4, 7)) {
+            cr &= !(CASTLE_BK | CASTLE_BQ);
         }
-        if cr & CASTLE_WK != 0 && !tiene(Color::White, PieceType::Rook, make_square(7, 0)) {
-            return Err("enroque blanco corto sin torre en h1".to_string());
+        if !tiene(Color::White, PieceType::Rook, make_square(7, 0)) {
+            cr &= !CASTLE_WK;
         }
-        if cr & CASTLE_WQ != 0 && !tiene(Color::White, PieceType::Rook, make_square(0, 0)) {
-            return Err("enroque blanco largo sin torre en a1".to_string());
+        if !tiene(Color::White, PieceType::Rook, make_square(0, 0)) {
+            cr &= !CASTLE_WQ;
         }
-        if cr & CASTLE_BK != 0 && !tiene(Color::Black, PieceType::Rook, make_square(7, 7)) {
-            return Err("enroque negro corto sin torre en h8".to_string());
+        if !tiene(Color::Black, PieceType::Rook, make_square(7, 7)) {
+            cr &= !CASTLE_BK;
         }
-        if cr & CASTLE_BQ != 0 && !tiene(Color::Black, PieceType::Rook, make_square(0, 7)) {
-            return Err("enroque negro largo sin torre en a8".to_string());
+        if !tiene(Color::Black, PieceType::Rook, make_square(0, 7)) {
+            cr &= !CASTLE_BQ;
         }
+        b.castling_rights = cr;
 
         // Invariante fundamental de una posicion legal: el bando que ACABA de
         // mover (el que NO tiene el turno) nunca puede dejar su propio rey en
@@ -655,10 +671,188 @@ mod tests {
         assert!(Board::from_fen(fen).is_err());
     }
 
+    // --- Saneo silencioso de derechos de enroque (estilo Stockfish) -------
+    //
+    // Un derecho solo sobrevive si el rey esta en su casilla original Y la
+    // torre correspondiente en la suya. Lo demas se descarta EN SILENCIO (no
+    // es error) para no romper la interoperabilidad con GUIs y libros que
+    // emiten el campo de enroque sin actualizar.
+
+    use super::{CASTLE_BK, CASTLE_BQ, CASTLE_WK, CASTLE_WQ};
+
+    /// Comprueba que `fen` se acepta y que sus derechos quedan en `esperados`,
+    /// y de paso que el zobrist recalculado usa ya los derechos saneados.
+    fn saneo(fen: &str, esperados: u8) {
+        let b = Board::from_fen(fen).unwrap_or_else(|e| panic!("FEN rechazado {}: {}", fen, e));
+        assert_eq!(
+            b.castling_rights, esperados,
+            "derechos saneados inesperados en {}",
+            fen
+        );
+        // El hash guardado debe coincidir con el recalculado desde cero, que
+        // usa castling_rights: si el saneo ocurriera despues del hash, este
+        // assert fallaria.
+        let mut copia = b;
+        copia.recompute_zobrist();
+        assert_eq!(b.zobrist, copia.zobrist, "zobrist inconsistente en {}", fen);
+    }
+
     #[test]
-    fn rechaza_enroque_sin_torre() {
-        let fen = "4k3/8/8/8/8/8/8/4K3 w K - 0 1";
-        assert!(Board::from_fen(fen).is_err());
+    fn sanea_enroque_sin_torre() {
+        // Rey en e1 pero sin torre en h1: 'K' se descarta en silencio.
+        saneo("4k3/8/8/8/8/8/8/4K3 w K - 0 1", 0);
+        // Sin torre en a1: 'Q' se descarta.
+        saneo("4k3/8/8/8/8/8/8/4K2R w KQ - 0 1", CASTLE_WK);
+        // Torre negra movida de h8 a g8: 'k' cae, 'q' sobrevive.
+        saneo("r3k1r1/8/8/8/8/8/8/4K3 w kq - 0 1", CASTLE_BQ);
+    }
+
+    #[test]
+    fn sanea_enroque_con_rey_movido() {
+        // Rey blanco en d1 con ambas torres en su sitio: caen 'K' y 'Q'.
+        saneo("4k3/8/8/8/8/8/8/R2K3R w KQ - 0 1", 0);
+        // Rey negro en e7: caen 'k' y 'q', los blancos se conservan.
+        saneo("r6r/4k3/8/8/8/8/8/R3K2R w KQkq - 0 1", CASTLE_WK | CASTLE_WQ);
+    }
+
+    #[test]
+    fn sanea_enroque_rey_y_torre_movidos() {
+        // Rey blanco fuera de e1 y ninguna torre en su esquina; negras intactas.
+        saneo("r3k2r/8/8/8/8/8/8/3K1R2 w KQkq - 0 1", CASTLE_BK | CASTLE_BQ);
+        // Todo movido por ambos bandos: no queda ningun derecho.
+        saneo("1r2k1r1/8/8/8/8/8/8/1R2K1R1 w KQkq - 0 1", 0);
+    }
+
+    #[test]
+    fn sanea_solo_el_lado_afectado() {
+        // Solo falta la torre de a1: cae 'Q' y sobreviven 'K', 'k' y 'q'.
+        saneo(
+            "r3k2r/8/8/8/8/8/8/4K2R w KQkq - 0 1",
+            CASTLE_WK | CASTLE_BK | CASTLE_BQ,
+        );
+        // Solo falta la torre de h8: cae 'k' y sobreviven los demas.
+        saneo(
+            "r3k3/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            CASTLE_WK | CASTLE_WQ | CASTLE_BQ,
+        );
+    }
+
+    /// Bateria de FENs bien formados y variados (incluidas posiciones con
+    /// enroque legitimo por ambos lados) que NO deben verse alterados por el
+    /// saneo: los derechos se conservan exactamente y el FEN re-emitido es
+    /// identico al de entrada.
+    #[test]
+    fn fens_validos_no_cambian_en_absoluto() {
+        let casos: [(&str, u8); 12] = [
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                CASTLE_WK | CASTLE_WQ | CASTLE_BK | CASTLE_BQ,
+            ),
+            (
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                CASTLE_WK | CASTLE_WQ | CASTLE_BK | CASTLE_BQ,
+            ),
+            (
+                "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+                CASTLE_BK | CASTLE_BQ,
+            ),
+            (
+                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+                CASTLE_WK | CASTLE_WQ,
+            ),
+            (
+                "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+                0,
+            ),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 0),
+            ("4k3/8/8/8/8/8/8/4K3 w - - 0 1", 0),
+            (
+                "rnbqkbnr/pp1ppppp/8/2pP4/8/8/PPP1PPPP/RNBQKBNR w KQkq c6 0 2",
+                CASTLE_WK | CASTLE_WQ | CASTLE_BK | CASTLE_BQ,
+            ),
+            (
+                "rnbqkbnr/ppp1pppp/8/8/3pP3/5N2/PPPP1PPP/RNBQKB1R b KQkq e3 0 3",
+                CASTLE_WK | CASTLE_WQ | CASTLE_BK | CASTLE_BQ,
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                CASTLE_WK | CASTLE_WQ | CASTLE_BK | CASTLE_BQ,
+            ),
+            ("r3k2r/8/8/8/8/8/8/R3K2R b Kq - 5 42", CASTLE_WK | CASTLE_BQ),
+            ("4k2r/8/8/8/8/8/8/R3K3 w Qk - 0 1", CASTLE_WQ | CASTLE_BK),
+        ];
+        for (fen, derechos) in casos {
+            let b = Board::from_fen(fen).unwrap_or_else(|e| panic!("FEN valido {}: {}", fen, e));
+            assert_eq!(
+                b.castling_rights, derechos,
+                "el saneo altero un FEN valido: {}",
+                fen
+            );
+            assert_eq!(b.to_fen(), fen, "round-trip de FEN alterado: {}", fen);
+            let mut copia = b;
+            copia.recompute_zobrist();
+            assert_eq!(b.zobrist, copia.zobrist, "zobrist inconsistente en {}", fen);
+        }
+    }
+
+    /// El saneo debe dejar la posicion indistinguible de la version del FEN ya
+    /// corregida a mano: mismos derechos, mismo FEN emitido y mismo zobrist.
+    #[test]
+    fn fen_saneado_equivale_al_fen_ya_corregido() {
+        let pares = [
+            (
+                "r3k2r/8/8/8/8/8/8/4K2R w KQkq - 0 1",
+                "r3k2r/8/8/8/8/8/8/4K2R w Kkq - 0 1",
+            ),
+            (
+                "1r2k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                "1r2k2r/8/8/8/8/8/8/R3K2R w KQk - 0 1",
+            ),
+            (
+                "r6r/4k3/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                "r6r/4k3/8/8/8/8/8/R3K2R w KQ - 0 1",
+            ),
+        ];
+        for (sucio, limpio) in pares {
+            let a = Board::from_fen(sucio).unwrap();
+            let b = Board::from_fen(limpio).unwrap();
+            assert_eq!(a.castling_rights, b.castling_rights, "derechos: {}", sucio);
+            assert_eq!(a.to_fen(), b.to_fen(), "fen: {}", sucio);
+            assert_eq!(a.zobrist, b.zobrist, "zobrist: {}", sucio);
+            assert_eq!(a.to_fen(), limpio);
+        }
+    }
+
+    /// El saneo no debe romper el mantenimiento incremental del hash: tras
+    /// jugar sobre una posicion saneada, el zobrist incremental sigue
+    /// coincidiendo con el recomputado.
+    #[test]
+    fn zobrist_incremental_consistente_tras_saneo() {
+        let b = Board::from_fen("r3k2r/8/8/8/8/8/8/R2K3R w KQkq - 0 1").unwrap();
+        assert_eq!(b.castling_rights, CASTLE_BK | CASTLE_BQ);
+        let mut copia = b;
+        copia.recompute_zobrist();
+        assert_eq!(b.zobrist, copia.zobrist);
+
+        for mv in crate::movegen::generate_legal(&b) {
+            let hijo = b.make_move(&mv);
+            let mut recomputado = hijo;
+            recomputado.recompute_zobrist();
+            assert_eq!(
+                hijo.zobrist,
+                recomputado.zobrist,
+                "hash incremental != recomputado tras {}",
+                mv.to_uci()
+            );
+        }
+    }
+
+    /// Los derechos malformados (caracter desconocido o repetido) siguen
+    /// siendo un error: el saneo es para derechos imposibles, no para basura.
+    #[test]
+    fn rechaza_campo_de_enroque_malformado() {
+        assert!(Board::from_fen("4k3/8/8/8/8/8/8/4K3 w X - 0 1").is_err());
+        assert!(Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KK - 0 1").is_err());
     }
 
     #[test]

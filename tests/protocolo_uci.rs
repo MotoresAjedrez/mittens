@@ -170,7 +170,11 @@ fn fen_malformado_no_crashea_y_conserva_la_posicion_previa() {
         "8/8/8/8/8/8/8/8 w - - 0 1",
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq e9 0 1",
         "rnbqkbnr/pppppppp/99/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        "4k3/8/8/8/8/8/8/4K3 w KQkq - 0 1",
+        // Campo de enroque con basura: sigue siendo malformado. (Ojo: un FEN
+        // con derechos de enroque meramente IMPOSIBLES, como "4k3/.../4K3 w
+        // KQkq", ya NO es un error: se sanea en silencio -- ver el test
+        // fen_con_enroque_imposible_se_acepta_saneado mas abajo.)
+        "4k3/8/8/8/8/8/8/4K3 w KQXq - 0 1",
     ] {
         m.enviar(&format!("position fen {}", malo));
     }
@@ -183,6 +187,36 @@ fn fen_malformado_no_crashea_y_conserva_la_posicion_previa() {
         best.trim(),
         "bestmove f3f7",
         "se perdio la posicion previa tras los FEN malos"
+    );
+}
+
+/// Interoperabilidad con GUIs y libros que no actualizan el campo de enroque:
+/// un FEN cuyos derechos son imposibles (rey y/o torre fuera de su casilla
+/// original) NO se rechaza, se acepta con los derechos saneados en silencio.
+/// El motor debe adoptar la posicion y jugar en ella, no quedarse en la
+/// anterior ni intentar un enroque inexistente.
+#[test]
+fn fen_con_enroque_imposible_se_acepta_saneado() {
+    let mut m = Motor::nuevo();
+    m.enviar("uci");
+    m.esperar("uciok", Duration::from_secs(10));
+    // Ni el rey blanco (d1) ni el negro (g8) estan en su casilla original y no
+    // hay torres negras, pero el FEN insiste en "KQkq": los cuatro derechos
+    // deben caer. Mate en 1 de pasillo para blancas: Ta1-a8.
+    m.enviar("position fen 6k1/5ppp/8/8/8/8/8/R2K4 w KQkq - 0 1");
+    m.enviar("isready");
+    m.esperar("readyok", Duration::from_secs(10));
+    m.enviar("go movetime 500");
+    let (best, vistas) = m.esperar("bestmove", Duration::from_secs(15));
+    let jugada = best.trim().trim_start_matches("bestmove ").trim();
+    assert_eq!(
+        jugada, "a1a8",
+        "no adopto la posicion del FEN con enroque imposible: {}",
+        best
+    );
+    assert!(
+        !vistas.iter().any(|l| l.contains("panicked")),
+        "el motor entro en panico con un FEN de enroque imposible"
     );
 }
 
