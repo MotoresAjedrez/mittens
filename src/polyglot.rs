@@ -31,11 +31,35 @@ pub fn set_activo(v: bool) {
     ACTIVO.store(v, Ordering::Relaxed);
 }
 
+/// Libro Polyglot embebido en el binario (performance.bin, 92.954 entradas).
+/// Antes de esto el libro era codigo muerto: solo se cargaba si el usuario
+/// pasaba MIMOTOR_BOOK_PATH o "setoption name BookPath", asi que en la
+/// practica (CCRL, lichess-bot, cualquier GUI) el motor jugaba SIEMPRE sin
+/// libro. Se embebe igual que la NNUE para que el comportamiento por defecto
+/// sea el bueno; "setoption name OwnBook value false" lo apaga y un BookPath
+/// explicito lo sustituye.
+const LIBRO_EMBEBIDO: &[u8] = include_bytes!("../performance.bin");
+
 pub fn init(path: &str) -> Result<usize, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    instalar(&bytes)
+}
+
+/// Instala el libro embebido si todavia no hay ninguno cargado. Se llama
+/// justo antes de la primera busqueda, no al arrancar: asi un "setoption
+/// name BookPath" del GUI (que llega despues del handshake UCI) sigue
+/// teniendo prioridad sobre el embebido.
+pub fn asegurar_libro_por_defecto() -> Option<usize> {
+    if LIBRO.get().is_some() {
+        return None;
+    }
+    instalar(LIBRO_EMBEBIDO).ok()
+}
+
+fn instalar(bytes: &[u8]) -> Result<usize, String> {
     if LIBRO.get().is_some() {
         return Err("ya hay un libro cargado; reinicia el motor para cambiar BookPath".to_string());
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if bytes.is_empty() || bytes.len() % 16 != 0 {
         return Err(
             "tamano de archivo invalido para un libro polyglot (debe ser multiplo de 16 bytes)"

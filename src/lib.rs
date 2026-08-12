@@ -1461,6 +1461,13 @@ pub fn uci_loop() {
                 }
             }
             "go" => {
+                // Si nadie configuro BookPath, entra en juego el libro
+                // embebido. Se hace aqui (y no al arrancar) para que un
+                // "setoption name BookPath", que el GUI manda despues del
+                // handshake UCI, siga ganandole al embebido.
+                if let Some(n) = polyglot::asegurar_libro_por_defecto() {
+                    println!("info string libro de aperturas embebido activo ({} entradas)", n);
+                }
                 let infinito = partes.contains(&"infinite");
                 if let Some(i) = partes.iter().position(|&p| p == "depth") {
                     let depth: i32 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(6);
