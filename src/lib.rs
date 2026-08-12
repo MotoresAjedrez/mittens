@@ -1113,7 +1113,13 @@ pub fn uci_loop() {
             Err(e) => eprintln!("info string error cargando libro de aperturas: {}", e),
         }
     }
-    let usar_libro_inicial: bool = std::env::var("MIMOTOR_SIN_LIBRO").as_deref() != Ok("1");
+    // OwnBook viene APAGADO por defecto (decision explicita del usuario). El
+    // libro embebido esta ahi, pero hay que pedirlo. MIMOTOR_CON_LIBRO=1 es el
+    // equivalente por entorno de "setoption name OwnBook value true", para
+    // scripts y puentes que no mandan setoption; MIMOTOR_SIN_LIBRO=1 se sigue
+    // aceptando (ya era el comportamiento por defecto) y gana si estan las dos.
+    let usar_libro_inicial: bool = std::env::var("MIMOTOR_CON_LIBRO").as_deref() == Ok("1")
+        && std::env::var("MIMOTOR_SIN_LIBRO").as_deref() != Ok("1");
     polyglot::set_activo(usar_libro_inicial);
     // El camino de un hilo usa una TT local sin Mutex. Solo Lazy SMP necesita
     // una TT compartida entre hilos; reservarla tambien en Threads=1 añade un
@@ -1203,7 +1209,7 @@ pub fn uci_loop() {
                 println!("option name Personalidad type combo default tal var tal var universal");
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name BookPath type string default <empty>");
-                println!("option name OwnBook type check default true");
+                println!("option name OwnBook type check default false");
                 println!("option name UseNNUE type check default true");
                 println!("option name NNUEPath type string default <empty>");
                 println!("option name UseNN type check default false");
@@ -1461,6 +1467,13 @@ pub fn uci_loop() {
                 }
             }
             "go" => {
+                // Solo si alguien encendio OwnBook y nadie configuro BookPath
+                // entra en juego el libro embebido. Se hace aqui (y no al
+                // arrancar) para que un "setoption name BookPath", que el GUI
+                // manda despues del handshake UCI, siga ganandole al embebido.
+                if let Some(n) = polyglot::asegurar_libro_por_defecto() {
+                    println!("info string libro de aperturas embebido activo ({} entradas)", n);
+                }
                 let infinito = partes.contains(&"infinite");
                 if let Some(i) = partes.iter().position(|&p| p == "depth") {
                     let depth: i32 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(6);

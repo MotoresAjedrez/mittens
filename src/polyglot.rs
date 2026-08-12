@@ -21,21 +21,54 @@ struct Entrada {
 }
 
 static LIBRO: OnceLock<Vec<Entrada>> = OnceLock::new();
-// Activado por defecto (si hay libro cargado); "setoption name OwnBook value
-// false" lo apaga sin necesidad de descargar el libro. Global en vez de un
-// campo por Searcher para no tener que hilarlo por los dos caminos de
-// busqueda (un solo hilo y Lazy SMP).
-static ACTIVO: AtomicBool = AtomicBool::new(true);
+// APAGADO por defecto por decision explicita del usuario: el libro embebido
+// esta disponible pero el motor no juega de libro salvo que alguien lo pida
+// con "setoption name OwnBook value true". Global en vez de un campo por
+// Searcher para no tener que hilarlo por los dos caminos de busqueda (un solo
+// hilo y Lazy SMP).
+static ACTIVO: AtomicBool = AtomicBool::new(false);
 
 pub fn set_activo(v: bool) {
     ACTIVO.store(v, Ordering::Relaxed);
 }
 
+pub fn activo() -> bool {
+    ACTIVO.load(Ordering::Relaxed)
+}
+
+/// Libro Polyglot embebido en el binario (performance.bin, 92.954 entradas).
+/// Antes de esto el libro era codigo muerto: solo se cargaba si el usuario
+/// pasaba MIMOTOR_BOOK_PATH o "setoption name BookPath", asi que en la
+/// practica (CCRL, lichess-bot, cualquier GUI) el motor jugaba SIEMPRE sin
+/// libro. Se embebe igual que la NNUE para que este disponible sin depender
+/// de un archivo externo, pero -- a diferencia de la NNUE -- queda APAGADO
+/// por defecto: hay que pedirlo con "setoption name OwnBook value true".
+/// Un BookPath explicito lo sustituye.
+const LIBRO_EMBEBIDO: &[u8] = include_bytes!("../performance.bin");
+
 pub fn init(path: &str) -> Result<usize, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    instalar(&bytes)
+}
+
+/// Instala el libro embebido si todavia no hay ninguno cargado. Se llama
+/// justo antes de cada busqueda, no al arrancar: asi un "setoption name
+/// BookPath" del GUI (que llega despues del handshake UCI) sigue teniendo
+/// prioridad sobre el embebido. Como OwnBook viene apagado por defecto, no
+/// se paga el parseo ni la memoria de las 92.954 entradas salvo que alguien
+/// active el libro; si lo activa a mitad de partida, se instala en el
+/// siguiente "go".
+pub fn asegurar_libro_por_defecto() -> Option<usize> {
+    if !activo() || LIBRO.get().is_some() {
+        return None;
+    }
+    instalar(LIBRO_EMBEBIDO).ok()
+}
+
+fn instalar(bytes: &[u8]) -> Result<usize, String> {
     if LIBRO.get().is_some() {
         return Err("ya hay un libro cargado; reinicia el motor para cambiar BookPath".to_string());
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if bytes.is_empty() || bytes.len() % 16 != 0 {
         return Err(
             "tamano de archivo invalido para un libro polyglot (debe ser multiplo de 16 bytes)"

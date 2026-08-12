@@ -94,7 +94,11 @@ Opciones principales:
 - `Move Overhead`: margen en milisegundos para GUI, red y sistema operativo.
 - `Threads`: hilos de Lazy SMP.
 - `Personalidad`: `tal` o `universal`.
-- `BookPath` y `OwnBook`: libro Polyglot.
+- `BookPath` y `OwnBook`: libro Polyglot. El libro `performance.bin` va **embebido en el
+  ejecutable pero APAGADO por defecto** (`OwnBook` es `default false`): el motor busca
+  normalmente desde la jugada 1 salvo que se active con
+  `setoption name OwnBook value true` (o `MIMOTOR_CON_LIBRO=1`). Un `BookPath` explicito
+  sustituye al libro embebido.
 - `SyzygyPath`: tablas de finales.
 - `UseNNUE`: **activado por defecto**. La red va EMBEBIDA en el ejecutable
   (`pesos_bullet_512_buckets8.bin`, formato bullet `768 -> 512`x2 -> 1 SCReLU
@@ -138,7 +142,14 @@ LMR queda activado salvo que se defina expresamente `MIMOTOR_LMR=0`.
   porque scripts h2h antiguos lo nombran. NO es la arquitectura de 5378
   entradas que decia esta documentacion.
 - `pesos_v1.bin`: fixture de la arquitectura VIEJA (770 entradas, `770 -> 256 -> 32 -> 1`), conservado solo porque dos tests unitarios en `src/neural.rs` (`rechaza_nan_sin_panico`, `checksum_es_estable`) lo usan via `include_bytes!` para probar el validador de bytes -- no representa la red que juega hoy.
-- `performance.bin`: conservado tal como fue proporcionado. El codigo actual no lo carga directamente.
+- `performance.bin`: libro de aperturas Polyglot (1.487.264 bytes = 92.954 entradas,
+  77.872 posiciones unicas). Va EMBEBIDO en el ejecutable via `include_bytes!`
+  (`src/polyglot.rs`), pero **apagado por defecto**: se instala en la primera busqueda
+  solo si `OwnBook` esta en `true`. Antes era codigo muerto: solo se cargaba si alguien
+  pasaba `MIMOTOR_BOOK_PATH` o `setoption name BookPath`, asi que en la practica el motor
+  jugaba siempre sin libro. Auditado en la rama `ronda4_libro`: el repertorio es sano
+  (mediana -4 cp a depth 16, ninguna linea peor que -1.00) y con el libro encendido marco
+  56.2% en 160 partidas a 150 ms contra el mismo motor sin libro.
 
 ## Estado de validacion de este paquete
 
