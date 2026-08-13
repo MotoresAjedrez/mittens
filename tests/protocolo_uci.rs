@@ -15,7 +15,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-const BIN: &str = env!("CARGO_BIN_EXE_mi-motor-rust");
+const BIN: &str = env!("CARGO_BIN_EXE_mittens");
 
 struct Motor {
     stdin: ChildStdin,

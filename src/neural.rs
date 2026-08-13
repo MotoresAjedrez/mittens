@@ -579,7 +579,7 @@ impl NnueAccumulator {
     /// eval.rs); la de bullet ya devuelve centipeones "de verdad" en la
     /// misma escala que la clasica, asi que su peso natural es 1.0 y no
     /// tendria sentido heredar el 1.5 ajustado para la otra arquitectura.
-    /// Se puede sobreescribir con MIMOTOR_PESO_BULLET para experimentar.
+    /// Se puede sobreescribir con MITTENS_PESO_BULLET para experimentar.
     pub fn peso(&self) -> f64 {
         match self {
             NnueAccumulator::Amenazas(_) => crate::eval::PESO_RED,
@@ -587,7 +587,7 @@ impl NnueAccumulator {
             // Igual que la bullet estandar: ya devuelve centipeones "de
             // verdad" en la misma escala que la clasica. Pero es OTRA
             // arquitectura (5376 features de amenaza), asi que tiene su
-            // propia perilla de calibracion: MIMOTOR_PESO_BULLET_AMENAZAS.
+            // propia perilla de calibracion: MITTENS_PESO_BULLET_AMENAZAS.
             NnueAccumulator::BulletAmenazas(_) => peso_bullet_amenazas(),
         }
     }
@@ -596,7 +596,7 @@ impl NnueAccumulator {
     /// clasica. Solo aplica a la arquitectura bullet, que a diferencia de la
     /// de amenazas ya evalua la posicion COMPLETA por si misma; sumarle
     /// encima la clasica puede estar contando dos veces lo mismo.
-    /// Se activa con MIMOTOR_BULLET_PURA=1.
+    /// Se activa con MITTENS_BULLET_PURA=1.
     pub fn pura(&self) -> bool {
         match self {
             // Las bullet (estandar y 5376) evaluan la posicion COMPLETA por
@@ -607,7 +607,7 @@ impl NnueAccumulator {
             // llama ANTES del match, ver evaluate_with_state), asi que el
             // modo puro no ahorra ni un nanosegundo, solo TIRA informacion.
             // El hibrido es igual o mejor por construccion. Se puede forzar
-            // el modo puro con MIMOTOR_BULLET_AMENAZAS_PURA=1 para comparar.
+            // el modo puro con MITTENS_BULLET_AMENAZAS_PURA=1 para comparar.
             NnueAccumulator::BulletAmenazas(_) => bullet_amenazas_pura(),
             NnueAccumulator::Amenazas(_) => false,
         }
@@ -619,12 +619,12 @@ fn bullet_pura() -> bool {
     *CACHE.get_or_init(|| {
         // Por defecto activo desde 2026-08-13: con la red reentrenada
         // (etiquetas Stockfish-15ms, dataset barajado, checkpoint
-        // cand_pura150-150) y MIMOTOR_PESO_BULLET=1.6, el modo puro le
+        // cand_pura150-150) y MITTENS_PESO_BULLET=1.6, el modo puro le
         // gano al hibrido 59.2% en 200 partidas (ver h2h_puro16_vs_hibrido_v3.log
         // en mi-motor-rust-agentes/cand_nnue_pura). Se puede apagar con
-        // MIMOTOR_BULLET_PURA=0 para volver al hibrido clasica+red.
+        // MITTENS_BULLET_PURA=0 para volver al hibrido clasica+red.
         !matches!(
-            std::env::var("MIMOTOR_BULLET_PURA").as_deref(),
+            std::env::var("MITTENS_BULLET_PURA").as_deref(),
             Ok("0") | Ok("false")
         )
     })
@@ -634,7 +634,7 @@ fn bullet_amenazas_pura() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
         matches!(
-            std::env::var("MIMOTOR_BULLET_AMENAZAS_PURA").as_deref(),
+            std::env::var("MITTENS_BULLET_AMENAZAS_PURA").as_deref(),
             Ok("1") | Ok("true")
         )
     })
@@ -649,7 +649,7 @@ fn bullet_amenazas_pura() -> bool {
 fn peso_bullet_amenazas() -> f64 {
     static CACHE: OnceLock<f64> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("MIMOTOR_PESO_BULLET_AMENAZAS")
+        std::env::var("MITTENS_PESO_BULLET_AMENAZAS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 8.0)
@@ -663,7 +663,7 @@ fn peso_bullet() -> f64 {
         // Default 1.6 desde 2026-08-13, calibrado en modo puro (ver
         // bullet_pura arriba) para compensar la escala de busqueda
         // afinada sobre el hibrido clasica+red.
-        std::env::var("MIMOTOR_PESO_BULLET")
+        std::env::var("MITTENS_PESO_BULLET")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 8.0)
@@ -1370,9 +1370,9 @@ mod tests {
         // Estos tests ejercitan exclusivamente el acumulador legacy de
         // amenazas; producción usa ahora la red Bullet. El fixture (11 MB)
         // vivia en backups/ y no viaja con el checkout: se lee en runtime
-        // (override con MIMOTOR_RED_AMENAZAS) y los tests se omiten con
+        // (override con MITTENS_RED_AMENAZAS) y los tests se omiten con
         // aviso si no esta, igual que hacen los de bullet_net.
-        let ruta = std::env::var("MIMOTOR_RED_AMENAZAS").unwrap_or_else(|_| {
+        let ruta = std::env::var("MITTENS_RED_AMENAZAS").unwrap_or_else(|_| {
             format!(
                 "{}/backups/pesos_amenazas_prueba.bak_pre_bullet_relabel_500h2h_20260731_121222.bin",
                 env!("CARGO_MANIFEST_DIR")

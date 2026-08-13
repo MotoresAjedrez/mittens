@@ -33,13 +33,13 @@ ROOT = pathlib.Path(__file__).resolve().parent
 # Configurables por entorno porque esa ruta es especifica de cada maquina.
 BASE = pathlib.Path(
     os.environ.get(
-        "MIMOTOR_BASE_BIN",
+        "MITTENS_BASE_BIN",
         str(pathlib.Path.home() / "mimotor-lichess-bot/engines/mimotor-tal-rust"),
     )
 )
 BASE_WEIGHTS = pathlib.Path(
     os.environ.get(
-        "MIMOTOR_BASE_WEIGHTS",
+        "MITTENS_BASE_WEIGHTS",
         str(pathlib.Path.home() / "mimotor-lichess-bot/engines/nn_weights/pesos_flat_3m.bin"),
     )
 )

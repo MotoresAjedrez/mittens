@@ -24,7 +24,7 @@ No es Stockfish. No pretende serlo. Pero pelea.
    ```
 3. Ábrelo con cualquier interfaz UCI (Arena, CuteChess, BanksiaGUI...) o directo por terminal:
    ```bash
-   ./target/release/mi-motor-rust
+   ./target/release/mittens
    uci
    ```
 4. Escribe `go` y reza.
@@ -97,7 +97,7 @@ Opciones principales:
 - `BookPath` y `OwnBook`: libro Polyglot. El libro `performance.bin` va **embebido en el
   ejecutable pero APAGADO por defecto** (`OwnBook` es `default false`): el motor busca
   normalmente desde la jugada 1 salvo que se active con
-  `setoption name OwnBook value true` (o `MIMOTOR_CON_LIBRO=1`). Un `BookPath` explicito
+  `setoption name OwnBook value true` (o `MITTENS_CON_LIBRO=1`). Un `BookPath` explicito
   sustituye al libro embebido.
 - `SyzygyPath`: tablas de finales.
 - `UseNNUE`: **activado por defecto**. La red va EMBEBIDA en el ejecutable
@@ -127,10 +127,10 @@ Una carga fallida ya no borra una red valida que estuviera cargada. El motor mue
 Variables opcionales:
 
 ```bash
-MIMOTOR_BIN=/ruta/al/motor MIMOTOR_HILOS=4 ./mover_fen_rust.sh "FEN" 5000
+MITTENS_BIN=/ruta/al/motor MITTENS_HILOS=4 ./mover_fen_rust.sh "FEN" 5000
 ```
 
-LMR queda activado salvo que se defina expresamente `MIMOTOR_LMR=0`.
+LMR queda activado salvo que se defina expresamente `MITTENS_LMR=0`.
 
 ## Archivos binarios
 
@@ -146,7 +146,7 @@ LMR queda activado salvo que se defina expresamente `MIMOTOR_LMR=0`.
   77.872 posiciones unicas). Va EMBEBIDO en el ejecutable via `include_bytes!`
   (`src/polyglot.rs`), pero **apagado por defecto**: se instala en la primera busqueda
   solo si `OwnBook` esta en `true`. Antes era codigo muerto: solo se cargaba si alguien
-  pasaba `MIMOTOR_BOOK_PATH` o `setoption name BookPath`, asi que en la practica el motor
+  pasaba `MITTENS_BOOK_PATH` o `setoption name BookPath`, asi que en la practica el motor
   jugaba siempre sin libro. Auditado en la rama `ronda4_libro`: el repertorio es sano
   (mediana -4 cp a depth 16, ninguna linea peor que -1.00) y con el libro encendido marco
   56.2% en 160 partidas a 150 ms contra el mismo motor sin libro.

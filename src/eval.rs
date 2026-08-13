@@ -11,7 +11,7 @@ use crate::types::{Color, PieceType, Square, file_of, make_square, rank_of};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 // Dos identidades de evaluacion, seleccionables en caliente (UCI "setoption
-// name Personalidad" o variable de entorno MIMOTOR_PERSONALIDAD), que
+// name Personalidad" o variable de entorno MITTENS_PERSONALIDAD), que
 // COEXISTEN -- no se reemplaza Tal, se agrega Universal como alternativa.
 // Estado global de solo-lectura durante la busqueda (se fija antes de "go",
 // nunca cambia a mitad de una busqueda concurrente) -- por eso un atomico

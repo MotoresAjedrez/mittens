@@ -50,11 +50,11 @@ use types::{Move, MoveFlag, PieceType};
 /// Por eso este ajuste es SOLO de presentacion: se aplica al imprimir y a
 /// nada mas. La busqueda, los margenes y las ventanas de aspiracion siguen
 /// trabajando en la escala interna intacta, asi que no puede mover un Elo.
-/// Se desactiva con MIMOTOR_ESCALA_UCI=1.0.
+/// Se desactiva con MITTENS_ESCALA_UCI=1.0.
 fn escala_uci() -> f64 {
     static CACHE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("MIMOTOR_ESCALA_UCI")
+        std::env::var("MITTENS_ESCALA_UCI")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && (0.1..=10.0).contains(v))
@@ -88,8 +88,8 @@ const POSITION3: &str = "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1";
 const POSITION5: &str = "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 0 1";
 
 /// Modo comodo para probar una posicion suelta sin protocolo UCI:
-///   mimotor-tal-rust simple "FEN"
-///   mimotor-tal-rust simple 3000 "FEN"   (movetime en ms, default 2000)
+///   mittens simple "FEN"
+///   mittens simple 3000 "FEN"   (movetime en ms, default 2000)
 fn run_simple(fen: &str, movetime_ms: u64) {
     let b = match Board::from_fen(fen) {
         Ok(b) => b,
@@ -102,7 +102,7 @@ fn run_simple(fen: &str, movetime_ms: u64) {
     let (mv, sc, prof) = s.search_time(&b, Some(movetime_ms), 64, |_, _, _, _, _| {});
     let pv = s.extraer_pv(&b, 12);
     let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
-    println!("================ MiMotor Tal ================");
+    println!("================ Mittens ================");
     println!(
         "Mejor jugada: {}",
         mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
@@ -461,7 +461,7 @@ fn run_singular_diagnostico(depth: i32) {
     println!(
         "\n{}",
         if peor_encontrado || nodos_explotaron {
-            "singular extensions FALLO el diagnostico -- NO activar por defecto (MIMOTOR_SINGULAR=1 sigue disponible solo para pruebas)"
+            "singular extensions FALLO el diagnostico -- NO activar por defecto (MITTENS_SINGULAR=1 sigue disponible solo para pruebas)"
         } else {
             "singular extensions paso el diagnostico: sin perdidas de score ni explosion de nodos en este lote"
         }
@@ -1066,14 +1066,14 @@ pub fn uci_loop() {
     // Lazy SMP y el hilo principal deben compartir una sola TT. Antes se
     // construía aquí una TT propia y, unas líneas después, otra para SMP;
     // con Hash=512 eso duplicaba la reserva de memoria desde el arranque.
-    let modo_lmr_inicial = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
+    let modo_lmr_inicial = std::env::var("MITTENS_LMR").as_deref() != Ok("0");
     let mut game_history: Vec<u64> = Vec::new();
-    // MIMOTOR_HILOS sigue funcionando como default de conveniencia para
+    // MITTENS_HILOS sigue funcionando como default de conveniencia para
     // pruebas locales, pero un tester UCI (CCRL y similares) SOLO configura
     // motores por "setoption", nunca por variables de entorno -- por eso
     // "Threads" tambien es una opcion UCI real (ver abajo) que sobreescribe
     // este valor inicial.
-    let mut n_hilos: usize = std::env::var("MIMOTOR_HILOS")
+    let mut n_hilos: usize = std::env::var("MITTENS_HILOS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
@@ -1097,30 +1097,30 @@ pub fn uci_loop() {
     // el modo normal conserva stop asíncrono sin ninguna variación.
     let mut sync_ultrabullet = false;
     let mut multipv: usize = 1;
-    if let Ok(p) = std::env::var("MIMOTOR_PERSONALIDAD")
+    if let Ok(p) = std::env::var("MITTENS_PERSONALIDAD")
         && let Some(pers) = eval::personalidad_desde_texto(&p)
     {
         eval::set_personalidad(pers);
     }
-    if let Ok(path) = std::env::var("MIMOTOR_SYZYGY_PATH") {
+    if let Ok(path) = std::env::var("MITTENS_SYZYGY_PATH") {
         match syzygy::init(&path) {
             Ok(max) => eprintln!("info string tablas Syzygy cargadas ({} piezas max)", max),
             Err(e) => eprintln!("info string error cargando tablas Syzygy: {}", e),
         }
     }
-    if let Ok(path) = std::env::var("MIMOTOR_BOOK_PATH") {
+    if let Ok(path) = std::env::var("MITTENS_BOOK_PATH") {
         match polyglot::init(&path) {
             Ok(n) => eprintln!("info string libro de aperturas cargado ({} entradas)", n),
             Err(e) => eprintln!("info string error cargando libro de aperturas: {}", e),
         }
     }
     // OwnBook viene APAGADO por defecto (decision explicita del usuario). El
-    // libro embebido esta ahi, pero hay que pedirlo. MIMOTOR_CON_LIBRO=1 es el
+    // libro embebido esta ahi, pero hay que pedirlo. MITTENS_CON_LIBRO=1 es el
     // equivalente por entorno de "setoption name OwnBook value true", para
-    // scripts y puentes que no mandan setoption; MIMOTOR_SIN_LIBRO=1 se sigue
+    // scripts y puentes que no mandan setoption; MITTENS_SIN_LIBRO=1 se sigue
     // aceptando (ya era el comportamiento por defecto) y gana si estan las dos.
-    let usar_libro_inicial: bool = std::env::var("MIMOTOR_CON_LIBRO").as_deref() == Ok("1")
-        && std::env::var("MIMOTOR_SIN_LIBRO").as_deref() != Ok("1");
+    let usar_libro_inicial: bool = std::env::var("MITTENS_CON_LIBRO").as_deref() == Ok("1")
+        && std::env::var("MITTENS_SIN_LIBRO").as_deref() != Ok("1");
     polyglot::set_activo(usar_libro_inicial);
     // El camino de un hilo usa una TT local sin Mutex. Solo Lazy SMP necesita
     // una TT compartida entre hilos; reservarla tambien en Threads=1 añade un
@@ -1353,7 +1353,7 @@ pub fn uci_loop() {
                     drop(old_tt);
                     // TT nueva => contador de aging desde cero.
                     smp_generacion.store(0, Ordering::Relaxed);
-                    let modo_lmr = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
+                    let modo_lmr = std::env::var("MITTENS_LMR").as_deref() != Ok("0");
                     if n_hilos > 1 {
                         let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
                         searcher_slot = Some(Searcher::new_con_tt_compartida(
@@ -1394,7 +1394,7 @@ pub fn uci_loop() {
                 drop(old_tt);
                 // TT nueva => contador de aging desde cero.
                 smp_generacion.store(0, Ordering::Relaxed);
-                let modo_lmr = std::env::var("MIMOTOR_LMR").as_deref() != Ok("0");
+                let modo_lmr = std::env::var("MITTENS_LMR").as_deref() != Ok("0");
                 if n_hilos > 1 {
                     let (nueva_tt, nueva_mask) = search::construir_tt(tt_mb);
                     searcher_slot = Some(Searcher::new_con_tt_compartida(
@@ -1859,7 +1859,7 @@ pub fn uci_loop() {
                 }
             }
             "bench" => {
-                // Igual que el "bench" de linea de comandos (`mimotor-tal-rust
+                // Igual que el "bench" de linea de comandos (`mittens
                 // bench [depth]`), pero disponible tambien como comando UCI
                 // en vivo -- convencion de Stockfish y la mayoria de motores,
                 // que herramientas de testeo (Cutechess, OpenBench, scripts

@@ -65,13 +65,13 @@ const QB: i32 = 64;
 const ALINEACION: usize = 64;
 
 /// Escala de salida. La red bullet aprende `salida ~= score / eval_scale` y
-/// el archivo no lleva ese dato; se configura con MIMOTOR_BULLET_SCALE
+/// el archivo no lleva ese dato; se configura con MITTENS_BULLET_SCALE
 /// (defecto 400, lo que usaron todas las redes entrenadas hasta ahora).
 fn scale() -> i32 {
     use std::sync::OnceLock;
     static CACHE: OnceLock<i32> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("MIMOTOR_BULLET_SCALE")
+        std::env::var("MITTENS_BULLET_SCALE")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|v| (16..=4096).contains(v))
@@ -1117,7 +1117,7 @@ mod tests {
     use super::*;
 
     fn cargar_real() -> Option<&'static RedBulletAmenazas> {
-        let ruta = std::env::var("MIMOTOR_RED_BULLET_5376").unwrap_or_else(|_| {
+        let ruta = std::env::var("MITTENS_RED_BULLET_5376").unwrap_or_else(|_| {
             "/Users/Tavito/mi-motor/cand_bullet_nnue_1024_amenazas/checkpoints/mimotor_bullet_1024_amenazas-30/quantised.bin".to_string()
         });
         let datos = std::fs::read(&ruta).ok()?;
@@ -1263,7 +1263,7 @@ mod tests_incremental {
     use super::*;
 
     fn cargar_real() -> Option<&'static RedBulletAmenazas> {
-        let ruta = std::env::var("MIMOTOR_RED_BULLET_5376").unwrap_or_else(|_| {
+        let ruta = std::env::var("MITTENS_RED_BULLET_5376").unwrap_or_else(|_| {
             "/Users/Tavito/mi-motor/cand_bullet_nnue_1024_amenazas/checkpoints/mimotor_bullet_1024_amenazas-30/quantised.bin".to_string()
         });
         let datos = std::fs::read(&ruta).ok()?;

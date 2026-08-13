@@ -43,13 +43,13 @@ const QB: i32 = 64;
 /// entreno la red: la red aprende `salida ~= score / eval_scale`, asi que
 /// para recuperar centipeones hay que multiplicar por ese mismo numero. El
 /// archivo de pesos NO lleva este dato dentro, asi que se configura con
-/// MIMOTOR_BULLET_SCALE (por defecto 400, que es lo que usaron todas las
+/// MITTENS_BULLET_SCALE (por defecto 400, que es lo que usaron todas las
 /// redes entrenadas hasta ahora).
 fn scale() -> i32 {
     use std::sync::OnceLock;
     static CACHE: OnceLock<i32> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("MIMOTOR_BULLET_SCALE")
+        std::env::var("MITTENS_BULLET_SCALE")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|v| (16..=4096).contains(v))
@@ -558,10 +558,10 @@ mod tests {
         // PESOS_EMBEBIDOS), no una copia suelta en una ruta absoluta de una
         // maquina concreta -- si esa ruta no existia, todos estos tests se
         // "omitian" en silencio y no verificaban nada.
-        // MIMOTOR_RED_BULLET permite apuntar a otra red.
+        // MITTENS_RED_BULLET permite apuntar a otra red.
         static RED: std::sync::OnceLock<Option<&'static RedBullet>> = std::sync::OnceLock::new();
         *RED.get_or_init(|| {
-            let datos = match std::env::var("MIMOTOR_RED_BULLET") {
+            let datos = match std::env::var("MITTENS_RED_BULLET") {
                 Ok(ruta) => std::fs::read(ruta).ok()?,
                 Err(_) => include_bytes!("../pesos_bullet_512_buckets8.bin").to_vec(),
             };
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn incremental_igual_que_recalculo() {
         let Some(red) = red() else {
-            eprintln!("sin MIMOTOR_RED_BULLET: test omitido");
+            eprintln!("sin MITTENS_RED_BULLET: test omitido");
             return;
         };
         let fens = [
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn aplicar_jugada_se_deshace_bit_a_bit() {
         let Some(red) = red() else {
-            eprintln!("sin MIMOTOR_RED_BULLET: test omitido");
+            eprintln!("sin MITTENS_RED_BULLET: test omitido");
             return;
         };
         let raiz = crate::board::Board::from_fen(

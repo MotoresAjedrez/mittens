@@ -40,13 +40,13 @@ spec.loader.exec_module(module)
 module.ROOT = REPO
 module.BASE = pathlib.Path(
     os.environ.get(
-        "MIMOTOR_BASE_BIN",
+        "MITTENS_BASE_BIN",
         str(pathlib.Path.home() / "mimotor-lichess-bot/engines/mimotor-tal-rust"),
     )
 )
 module.WEIGHTS = pathlib.Path(
     os.environ.get(
-        "MIMOTOR_BASE_WEIGHTS",
+        "MITTENS_BASE_WEIGHTS",
         str(pathlib.Path.home() / "mimotor-lichess-bot/engines/nn_weights/pesos_flat_3m.bin"),
     )
 )

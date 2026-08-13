@@ -23,7 +23,7 @@ import chess
 import chess.engine
 
 ROOT = pathlib.Path(__file__).resolve().parent
-BIN = pathlib.Path(os.environ.get("MIMOTOR_BIN", str(ROOT / "target/release/mi-motor-rust")))
+BIN = pathlib.Path(os.environ.get("MITTENS_BIN", str(ROOT / "target/release/mittens")))
 MAX_PLIES = 300
 
 OPENINGS = [

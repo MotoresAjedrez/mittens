@@ -38,7 +38,7 @@ pub fn activo() -> bool {
 
 /// Libro Polyglot embebido en el binario (performance.bin, 92.954 entradas).
 /// Antes de esto el libro era codigo muerto: solo se cargaba si el usuario
-/// pasaba MIMOTOR_BOOK_PATH o "setoption name BookPath", asi que en la
+/// pasaba MITTENS_BOOK_PATH o "setoption name BookPath", asi que en la
 /// practica (CCRL, lichess-bot, cualquier GUI) el motor jugaba SIEMPRE sin
 /// libro. Se embebe igual que la NNUE para que este disponible sin depender
 /// de un archivo externo, pero -- a diferencia de la NNUE -- queda APAGADO

@@ -565,7 +565,7 @@ impl Board {
                 // de abortar. debug_assert! mantiene la deteccion en tests
                 // (cargo test, perfil debug) sin coste en release.
                 eprintln!(
-                    "MIMOTOR: posicion ilegal en make_move (captura de rey en {}). FEN antes de la jugada: {}  jugada: {}",
+                    "MITTENS: posicion ilegal en make_move (captura de rey en {}). FEN antes de la jugada: {}  jugada: {}",
                     square_name(mv.to),
                     self.to_fen(),
                     mv.to_uci()

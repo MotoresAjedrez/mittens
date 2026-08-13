@@ -4,7 +4,7 @@
 import chess
 import chess.engine
 
-BIN = "/Users/Tavito/mi-motor-rust-produccion/target/release/mi-motor-rust"
+BIN = "/Users/Tavito/mi-motor-rust-produccion/target/release/mittens"
 PESOS = "/Users/Tavito/mi-motor-rust-produccion/pesos_amenazas_prueba.bin"
 BOOK = "/Users/Tavito/mi-motor-rust-produccion/performance.bin"
 MOVETIME_MS = 600

@@ -639,14 +639,14 @@ pub struct Searcher {
     // de los killers.
     counter_moves: Vec<Option<Move>>,
     pub modo_lmr: bool,
-    // Desactivable solo para comparacion A/B en pruebas (MIMOTOR_NO_ASPIRATION=1)
+    // Desactivable solo para comparacion A/B en pruebas (MITTENS_NO_ASPIRATION=1)
     // -- en juego real siempre queda activado, la tecnica en si es segura por
     // construccion (ensancha hasta ventana completa si hace falta).
     pub modo_aspiration: bool,
     // Singular extensions: activadas por defecto desde el h2h de 250
     // partidas a 20ms (55.0% para singular -- justo en el umbral, no un
     // margen amplio como LMP/history malus, pero cumple el criterio).
-    // MIMOTOR_SINGULAR=0 las desactiva si hiciera falta comparar de nuevo.
+    // MITTENS_SINGULAR=0 las desactiva si hiciera falta comparar de nuevo.
     pub modo_singular: bool,
     // La quiescence puede omitir NNUE de forma experimental. El resto del
     // árbol conserva la mezcla completa; esta bandera solo existe para medir
@@ -779,11 +779,11 @@ impl Searcher {
             counter_moves: vec![None; 6 * 64],
             // Activado por defecto: el torneo h2h de esta sesion confirmo
             // +80 ELO (61.3% en 40 partidas) con la reescritura PVS -- ver
-            // resultados_lmr_h2h.txt en ~/mi-motor. MIMOTOR_LMR=0 lo desactiva
+            // resultados_lmr_h2h.txt en ~/mi-motor. MITTENS_LMR=0 lo desactiva
             // explicitamente para pruebas comparativas.
-            modo_lmr: std::env::var("MIMOTOR_LMR").as_deref() != Ok("0"),
-            modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
-            modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() != Ok("0"),
+            modo_lmr: std::env::var("MITTENS_LMR").as_deref() != Ok("0"),
+            modo_aspiration: std::env::var("MITTENS_NO_ASPIRATION").as_deref() != Ok("1"),
+            modo_singular: std::env::var("MITTENS_SINGULAR").as_deref() != Ok("0"),
             qsearch_nnue: true,
             nnue: None,
             nnue_classical_depth: 0,
@@ -879,8 +879,8 @@ impl Searcher {
             counter_moves: vec![None; 6 * 64],
             tt_generation: 0,
             modo_lmr,
-            modo_aspiration: std::env::var("MIMOTOR_NO_ASPIRATION").as_deref() != Ok("1"),
-            modo_singular: std::env::var("MIMOTOR_SINGULAR").as_deref() != Ok("0"),
+            modo_aspiration: std::env::var("MITTENS_NO_ASPIRATION").as_deref() != Ok("1"),
+            modo_singular: std::env::var("MITTENS_SINGULAR").as_deref() != Ok("0"),
             qsearch_nnue: true,
             nnue: None,
             nnue_classical_depth: 0,
@@ -1811,7 +1811,7 @@ impl Searcher {
         // exactamente equivalente y evita repetir una mezcla NNUE+clasica.
         let mut static_eval_cache: Option<i32> = None;
 
-        // Hindsight reductions, adaptado al LMR entero de MiMotor. Si una
+        // Hindsight reductions, adaptado al LMR entero de Mittens. Si una
         // jugada reducida deja una posicion peor de lo que sugeria la eval
         // del padre, recuperamos el ply perdido. Si la posicion mejora con
         // claridad, aceptamos un ply menos. Solo actua sobre hijos que
@@ -1978,7 +1978,7 @@ impl Searcher {
         // Obsidian ~3636 CCRL y Quanticade Cronus ~3624 CCRL; reimplementado
         // desde cero en Rust, no es codigo portado).
         //
-        // Diferencia de fondo con la version anterior de MiMotor: antes se
+        // Diferencia de fondo con la version anterior de Mittens: antes se
         // intentaba el sondeo nulo en TODO nodo con depth>=3 fuera de jaque,
         // sin mirar la evaluacion estatica. Los dos motores de referencia
         // exigen ANTES que la evaluacion ya este por encima de beta: si la
@@ -1989,7 +1989,7 @@ impl Searcher {
         //
         //   Obsidian:   R = min((eval-beta)/147, 4) + depth/3 + 4 + ttMoveNoisy
         //   Quanticade: R = depth/3 + 6, acotado a depth
-        //   MiMotor previo: R = 2 (+1 en depth>=6, +1 en depth>=12) -> tope 4
+        //   Mittens previo: R = 2 (+1 en depth>=6, +1 en depth>=12) -> tope 4
         //
         // Aca se adopta la MISMA FORMA (base + termino por profundidad +
         // termino proporcional a cuanto la eval supera beta) pero con
@@ -2985,7 +2985,7 @@ impl Searcher {
         // rechaza antes, en from_fen; esto es defensa en profundidad.
         if b.in_check(b.turn.opposite()) {
             eprintln!(
-                "MIMOTOR: posicion ilegal en la raiz de busqueda -- se devuelve sin jugada. FEN: {}",
+                "MITTENS: posicion ilegal en la raiz de busqueda -- se devuelve sin jugada. FEN: {}",
                 b.to_fen()
             );
             return (None, 0, 0);
@@ -3155,7 +3155,7 @@ impl Searcher {
         // abortar el proceso por la captura del rey rival.
         if b.in_check(b.turn.opposite()) {
             eprintln!(
-                "MIMOTOR: posicion ilegal en la raiz de busqueda -- se devuelve sin jugada. FEN: {}",
+                "MITTENS: posicion ilegal en la raiz de busqueda -- se devuelve sin jugada. FEN: {}",
                 b.to_fen()
             );
             return (None, 0, 0);
