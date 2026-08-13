@@ -590,6 +590,14 @@ pub struct Searcher {
     /// pide (score que cae, mejor jugada inestable) pero JAMAS lo cruza.
     /// None = comportamiento clasico (maximo == optimo).
     pub tiempo_maximo_ms: Option<u64>,
+    /// Techo DURO opcional de nodos ("go nodes N" de UCI). Se revisa en el
+    /// mismo chequeo periodico que el deadline de tiempo (check_time, cada
+    /// 256 nodos DENTRO del arbol, no solo entre iteraciones de
+    /// profundizacion) -- si solo se revisara entre iteraciones, el
+    /// crecimiento exponencial de nodos por profundidad (factor de
+    /// ramificacion) haria que el motor se pase por varias veces el limite
+    /// antes de que el chequeo entre depths llegue a ejecutarse.
+    pub nodes_limit: Option<u64>,
     stop: bool,
     // Generacion de la busqueda actual para aging de la TT (0..31): se
     // incrementa al inicio de cada busqueda y las entradas de la generacion
@@ -759,6 +767,7 @@ impl Searcher {
             nodes: 0,
             deadline: None,
             tiempo_maximo_ms: None,
+            nodes_limit: None,
             stop: false,
             tt_generation: 0,
             killers: vec![[None, None]; MAX_KILLER_PLY],
@@ -859,6 +868,7 @@ impl Searcher {
             nodes: 0,
             deadline: None,
             tiempo_maximo_ms: None,
+            nodes_limit: None,
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
             history: Box::new([[0i32; 64]; 64]),
@@ -1346,6 +1356,16 @@ impl Searcher {
             if !self.stop
                 && let Some(flag) = &self.external_stop
                 && flag.load(Ordering::Relaxed)
+            {
+                self.stop = true;
+            }
+            // Limite de nodos ("go nodes N"): mismo chequeo periodico (cada
+            // 256 nodos) que ya se usa para el deadline de tiempo, no solo
+            // entre iteraciones de profundizacion -- ver comentario en
+            // `nodes_limit`.
+            if !self.stop
+                && let Some(lim) = self.nodes_limit
+                && self.nodes >= lim
             {
                 self.stop = true;
             }
@@ -3694,6 +3714,7 @@ pub fn buscar_lazy_smp(
     external_stop: Arc<AtomicBool>,
     root_moves_filtro: Option<Vec<Move>>,
     pool: &mut PoolMemoriaSMP,
+    nodes_limit: Option<u64>,
 ) -> (Option<Move>, i32, u64, Vec<ResultadoHilo>) {
     // Aging compartido de la TT (ver set_tt_generacion): el contador vive en
     // el llamador (junto a smp_tt, que persiste entre jugadas) y avanza UNA
@@ -3713,6 +3734,7 @@ pub fn buscar_lazy_smp(
         s.set_external_stop(Some(external_stop));
         s.set_game_history(game_history.to_vec());
         s.root_moves_filtro = root_moves_filtro;
+        s.nodes_limit = nodes_limit;
         let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _, _| {});
         let nodos = s.nodes;
         pool.devolver(0, s.extraer_memoria());
@@ -3755,6 +3777,14 @@ pub fn buscar_lazy_smp(
                 };
                 s.set_external_stop(Some(external_stop));
                 s.set_game_history(game_history);
+                // NOTA: en Lazy SMP real (n_hilos > 1) cada hilo recibe el
+                // MISMO limite N -- no hay un contador de nodos compartido
+                // entre hilos, asi que el total agregado puede llegar hasta
+                // n_hilos * N en el peor caso, no exactamente N. Sigue
+                // siendo un techo acotado (antes no habia limite alguno);
+                // acotar el TOTAL exacto entre hilos requeriria un contador
+                // atomico compartido, fuera de alcance de este fix.
+                s.nodes_limit = nodes_limit;
                 let (mv, sc, prof) =
                     s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _, _| {});
                 let nodos = s.nodes;
@@ -4142,6 +4172,7 @@ mod regression_tests {
             Arc::clone(&stop),
             None,
             &mut pool,
+            None,
         );
         let g1 = generaciones_presentes(&tt);
         assert!(
@@ -4167,6 +4198,7 @@ mod regression_tests {
             Arc::clone(&stop),
             None,
             &mut pool,
+            None,
         );
         let g2 = generaciones_presentes(&tt);
         assert!(
@@ -4220,6 +4252,7 @@ mod regression_tests {
                 Arc::clone(&stop),
                 None,
                 pool,
+                None,
             );
         };
 
@@ -4465,6 +4498,7 @@ mod reproduccion_h5c5 {
                 stop.clone(),
                 None,
                 &mut pool,
+                None,
             );
             let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
             assert!(
@@ -4622,6 +4656,7 @@ mod reproduccion_h5c5 {
             stop.clone(),
             None,
             &mut pool,
+            None,
         );
         let uci = mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string());
         assert!(

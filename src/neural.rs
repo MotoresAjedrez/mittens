@@ -617,9 +617,15 @@ impl NnueAccumulator {
 fn bullet_pura() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        matches!(
+        // Por defecto activo desde 2026-08-13: con la red reentrenada
+        // (etiquetas Stockfish-15ms, dataset barajado, checkpoint
+        // cand_pura150-150) y MIMOTOR_PESO_BULLET=1.6, el modo puro le
+        // gano al hibrido 59.2% en 200 partidas (ver h2h_puro16_vs_hibrido_v3.log
+        // en mi-motor-rust-agentes/cand_nnue_pura). Se puede apagar con
+        // MIMOTOR_BULLET_PURA=0 para volver al hibrido clasica+red.
+        !matches!(
             std::env::var("MIMOTOR_BULLET_PURA").as_deref(),
-            Ok("1") | Ok("true")
+            Ok("0") | Ok("false")
         )
     })
 }
@@ -654,11 +660,14 @@ fn peso_bullet_amenazas() -> f64 {
 fn peso_bullet() -> f64 {
     static CACHE: OnceLock<f64> = OnceLock::new();
     *CACHE.get_or_init(|| {
+        // Default 1.6 desde 2026-08-13, calibrado en modo puro (ver
+        // bullet_pura arriba) para compensar la escala de busqueda
+        // afinada sobre el hibrido clasica+red.
         std::env::var("MIMOTOR_PESO_BULLET")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 8.0)
-            .unwrap_or(1.0)
+            .unwrap_or(1.6)
     })
 }
 
