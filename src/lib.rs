@@ -1024,7 +1024,13 @@ fn parse_setoption(partes: &[&str]) -> Option<(String, Option<String>)> {
     Some((nombre, valor))
 }
 
-fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead_ms: u64) -> u64 {
+fn calcular_movetime_reloj(
+    mio_i: i64,
+    inc_i: i64,
+    movestogo: i64,
+    move_overhead_ms: u64,
+    max_move_time_ms: u64,
+) -> u64 {
     let mio = mio_i.max(0) as u64;
     let inc = inc_i.max(0) as u64;
     let disponible = mio.saturating_sub(move_overhead_ms);
@@ -1033,6 +1039,14 @@ fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead
         3_500
     } else {
         20_000
+    };
+    // "Max Move Time" (0 = sin limite): tope duro pedido por el operador. Se
+    // aplica al OBJETIVO ademas de al maximo para que los factores reactivos
+    // se estiren sobre un presupuesto ya acotado y no sobre el original.
+    let techo = if max_move_time_ms > 0 {
+        techo.min(max_move_time_ms)
+    } else {
+        techo
     };
     let base = disponible / movestogo.max(1) as u64;
     let objetivo = base.saturating_add(inc.saturating_mul(8) / 10);
@@ -1050,12 +1064,25 @@ fn calcular_movetime_reloj(mio_i: i64, inc_i: i64, movestogo: i64, move_overhead
 ///    arrancada justo antes del corte blando podia comerse casi todo el
 ///    reloj de golpe (se midio una partida perdida por tiempo asi).
 /// Perder por tiempo es peor que cualquier Elo que se gane.
-fn calcular_movetime_maximo(mio_i: i64, move_overhead_ms: u64, objetivo_ms: u64) -> u64 {
+fn calcular_movetime_maximo(
+    mio_i: i64,
+    move_overhead_ms: u64,
+    objetivo_ms: u64,
+    max_move_time_ms: u64,
+) -> u64 {
     let mio = mio_i.max(0) as u64;
     let disponible = mio.saturating_sub(move_overhead_ms);
     let por_reloj = disponible.saturating_mul(80) / 100;
     let por_objetivo = objetivo_ms.saturating_mul(4);
-    por_reloj.min(por_objetivo).max(1)
+    let maximo = por_reloj.min(por_objetivo);
+    // Tercer limite: el tope duro del operador ("Max Move Time", 0 = off).
+    // Manda el mas chico de los tres.
+    let maximo = if max_move_time_ms > 0 {
+        maximo.min(max_move_time_ms)
+    } else {
+        maximo
+    };
+    maximo.max(1)
 }
 
 pub fn uci_loop() {
@@ -1063,6 +1090,9 @@ pub fn uci_loop() {
     let mut board = Board::from_fen(STARTPOS).unwrap();
     let mut tt_mb: usize = 64;
     let mut move_overhead_ms: u64 = 75;
+    // Tope duro de tiempo por jugada en ms; 0 = sin limite (comportamiento
+    // historico). Pensado para partidas online donde interesa mover rapido.
+    let mut max_move_time_ms: u64 = 0;
     // Lazy SMP y el hilo principal deben compartir una sola TT. Antes se
     // construía aquí una TT propia y, unas líneas después, otra para SMP;
     // con Hash=512 eso duplicaba la reserva de memoria desde el arranque.
@@ -1203,6 +1233,7 @@ pub fn uci_loop() {
                 println!("option name Hash type spin default 64 min 1 max 1024");
                 println!("option name Clear Hash type button");
                 println!("option name Move Overhead type spin default 75 min 0 max 5000");
+                println!("option name Max Move Time type spin default 0 min 0 max 300000");
                 println!(
                     "option name Threads type spin default {} min 1 max 16",
                     n_hilos
@@ -1245,6 +1276,10 @@ pub fn uci_loop() {
                     } else if nombre.eq_ignore_ascii_case("move overhead") {
                         if let Some(ms) = valor.and_then(|v| v.parse::<u64>().ok()) {
                             move_overhead_ms = ms.min(5000);
+                        }
+                    } else if nombre.eq_ignore_ascii_case("max move time") {
+                        if let Some(ms) = valor.and_then(|v| v.parse::<u64>().ok()) {
+                            max_move_time_ms = ms.min(300_000);
                         }
                     } else if nombre.eq_ignore_ascii_case("threads") {
                         if let Some(n) = valor.and_then(|v| v.parse::<usize>().ok()) {
@@ -1578,6 +1613,7 @@ pub fn uci_loop() {
                             inc_i,
                             movestogo,
                             move_overhead_ms,
+                            max_move_time_ms,
                         ));
                         // Techo duro para el time management de dos
                         // presupuestos (ver Searcher::tiempo_maximo_ms).
@@ -1585,6 +1621,7 @@ pub fn uci_loop() {
                             mio_i,
                             move_overhead_ms,
                             movetime.unwrap_or(0),
+                            max_move_time_ms,
                         ));
                     } else if nodes_limit.is_none() {
                         movetime = Some(2000); // "go" sin ningun parametro de tiempo: default razonable
