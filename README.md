@@ -1,4 +1,4 @@
-# 🐱 Mittens (NOTA:Claude ayudo en este motor, apoyado de los recursos que tenia la computadora)
+# 🐱 Mittens (NOTE:VIBECODED)
 
 ![logo](logo.png)
 
