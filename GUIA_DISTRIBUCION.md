@@ -45,6 +45,21 @@ nada de Mac, gratis y para siempre (no caduca):
 
 ---
 
+## Opción 2b — Linux: un solo binario, sin Mac, permanente.
+
+Para amigos con **Linux** (PC de escritorio, servidor, o incluso una
+Raspberry con Linux x86), hay un binario nativo igual que el de Windows:
+
+- El archivo es [`mittens-linux-x64`](mittens-linux-x64) (~4 MB, x86-64), en la
+  raíz de este repo. Recompilado con la versión más reciente del motor.
+- Igual que el de Windows, es un *motor UCI*: se carga en una GUI de ajedrez de
+  Linux (**Cute Chess**, **BanksiaGUI**, **Scid vs PC**, todas gratis) para
+  jugar con tablero.
+- Pasos: descargar, darle permiso de ejecución (`chmod +x mittens-linux-x64`),
+  y añadirlo como motor en la GUI. Cero Mac.
+
+---
+
 ## Opción 3 — Android: compartir un APK (gratis, sin Mac, permanente) — PENDIENTE DE CONSTRUIR
 
 En Android **sí se puede** distribuir sin ningún Mac: se genera un archivo `.apk`
@@ -92,6 +107,7 @@ gratis con cable (la otra guía) alcanza.
 |---|---|---|---|
 | Cualquier cosa (iPhone/Android/PC) | Juega el bot en **Lichess** | No | Gratis (tu Mac corre el bot) |
 | **Windows** | Descarga el `.exe` + Arena | No | Gratis, permanente |
+| **Linux** | Descarga el binario + Cute Chess | No | Gratis, permanente |
 | **Android** | Instala el `.apk` *(cuando exista)* | No | Gratis, permanente |
 | **iPhone**, sin tu Mac | **TestFlight** | No | 99 USD/año (Apple) |
 | **iPhone**, método gratis | Cable + Xcode en tu Mac | **Sí** | Gratis, caduca 7 días |
