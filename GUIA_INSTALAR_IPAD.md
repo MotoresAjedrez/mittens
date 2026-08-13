@@ -1,5 +1,11 @@
 # Guía: instalar Mittens en tu iPhone o iPad
 
+> **Actualizado 2026-08-13**: `MimotorCore.xcframework` se recompiló con la
+> versión más reciente del motor (red NNUE reentrenada, modo puro por
+> defecto, +13-16% más rápido). Si ya tenías la app instalada de antes, repite
+> el **Paso 6** (▶ en Xcode) para llevar el iPhone/iPad a la versión nueva —
+> no hace falta rehacer los pasos 1 al 5.
+
 Esta guía es para instalar la app **MiMotorTal** (tu motor de ajedrez) en un
 iPhone o iPad **tuyo**, usando solo un **Apple ID gratuito**. No hace falta
 pagar el programa de desarrollador de Apple (los 99 dólares al año). Apple
