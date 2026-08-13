@@ -1,4 +1,4 @@
-# 🐱 Mittens
+# 🐱 Mittens (NOTA:Claude ayudo en este motor, apoyado de los recursos que tenia la computadora)
 
 ![logo](logo.png)
 
