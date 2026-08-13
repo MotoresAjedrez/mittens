@@ -1230,7 +1230,7 @@ pub fn uci_loop() {
             "uci" => {
                 println!("id name Mittens");
                 println!("id author Tavito y Claude");
-                println!("option name Hash type spin default 64 min 1 max 1024");
+                println!("option name Hash type spin default 64 min 1 max 131072");
                 println!("option name Clear Hash type button");
                 println!("option name Move Overhead type spin default 75 min 0 max 5000");
                 println!("option name Max Move Time type spin default 0 min 0 max 300000");
@@ -1268,7 +1268,7 @@ pub fn uci_loop() {
                         }
                     } else if nombre.eq_ignore_ascii_case("hash") {
                         if let Some(mb) = valor.and_then(|v| v.parse::<usize>().ok()) {
-                            tt_mb = mb.clamp(1, 1024);
+                            tt_mb = mb.clamp(1, 131_072);
                             reiniciar_tt = true;
                         }
                     } else if nombre.eq_ignore_ascii_case("clear hash") {
