@@ -854,12 +854,22 @@ impl ClassicalAccumulator {
 pub struct EvalState {
     classical: ClassicalAccumulator,
     nnue_activo: bool,
+    /// RENDIMIENTO: false cuando el acumulador clasico se dejo de actualizar
+    /// por delta porque en esta configuracion (red "pura") su valor no entra
+    /// en la evaluacion de ningun nodo. Los pocos consumidores que aun
+    /// necesitan la clasica (hoy solo `draw_score`, en repeticion/regla de
+    /// 50) la recalculan desde el tablero con `evaluar_clasica(b, None)`,
+    /// que los tests de `incremental_tests` verifican identica al camino con
+    /// cache. O sea: mismo numero, solo que calculado en los pocos nodos que
+    /// de verdad lo miran en vez de en TODOS.
+    clasica_valida: bool,
 }
 
 pub fn crear_eval_state(b: &Board) -> EvalState {
     EvalState {
         classical: ClassicalAccumulator::desde_tablero(b),
         nnue_activo: true,
+        clasica_valida: true,
     }
 }
 
@@ -873,10 +883,39 @@ impl EvalState {
         self.nnue_activo
     }
 
+    /// Parte clasica de la evaluacion de `b`. Usa el acumulador incremental
+    /// si sigue vigente; si se dejo de mantener (modo red pura), la calcula
+    /// desde el tablero. Los dos caminos dan el MISMO entero: es la
+    /// equivalencia que comprueban `incremental_tests` posicion por
+    /// posicion.
+    #[inline]
+    pub(crate) fn clasica(&self, b: &Board) -> i32 {
+        if self.clasica_valida {
+            evaluar_clasica(b, Some(&self.classical))
+        } else {
+            evaluar_clasica(b, None)
+        }
+    }
+
     pub fn despues_de_jugada(&self, antes: &Board, despues: &Board) -> EvalState {
         EvalState {
             classical: self.classical.despues_de_jugada(antes, despues),
             nnue_activo: self.nnue_activo,
+            clasica_valida: self.clasica_valida,
+        }
+    }
+
+    /// Igual que `despues_de_jugada` pero SIN actualizar el acumulador
+    /// clasico. Solo lo puede usar quien haya comprobado que en esta
+    /// configuracion la parte clasica no entra en ninguna evaluacion (ver
+    /// `Searcher::clasica_necesaria`). El acumulador queda marcado invalido
+    /// para que nadie lo lea por error.
+    #[inline]
+    pub fn despues_de_jugada_sin_clasica(&self, _antes: &Board, _despues: &Board) -> EvalState {
+        EvalState {
+            classical: self.classical,
+            nnue_activo: self.nnue_activo,
+            clasica_valida: false,
         }
     }
 
@@ -885,9 +924,21 @@ impl EvalState {
     /// crear el delta de amenazas NNUE por cada captura es la parte que hace
     /// efectiva la optimización, no solo cambiar la suma final.
     pub fn despues_de_jugada_solo_clasica(&self, antes: &Board, despues: &Board) -> EvalState {
+        // Si el acumulador del padre venia invalidado (modo red pura), no se
+        // puede aplicar un delta encima: se reconstruye desde el tablero,
+        // que da exactamente el mismo acumulador (verificado en
+        // `incremental_tests`). En la configuracion por defecto esta rama no
+        // se ejecuta nunca, porque quien invalida solo lo hace cuando nadie
+        // va a pedir la clasica.
+        let classical = if self.clasica_valida {
+            self.classical.despues_de_jugada(antes, despues)
+        } else {
+            ClassicalAccumulator::desde_tablero(despues)
+        };
         EvalState {
-            classical: self.classical.despues_de_jugada(antes, despues),
+            classical,
             nnue_activo: false,
+            clasica_valida: true,
         }
     }
 }
@@ -1222,22 +1273,34 @@ pub fn evaluate_with_state(
     state: &EvalState,
     nnue: Option<&crate::neural::NnueAccumulator>,
 ) -> i32 {
-    let clasica = evaluar_clasica(b, Some(&state.classical));
+    // RENDIMIENTO: la clasica se calcula SOLO si su valor se va a usar. En
+    // modo "red pura" (el default desde 2026-08-13) el resultado era
+    // `red + TEMPO` y la clasica se descartaba entera, pero se calculaba
+    // igual porque estaba antes del `match`. Perfilando (macOS `sample`,
+    // 14s de busqueda a 1 hilo) ese trabajo muerto era ~15% del tiempo
+    // total del hilo de busqueda. `evaluar_clasica` es una funcion PURA
+    // (lee tablero y acumulador, no escribe nada), asi que no calcularla no
+    // tiene ningun efecto observable: el numero devuelto es bit a bit el
+    // mismo en los tres caminos.
     match nnue.filter(|_| state.nnue_activo) {
         Some(acumulador) => {
             let red = (acumulador.peso() * acumulador.evaluar() as f64).round() as i32;
             // En modo "red sola" la clasica se descarta por completo; se
             // conserva TEMPO para no perder la nocion de quien mueve.
-            if acumulador.pura() { red + TEMPO } else { clasica + red }
+            if acumulador.pura() {
+                red + TEMPO
+            } else {
+                state.clasica(b) + red
+            }
         }
-        None => clasica,
+        None => state.clasica(b),
     }
 }
 
 /// Evaluación clásica desde el acumulador incremental ya disponible.
 /// La quiescence puede usar esta ruta sin recomputar componentes clásicos.
 pub fn evaluate_classical_with_state(b: &Board, state: &EvalState) -> i32 {
-    evaluar_clasica(b, Some(&state.classical))
+    state.clasica(b)
 }
 
 #[cfg(test)]

@@ -953,6 +953,29 @@ impl Searcher {
         }
     }
 
+    /// True si en ESTA configuracion la parte clasica de la evaluacion puede
+    /// entrar en el puntaje de algun nodo. Cuando es false, mantener el
+    /// acumulador clasico por delta en cada nodo es trabajo puro perdido
+    /// (era ~10% del tiempo de busqueda segun el perfilado): la unica funcion
+    /// que aun la consulta es `draw_score`, que la recalcula desde el
+    /// tablero en las pocas posiciones de repeticion/regla de 50.
+    ///
+    /// Se exige que las TRES condiciones se cumplan para poder saltarla:
+    ///   - hay acumulador NNUE y su red es "pura" (evalua sola),
+    ///   - la quiescence usa NNUE (si no, su stand-pat es clasico puro),
+    ///   - no hay nodos que suelten la NNUE por profundidad
+    ///     (`NNUEClassicalDepth`), que evaluarian con la clasica.
+    #[inline]
+    fn clasica_necesaria(&self) -> bool {
+        if self.nnue_classical_depth > 0 || !self.qsearch_nnue {
+            return true;
+        }
+        match self.nnue.as_ref() {
+            Some(acum) => !acum.pura(),
+            None => true,
+        }
+    }
+
     #[inline]
     fn evaluar_completo(&self, b: &Board, eval_state: &EvalState) -> i32 {
         evaluate_with_state(b, eval_state, self.nnue_de(eval_state))
@@ -1009,7 +1032,11 @@ impl Searcher {
         despues: &Board,
     ) -> EvalState {
         let hijo = if self.qsearch_nnue {
-            eval_state.despues_de_jugada(antes, despues)
+            if self.clasica_necesaria() {
+                eval_state.despues_de_jugada(antes, despues)
+            } else {
+                eval_state.despues_de_jugada_sin_clasica(antes, despues)
+            }
         } else {
             eval_state.despues_de_jugada_solo_clasica(antes, despues)
         };
@@ -1032,8 +1059,10 @@ impl Searcher {
             && !despues.in_check(despues.turn)
         {
             eval_state.despues_de_jugada_solo_clasica(antes, despues)
-        } else {
+        } else if self.clasica_necesaria() {
             eval_state.despues_de_jugada(antes, despues)
+        } else {
+            eval_state.despues_de_jugada_sin_clasica(antes, despues)
         };
         self.entrar_hijo(hijo, antes, despues)
     }
