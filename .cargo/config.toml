@@ -12,10 +12,17 @@ rustflags = ["-C", "target-cpu=apple-m5", "-C", "target-feature=+dotprod"]
 [target.aarch64-linux-android]
 linker = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android24-clang"
 ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
-# El +dotprod de [build] es especifico del M5 de la Mac (confirmado con
-# FEAT_DotProd=1 ahi). Sin verificar que el celular soporte esa instruccion
-# ARM, vacio para no arriesgar un SIGILL en tiempo de ejecucion.
-rustflags = []
+# +dotprod aqui NO es opcional: src/neural.rs (cfg(target_arch = "aarch64"))
+# usa "sdot" en ensamblador en linea sin fallback escalar, asi que CUALQUIER
+# build aarch64 (Android, Linux, macOS) directamente no compila sin esta
+# bandera -- no es una optimizacion "a lo mejor la CPU la tiene", es un
+# requisito duro del codigo fuente. dotprod es ARMv8.2+ (~2017 en adelante),
+# lo trae practicamente cualquier telefono o servidor ARM64 moderno
+# (confirmado FEAT_DotProd=1 en los 2 celulares de prueba). Un ARM64 mas
+# viejo que ARMv8.2 simplemente no puede compilar este binario tal como esta
+# escrito el codigo -- eso requeriria agregar una ruta escalar de fallback
+# en neural.rs, que es un cambio de codigo, no de config.
+rustflags = ["-C", "target-feature=+dotprod"]
 
 # --- Android 32 bits (celulares viejos/economicos) ---
 [target.armv7-linux-androideabi]
@@ -45,9 +52,9 @@ rustflags = ["-C", "target-cpu=x86-64-v2"]
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=x86-64-v2"]
 
-# --- Linux ARM64 nativo (ej. servidores ARM, Raspberry Pi 64 bits, etc.) ---
-# No asumimos +dotprod aqui: a diferencia del M5 de esta Mac (confirmado con
-# FEAT_DotProd=1), no hay garantia de que un ARM64 Linux generico lo tenga.
-# Se deja en el baseline armv8-a que trae el target por default.
+# --- Linux ARM64 nativo (ej. servidores ARM, Raspberry Pi 4/5 de 64 bits) ---
+# Mismo caso que Android arriba: +dotprod es requisito duro del codigo
+# fuente (src/neural.rs), no una optimizacion opcional. Sin esta bandera
+# el build de este target directamente no compila.
 [target.aarch64-unknown-linux-gnu]
-rustflags = []
+rustflags = ["-C", "target-feature=+dotprod"]
