@@ -3894,6 +3894,91 @@ mod regression_tests {
         );
     }
 
+    /// `da_jaque_sin_copiar` decide si una jugada da jaque SIN construir el
+    /// tablero resultante (reconstruye a mano la ocupacion virtual, el
+    /// enroque, el peon comido al paso y la promocion). Es una optimizacion
+    /// caliente: de ella dependen CINCO decisiones de poda distintas en
+    /// quiescence y negamax. Un falso negativo poda una jugada de jaque que
+    /// no se debia podar; un falso positivo desactiva podas que si
+    /// correspondian. En ambos casos se pierde fuerza en silencio, sin
+    /// crashear ni fallar ningun test -- justo el tipo de bug que solo
+    /// aparece como "el motor juega peor y no sabemos por que".
+    ///
+    /// No tenia ninguna prueba. Esta la contrasta contra la verdad de fondo
+    /// (hacer la jugada de verdad y preguntar si el rival quedo en jaque)
+    /// para TODAS las jugadas legales de un arbol de posiciones elegidas por
+    /// cubrir los casos que la funcion reconstruye a mano.
+    fn jaque_coincide_con_verdad(b: &Board) {
+        for mv in generate_legal(b) {
+            let rapido = da_jaque_sin_copiar(b, &mv);
+            // Verdad de fondo: tras la jugada, el bando que ahora mueve
+            // (el rival) esta en jaque?
+            let despues = b.make_move(&mv);
+            let real = despues.in_check(despues.turn);
+            assert_eq!(
+                rapido,
+                real,
+                "da_jaque_sin_copiar dijo {} para {} en {} (la verdad es {})",
+                rapido,
+                mv.to_uci(),
+                b.to_fen(),
+                real
+            );
+        }
+    }
+
+    fn explorar_jaques(b: &Board, profundidad: u32) {
+        jaque_coincide_con_verdad(b);
+        if profundidad == 0 {
+            return;
+        }
+        for mv in generate_legal(b) {
+            explorar_jaques(&b.make_move(&mv), profundidad - 1);
+        }
+    }
+
+    #[test]
+    fn da_jaque_sin_copiar_coincide_con_hacer_la_jugada() {
+        let posiciones = [
+            // Posicion inicial: el caso trivial y masivo.
+            Board::startpos(),
+            // "Kiwipete": enroques por ambos lados, clavadas y descubiertos.
+            Board::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -")
+                .expect("fen valido"),
+            Board::from_fen("rnbqkbnr/pp1ppppp/8/2pP4/8/8/PPP1PPPP/RNBQKBNR w KQkq c6 0 2")
+                .expect("fen valido"),
+            // Final con torres y peones: descubiertos por lineas largas.
+            Board::from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1").expect("fen valido"),
+            // Promociones (incluida promocion con captura) y enroque negro.
+            Board::from_fen("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1")
+                .expect("fen valido"),
+            // --- Casos que la funcion reconstruye A MANO y que las
+            // posiciones "normales" de arriba NO ejercitan (comprobado
+            // rompiendo cada rama a proposito: sin estos FEN el test seguia
+            // pasando con el bug puesto). ---
+            //
+            // JAQUE DESCUBIERTO POR CAPTURA AL PASO: exd6 al paso despeja
+            // DOS casillas de la fila 5 a la vez (sale el peon blanco de e5
+            // y desaparece el negro de d5), y la torre a5 pasa a dar jaque
+            // al rey h5. Si la funcion no quita el peon comido, no ve el
+            // jaque.
+            Board::from_fen("8/8/8/R2pP2k/8/8/8/K7 w - d6 0 1").expect("fen valido"),
+            // JAQUE AL ENROCAR: tras O-O la TORRE llega a f1 y da jaque al
+            // rey de f8. El jaque lo da la torre, no el rey que se movio,
+            // asi que solo se ve si se reubica la torre del enroque.
+            Board::from_fen("5k2/8/8/8/8/8/8/4K2R w K - 0 1").expect("fen valido"),
+            // Lo mismo del lado de dama: tras O-O-O la torre llega a d1 y
+            // da jaque al rey de d8.
+            Board::from_fen("3k4/8/8/8/8/8/8/R3K3 w Q - 0 1").expect("fen valido"),
+            // PROMOCION QUE DA JAQUE: el peon corona y la pieza NUEVA es la
+            // que da jaque; con el tipo de pieza sin actualizar no se ve.
+            Board::from_fen("8/1P6/8/8/8/7k/8/K7 w - - 0 1").expect("fen valido"),
+        ];
+        for b in &posiciones {
+            explorar_jaques(b, 2);
+        }
+    }
+
     #[test]
     fn score_mate_tt_roundtrip_en_distintos_plies() {
         for ply in [0, 1, 7, 31] {

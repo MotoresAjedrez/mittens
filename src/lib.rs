@@ -1085,6 +1085,35 @@ fn calcular_movetime_maximo(
     maximo.max(1)
 }
 
+/// Aplica "Max Move Time" (0 = sin limite) al presupuesto ya resuelto.
+///
+/// Es un tope DURO POR JUGADA del operador, no un ajuste del reparto del
+/// reloj, asi que vale para toda busqueda con limite de tiempo y no solo
+/// para la rama de wtime/btime -- que era la unica que lo aplicaba. Sin
+/// esto, con Max Move Time=200 un `go movetime 5000` pensaba los 5000 ms
+/// igual y un `go` pelado se iba a los 2000 ms de default: la opcion se
+/// anunciaba en `uci` pero se ignoraba en 2 de las 3 rutas con tiempo.
+///
+/// `go infinite` NO pasa por aca a proposito: su contrato UCI es analizar
+/// hasta recibir "stop", y ahi manda el GUI. Se reconoce porque llega con
+/// `objetivo` en None.
+fn aplicar_tope_operador(
+    objetivo: &mut Option<u64>,
+    maximo: &mut Option<u64>,
+    max_move_time_ms: u64,
+) {
+    if max_move_time_ms == 0 {
+        return;
+    }
+    let Some(mt) = *objetivo else {
+        return; // `go infinite`: sin presupuesto propio, no se toca
+    };
+    *objetivo = Some(mt.min(max_move_time_ms));
+    // El techo duro tambien baja: si no, los factores reactivos del time
+    // management podrian estirarse por encima del tope del operador.
+    *maximo = Some(maximo.map_or(max_move_time_ms, |m| m.min(max_move_time_ms)));
+}
+
 pub fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
@@ -1628,6 +1657,19 @@ pub fn uci_loop() {
                     }
                 }
 
+                // "Max Move Time" es un tope DURO POR JUGADA del operador, no
+                // un ajuste del reparto del reloj: tiene que valer para toda
+                // busqueda con limite de tiempo, no solo para la rama de
+                // wtime/btime (que era la unica que lo aplicaba). Sin esto,
+                // con Max Move Time=200 un `go movetime 5000` pensaba los
+                // 5000 ms igual, y un `go` pelado se iba a los 2000 ms por
+                // default -- o sea, la opcion se anunciaba en `uci` pero se
+                // ignoraba en 2 de las 3 rutas.
+                //
+                // `go infinite` queda EXCLUIDO a proposito: su contrato UCI
+                // es analizar hasta recibir "stop", y ahi manda el GUI.
+                aplicar_tope_operador(&mut movetime, &mut movetime_maximo, max_move_time_ms);
+
                 // Publica el techo duro del reloj para ESTA busqueda (lo
                 // leen todos los caminos, incluidos los hilos de Lazy SMP).
                 // Se fija siempre, tambien a None, para que un `go movetime`
@@ -1918,7 +1960,9 @@ pub fn uci_loop() {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{calcular_movetime_reloj, parse_setoption, parse_uci_move};
+    use super::{
+        aplicar_tope_operador, calcular_movetime_reloj, parse_setoption, parse_uci_move,
+    };
     use crate::board::Board;
 
     #[test]
@@ -1941,14 +1985,53 @@ mod tests {
     }
     #[test]
     fn reloj_nunca_supera_lo_disponible() {
-        assert_eq!(calcular_movetime_reloj(20, 0, 30, 75), 1);
-        assert!(calcular_movetime_reloj(1_000, 0, 1, 75) <= 925);
-        assert!(calcular_movetime_reloj(10_000, 100, 30, 75) <= 9_925);
+        assert_eq!(calcular_movetime_reloj(20, 0, 30, 75, 0), 1);
+        assert!(calcular_movetime_reloj(1_000, 0, 1, 75, 0) <= 925);
+        assert!(calcular_movetime_reloj(10_000, 100, 30, 75, 0) <= 9_925);
+    }
+
+    /// "Max Move Time" se anunciaba en `uci` como tope duro por jugada pero
+    /// solo se aplicaba en la rama de wtime/btime: `go movetime N` y `go`
+    /// pelado lo ignoraban por completo. Medido antes del arreglo, con el
+    /// tope en 300 ms: `go movetime 3000` pensaba 3.00 s y `go` pelado 2.00 s.
+    #[test]
+    fn max_move_time_topa_todas_las_rutas_con_tiempo() {
+        // `go movetime 3000` con tope de 300: se recorta.
+        let (mut obj, mut max) = (Some(3000), None);
+        aplicar_tope_operador(&mut obj, &mut max, 300);
+        assert_eq!(obj, Some(300));
+        assert_eq!(max, Some(300), "el techo duro tambien debe bajar al tope");
+
+        // `go` pelado (default 2000) con tope de 300: se recorta.
+        let (mut obj, mut max) = (Some(2000), None);
+        aplicar_tope_operador(&mut obj, &mut max, 300);
+        assert_eq!(obj, Some(300));
+
+        // Rama de reloj: el techo duro ya venia calculado y solo puede BAJAR.
+        let (mut obj, mut max) = (Some(1900), Some(7600));
+        aplicar_tope_operador(&mut obj, &mut max, 300);
+        assert_eq!((obj, max), (Some(300), Some(300)));
+
+        // Un tope MAS GRANDE que el presupuesto no lo estira.
+        let (mut obj, mut max) = (Some(500), Some(2000));
+        aplicar_tope_operador(&mut obj, &mut max, 10_000);
+        assert_eq!((obj, max), (Some(500), Some(2000)));
+
+        // Tope 0 = desactivado: no toca nada (comportamiento historico).
+        let (mut obj, mut max) = (Some(3000), Some(9000));
+        aplicar_tope_operador(&mut obj, &mut max, 0);
+        assert_eq!((obj, max), (Some(3000), Some(9000)));
+
+        // `go infinite` (objetivo None): NO se le impone tope, su contrato
+        // UCI es analizar hasta "stop".
+        let (mut obj, mut max) = (None, None);
+        aplicar_tope_operador(&mut obj, &mut max, 300);
+        assert_eq!((obj, max), (None, None), "go infinite no se debe topar");
     }
 
     #[test]
     fn correspondencia_conserva_techo() {
-        assert_eq!(calcular_movetime_reloj(86_400_000, 0, 30, 75), 3_500);
+        assert_eq!(calcular_movetime_reloj(86_400_000, 0, 30, 75, 0), 3_500);
     }
 
     #[test]

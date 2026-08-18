@@ -2,3 +2,6 @@
 *.log
 .DS_Store
 /backups/
+
+# Respaldos manuales de archivos fuente (no deben ir al repo)
+*.bak_pre_*
