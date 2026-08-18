@@ -1,9 +1,12 @@
-# +dotprod: instruccion NEON que acelera los productos punto de la NNUE.
-# `target-cpu=apple-m5` permite al planificador del compilador ordenar ese
-# camino para el nucleo real de la Mac de entrenamiento. No cambia pesos ni
-# evaluaciones; solo genera codigo M5 mas eficiente. Las secciones Android y
-# Windows de abajo sobrescriben estos flags para conservar binarios portables.
-[build]
+# OJO: nada de target-cpu especifico va en [build] global. Ese bloque aplica
+# por default a CUALQUIER build sin seccion [target.*] propia, incluyendo el
+# de quien clone este repo en Linux, Windows, Mac Intel u otro chip Apple.
+# "target-cpu=apple-m5" ahi rompia el build de todo el mundo que no fuera
+# exactamente esta Mac (LLVM viejo no reconoce "apple-m5" -> falla al
+# compilar). La optimizacion especifica del M5 va SOLO en la seccion
+# [target.aarch64-apple-darwin] de abajo, que solo aplica cuando se compila
+# para Mac Apple Silicon.
+[target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m5", "-C", "target-feature=+dotprod"]
 
 [target.aarch64-linux-android]
@@ -27,9 +30,24 @@ ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/
 rustflags = []
 
 # --- Cross-compilation a Windows x64 (para someter a CCRL) ---
-# +dotprod de [build] es exclusivo de ARM/NEON (M5 de la Mac); en x86_64
-# no existe esa instruccion, asi que aqui va vacio para no romper la build.
+# x86-64-v2 (SSE4.2+POPCNT) es una linea base segura: la soporta
+# practicamente cualquier CPU x86_64 desde ~2009, a diferencia de "native"
+# (que optimizaria para ESTA maquina de build y podria generar SIGILL en la
+# maquina de quien lo descargue). No es tan agresivo como v3/AVX2 a proposito,
+# para no dejar fuera CPUs mas viejas que aun corren Windows moderno.
 [target.x86_64-pc-windows-gnu]
 linker = "/opt/homebrew/bin/x86_64-w64-mingw32-gcc"
 ar = "/opt/homebrew/bin/x86_64-w64-mingw32-ar"
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+# --- Linux x86_64 nativo (para quien clone el repo y compile ahi) ---
+# Misma logica que Windows: x86-64-v2 como piso seguro y portable.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+# --- Linux ARM64 nativo (ej. servidores ARM, Raspberry Pi 64 bits, etc.) ---
+# No asumimos +dotprod aqui: a diferencia del M5 de esta Mac (confirmado con
+# FEAT_DotProd=1), no hay garantia de que un ARM64 Linux generico lo tenga.
+# Se deja en el baseline armv8-a que trae el target por default.
+[target.aarch64-unknown-linux-gnu]
 rustflags = []
