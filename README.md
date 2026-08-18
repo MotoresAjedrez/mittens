@@ -1,4 +1,4 @@
-# 🐱 Mittens (NOTE:VIBECODED)
+# 🐱 Mittens 
 
 ![logo](logo.png)
 
@@ -154,3 +154,4 @@ LMR queda activado salvo que se defina expresamente `MITTENS_LMR=0`.
 ## Estado de validacion de este paquete
 
 `cargo test` corre 31/31 pruebas, incluido un fuzz de ~1920 posiciones aleatorias comparando el acumulador NNUE incremental contra el recalculo completo (ver `src/neural.rs`). El manifiesto `MANIFEST_SHA256.txt` se regenera con `shasum -a 256 * src/* > MANIFEST_SHA256.txt` cada vez que cambia el codigo o los pesos -- si no coincide con los archivos actuales, es que el proyecto se modifico despues de la ultima regeneracion, no necesariamente que este corrupto.
+Vibecoded
