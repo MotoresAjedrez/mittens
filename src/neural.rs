@@ -1277,7 +1277,7 @@ fn almacenamiento() -> &'static RwLock<Option<RedCargada>> {
 /// del torneo no configuraba `NNUEPath`, el motor jugaba con evaluacion
 /// clasica pura. Embeberla hace que la NNUE este disponible siempre, sin
 /// depender de que el .bin viaje junto al ejecutable.
-const PESOS_EMBEBIDOS: &[u8] = include_bytes!("../pesos_bullet_512_buckets8.bin");
+const PESOS_EMBEBIDOS: &[u8] = include_bytes!("../pesos_bullet_1024_buckets8.bin");
 
 /// Carga la red embebida. Se llama al arrancar el bucle UCI.
 pub fn cargar_embebida() -> Result<u64, String> {
