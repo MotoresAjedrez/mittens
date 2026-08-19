@@ -156,6 +156,29 @@ const MAX_KILLER_PLY: usize = 176; // margen sobre MAX_PLY para cubrir extension
 // jaque). Ninguna evaluacion real puede valer i32::MIN.
 const EVAL_INVALIDA: i32 = i32::MIN;
 
+/// Margen por ply de la poda RFP (reverse futility), en centipeones de la
+/// escala INTERNA del motor (que va ~1.6x inflada respecto de 100cp = peon,
+/// ver `peso_bullet()` en neural.rs).
+///
+/// Era una constante fija de 120, calibrada cuando la eval era el hibrido
+/// clasica+red de 512 neuronas. Desde entonces cambiaron las dos cosas: el
+/// motor pasa a modo puro (solo red) y la red es de 1024. Una red mas
+/// precisa justifica podar MAS agresivo (se le puede confiar mas a la eval
+/// estatica), asi que el 120 quedo como deuda de calibracion.
+///
+/// Se vuelve ajustable con `MITTENS_RFP_MARGEN` SIN cambiar el default: sin
+/// la variable el comportamiento es bit-identico al de antes.
+fn rfp_margen_por_ply() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_RFP_MARGEN")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v >= 20 && *v <= 400)
+            .unwrap_or(120)
+    })
+}
+
 // Tabla LMR precalculada: reduccion base en plies para cada par
 // (profundidad, numero de jugada en el orden). Formula logaritmica clasica
 // (Ethereal/Stockfish): crece suave con ambas -- las jugadas muy tardias a
@@ -1006,7 +1029,7 @@ impl Searcher {
         // undo tampoco tiene nada que hacer.
         if hijo.nnue_activo() {
             if let Some(acum) = self.nnue.as_mut() {
-                acum.aplicar_jugada(antes, despues);
+                acum.entrar(antes, despues);
             }
         }
         hijo
@@ -1019,7 +1042,7 @@ impl Searcher {
     fn salir_hijo(&mut self, hijo: &EvalState, antes: &Board, despues: &Board) {
         if hijo.nnue_activo() {
             if let Some(acum) = self.nnue.as_mut() {
-                acum.aplicar_jugada(despues, antes);
+                acum.salir(antes, despues);
             }
         }
     }
@@ -1945,7 +1968,7 @@ impl Searcher {
         };
 
         const RFP_PROF_MAX: i32 = 8;
-        const RFP_MARGEN_POR_PLY: i32 = 120;
+        let rfp_margen_base: i32 = rfp_margen_por_ply();
         if !en_jaque && !es_pv && depth <= RFP_PROF_MAX && beta.abs() < MATE - 1000 {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
@@ -1953,7 +1976,7 @@ impl Searcher {
                 self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
             // improving: con mejora el margen se achica (poda mas agresivo);
             // sin mejora se agranda (mas conservador, poda menos).
-            let margen_ply = if improving { RFP_MARGEN_POR_PLY * 3 / 5 } else { RFP_MARGEN_POR_PLY };
+            let margen_ply = if improving { rfp_margen_base * 3 / 5 } else { rfp_margen_base };
             if static_eval - margen_ply * depth >= beta {
                 return Ok(static_eval - margen_ply * depth);
             }

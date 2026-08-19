@@ -1,5 +1,6 @@
 mod bitboard;
 mod board;
+mod datagen;
 mod bullet_net;
 mod bullet_net_amenazas;
 mod eval;
@@ -266,6 +267,25 @@ const BENCH_POSICIONES: [(&str, &str); 6] = [
 ];
 
 fn run_bench(depth: i32) {
+    // La NNUE embebida se cargaba SOLO en `uci_loop`, asi que `mittens bench`
+    // buscaba con evaluacion CLASICA pura: `crear_acumulador` devolvia None
+    // (ACTIVA en false y almacenamiento vacio) y el acumulador del Searcher
+    // quedaba en None toda la busqueda. O sea que el bench -- la metrica
+    // rapida que este proyecto usa para validar cambios -- estaba midiendo
+    // un motor DISTINTO del que juega: sin red, el arbol, el orden y todos
+    // los margenes de poda (calibrados para la escala de la red) se comportan
+    // de otra forma. Eso explica por que el conteo de nodos del bench venia
+    // dando resultados no monotonos e inconsistentes con los h2h.
+    //
+    // OJO: esto CAMBIA el numero de nodos del bench respecto de todas las
+    // mediciones historicas; no son comparables con las anteriores.
+    match neural::cargar_embebida() {
+        Ok(checksum) => {
+            neural::set_activa(true);
+            println!("NNUE embebida activa checksum {checksum:016x}");
+        }
+        Err(e) => println!("AVISO: sin NNUE embebida ({e}) -- bench con eval clasica"),
+    }
     let mut nodos_totales: u64 = 0;
     let mut ms_totales: u128 = 0;
     for (nombre, fen) in BENCH_POSICIONES {
@@ -304,6 +324,7 @@ fn run_bench(depth: i32) {
     println!("Total time (ms) : {}", ms_totales);
     println!("Nodes searched  : {}", nodos_totales);
     println!("Nodes/second    : {:.0}", nps_total);
+
 }
 
 fn run_lmr_diagnostico(depth: i32) {
@@ -2055,6 +2076,10 @@ pub fn run_cli() {
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {
+            "datagen" => {
+                datagen::run_datagen(&args[2..]);
+                return;
+            }
             "perft" => {
                 run_perft_suite();
                 return;
