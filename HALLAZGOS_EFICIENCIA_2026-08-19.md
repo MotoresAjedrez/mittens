@@ -167,9 +167,14 @@ apertura jugada con ambos colores):
 \* Las corridas de 1.2 y 2.0 salieron de una versión del script con un error
 (ver abajo) y valen poco; la de 1.8 sí es limpia.
 
-**1.8 va ganando pero no es concluyente**: con 120 partidas el error estándar
-es ~4,5 %, así que 55 % está a ~1,1 desviaciones de 50 %. Hay un segundo tramo
-de 120 aperturas nuevas corriendo para confirmarlo o descartarlo.
+**RESUELTO: 1.8 NO es mejor.** El primer tramo dio 55,0 % pero con 120
+partidas el error estándar es ~4,5 %, así que no era concluyente. Un segundo
+tramo con 120 aperturas DISTINTAS dio **50,4 %** (60,5/120). Combinado:
+**126,5/240 = 52,7 %**, a 0,84 desviaciones de 50 % — dentro del ruido.
+
+El 55 % inicial era casualidad. **Se queda el default 1.6.** Este es el caso
+de libro de por qué no hay que parar de medir cuando el número da a favor:
+con 120 partidas parecía +35 Elo y no había nada.
 
 `MITTENS_RFP_MARGEN` (perilla nueva, ver abajo): 90 vs 120 dio **51,7 %** en
 120 partidas — dentro del ruido, no promete.
