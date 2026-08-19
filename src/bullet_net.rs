@@ -1,7 +1,9 @@
 // NNUE con la arquitectura ESTANDAR de la industria, entrenada con la
 // libreria `bullet` (https://github.com/jw1912/bullet):
 //
-//     (768 -> 256)x2 -> 1,  doble perspectiva,  activacion SCReLU
+//     (768 -> H)x2 -> 1,  doble perspectiva,  activacion SCReLU
+//     (H = 256, 512 u 1024 segun los pesos cargados; se detecta por el
+//     tamano del archivo, ver ARQUITECTURAS_SOPORTADAS mas abajo)
 //
 // Diferencias clave con la red "de amenazas" que vive en neural.rs:
 //   * Entrada 768 = 2 colores x 6 tipos x 64 casillas (features clasicas de
@@ -34,7 +36,17 @@ use crate::types::{ALL_PIECE_TYPES, Color};
 /// Tamano maximo de capa oculta soportado. El acumulador usa arrays de
 /// este tamano y se rellena solo `h` posiciones, para no volver la
 /// estructura dinamica (se CLONA una vez por nodo de busqueda).
-pub const H_MAX: usize = 512;
+///
+/// PENDIENTE_ENTRENAR_1024: subido de 512 a 1024 para dejar sitio a la
+/// proxima red (mismo formato 768->1024x2->1, 8 output buckets) una vez
+/// que el dataset de Lichess eval-db este listo y se entrene con
+/// ~/bullet-training. Los pesos de 512 SIGUEN cargando tal cual: el
+/// formato se detecta por el TAMANO del archivo (ver
+/// `ARQUITECTURAS_SOPORTADAS` y `arquitectura_para_tamano`), asi que subir
+/// este maximo no cambia el comportamiento con la red de produccion
+/// actual, solo reserva espacio para la que viene. Ver
+/// PENDIENTE_ENTRENAR_1024.md en la raiz del repo.
+pub const H_MAX: usize = 1024;
 const N_ENTRADA: usize = 768;
 const QA: i32 = 255;
 const QB: i32 = 64;
@@ -68,13 +80,21 @@ const fn bytes_utiles(h: usize, b: usize) -> usize {
 /// Arquitecturas admitidas: (capa oculta, output buckets). Cada combinacion
 /// da un tamano de archivo DISTINTO, asi que el tamano identifica el
 /// formato sin necesidad de cabecera (los archivos viejos siguen cargando).
-const ARQUITECTURAS_SOPORTADAS: [(usize, usize); 3] = [(256, 1), (512, 1), (512, 8)];
+///
+/// (1024, 8) es PENDIENTE_ENTRENAR_1024: la red de 1024 neuronas aun no
+/// existe (falta el dataset + entrenamiento), pero ya se reconoce por
+/// tamano de archivo para que, en cuanto aparezcan los pesos entrenados,
+/// carguen sin tocar mas codigo. (256, 1) y (512, 1)/(512, 8) son formatos
+/// viejos/actual, se conservan intactos.
+const ARQUITECTURAS_SOPORTADAS: [(usize, usize); 4] =
+    [(256, 1), (512, 1), (512, 8), (1024, 8)];
 
 /// Maximo de output buckets soportado.
 pub const B_MAX: usize = 8;
 
 pub struct RedBullet {
-    /// Neuronas de la capa oculta de ESTA red (256 o 512).
+    /// Neuronas de la capa oculta de ESTA red (256, 512 o 1024; ver
+    /// ARQUITECTURAS_SOPORTADAS).
     h: usize,
     /// Output buckets de ESTA red (1 = formato viejo, 8 = por material).
     buckets: usize,
@@ -189,8 +209,8 @@ impl RedBullet {
     /// Aplica de UNA SOLA PASADA todas las features que cambian en una
     /// jugada: las de `add` se suman y las de `sub` se restan.
     ///
-    /// Antes cada feature hacia su propio recorrido del acumulador: 512
-    /// lecturas + 512 escrituras POR FEATURE. Una jugada normal cambia 2
+    /// Antes cada feature hacia su propio recorrido del acumulador: H_MAX
+    /// lecturas + H_MAX escrituras POR FEATURE. Una jugada normal cambia 2
     /// features y una captura 3, por cada una de las DOS perspectivas, o sea
     /// entre 4 y 6 pasadas completas de 1 KB cada una por nodo de busqueda.
     /// Aqui el acumulador se lee y escribe UNA vez (en registros NEON, por
@@ -212,8 +232,8 @@ impl RedBullet {
             "feature fuera de rango en aplicar_features"
         );
         // Bloques de 32 i16 = 4 registros NEON. Las redes reales tienen
-        // h = 256 o 512 (ambas multiplos de 32); si algun dia hubiera otra,
-        // se cae al camino escalar, que da exactamente lo mismo.
+        // h = 256, 512 o 1024 (todas multiplos de 32); si algun dia hubiera
+        // otra, se cae al camino escalar, que da exactamente lo mismo.
         #[cfg(target_arch = "aarch64")]
         if self.h % 32 == 0 {
             unsafe {
@@ -455,12 +475,18 @@ impl AcumBullet {
             //   v*v*w                           ->  |.| <= 65025*32768 = 2.13e9
             // Ese producto cabe justo en i32 (limite 2.147e9), asi que cada
             // termino se calcula en i32 con vmulq_s32 sin desbordar NUNCA,
-            // sea cual sea la red. Lo que SI desbordaria es la suma de los
-            // 1024 terminos (con los pesos reales, max |l1w| = 84, ya son
-            // ~5.6e9), asi que los terminos se acumulan ENSANCHANDO a i64 con
+            // sea cual sea la red. Lo que SI desbordaria en i32 es la suma
+            // de los 2*h terminos (con la red de 512 y sus pesos reales,
+            // max |l1w| = 84, la suma de los 1024 terminos ya da ~5.6e9;
+            // con h=1024 serian hasta 2048 terminos, hasta el doble), asi
+            // que los terminos se acumulan ENSANCHANDO a i64 con
             // vpadalq_s32 (suma por pares de i32 -> i64, una instruccion).
-            // La suma entera es asociativa: el i64 final es EXACTAMENTE el
-            // mismo que el del bucle escalar, sin ninguna aproximacion.
+            // i64 tiene margen de sobra incluso en el peor caso teorico
+            // (2*H_MAX terminos de hasta 2.13e9 cada uno = ~4.4e12 con
+            // H_MAX=1024, muy por debajo de i64::MAX ~9.2e18), asi que el
+            // margen no depende de cuanto crezca `h`. La suma entera es
+            // asociativa: el i64 final es EXACTAMENTE el mismo que el del
+            // bucle escalar, sin ninguna aproximacion.
             //
             // CUATRO acumuladores independientes, por el mismo motivo que en
             // neural.rs: con uno solo las multiplicaciones forman una cadena
@@ -563,7 +589,7 @@ mod tests {
         *RED.get_or_init(|| {
             let datos = match std::env::var("MITTENS_RED_BULLET") {
                 Ok(ruta) => std::fs::read(ruta).ok()?,
-                Err(_) => include_bytes!("../pesos_bullet_512_buckets8.bin").to_vec(),
+                Err(_) => include_bytes!("../pesos_bullet_1024_buckets8.bin").to_vec(),
             };
             Some(Box::leak(Box::new(RedBullet::cargar_de_bytes(&datos)?)))
         })
