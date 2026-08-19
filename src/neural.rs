@@ -566,6 +566,29 @@ impl NnueAccumulator {
         }
     }
 
+    /// Baja un ply. En la arquitectura bullet usa la PILA (el padre queda
+    /// intacto y volver es gratis); las otras dos arquitecturas no tienen
+    /// pila, asi que caen al comportamiento de siempre (aplicar in-place).
+    #[inline]
+    pub fn entrar(&mut self, antes: &Board, despues: &Board) {
+        match self {
+            NnueAccumulator::Bullet(a) => a.entrar(antes, despues),
+            NnueAccumulator::Amenazas(a) => a.aplicar_jugada(antes, despues),
+            NnueAccumulator::BulletAmenazas(a) => a.aplicar_jugada(antes, despues),
+        }
+    }
+
+    /// Vuelve al ply anterior. Con pila es O(1); sin pila hay que aplicar el
+    /// delta invertido, para lo cual el llamador pasa los mismos tableros.
+    #[inline]
+    pub fn salir(&mut self, antes: &Board, despues: &Board) {
+        match self {
+            NnueAccumulator::Bullet(a) => a.salir(),
+            NnueAccumulator::Amenazas(a) => a.aplicar_jugada(despues, antes),
+            NnueAccumulator::BulletAmenazas(a) => a.aplicar_jugada(despues, antes),
+        }
+    }
+
     pub fn evaluar(&self) -> f32 {
         match self {
             NnueAccumulator::Amenazas(a) => a.evaluar(),
