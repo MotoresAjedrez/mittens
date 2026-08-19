@@ -305,6 +305,64 @@ struct Magics {
     table: Vec<Bitboard>,
 }
 
+
+// ---------------------------------------------------------------------------
+// NUMEROS MAGICOS PRECALCULADOS
+// ---------------------------------------------------------------------------
+// `build_magics` los BUSCABA por prueba y error en cada arranque, con un RNG
+// de semilla fija. Al ser la semilla fija, el resultado era SIEMPRE el mismo:
+// se recalculaban ~800 ms de trabajo identico cada vez que arrancaba el motor
+// (medido: 809 ms de los 840 ms de arranque total).
+//
+// En una computadora de escritorio pasa desapercibido, pero en un telefono
+// lento son varios segundos antes de poder mover, y en una partida de 1 minuto
+// eso es una fraccion enorme del reloj tirada.
+//
+// Aca estan los mismos numeros que la busqueda encontraba, ya resueltos. La
+// construccion de la tabla de ataques sigue igual; lo unico que se elimina es
+// la busqueda. El test `magicos_precalculados_siguen_siendo_validos` comprueba
+// que cada uno indexa sin colisiones destructivas, asi que si alguno estuviera
+// mal el fallo salta en los tests, no en una partida.
+/// Numeros magicos de TORRE, precalculados (ver `build_magics`).
+static MAGICOS_TORRE: [u64; 64] = [
+    0x2080002080400010, 0x00C0002001401000, 0x2100110008402002, 0x0880080081041000,
+    0x0200020020041008, 0x2300040008010012, 0x0C00283004008201, 0x0180010000407A80,
+    0x0168800080400020, 0x0010400040201000, 0x1001002001001048, 0x1001002408100100,
+    0x0801000408010012, 0x4001000209000400, 0x08A20004C8020001, 0x2002801145002280,
+    0x0080860021004200, 0x001000C009402002, 0x00B0002004002800, 0x100A808010020800,
+    0x8101010008000410, 0x0244008002000480, 0x0000040010810208, 0x2000020000448534,
+    0x4104400480008033, 0x0000810100204000, 0x0440430900200010, 0x4600240900100100,
+    0x0060080080040080, 0x0001000300080400, 0x0004084400011002, 0x0023040200008041,
+    0x0580050043002080, 0x0400804002802008, 0x0001002001004010, 0x1000200901001000,
+    0x4410800801800C00, 0xA012003806001004, 0x0020100104008802, 0x0004808402000041,
+    0x0010400170898000, 0x0080500020004004, 0x1040408012020020, 0x8010040008004040,
+    0x2001080100110004, 0x0000020004008080, 0x0021010810040002, 0x0800008C43020024,
+    0x0000800021005100, 0x0070201040008080, 0x0000D04282006A00, 0x0010014400080240,
+    0x0001080110050100, 0x0012000810240600, 0x0402000801040200, 0x028100108A004100,
+    0x0050800300102045, 0x8208210040120882, 0x8010600101183441, 0x020B000910006045,
+    0x0241001002480005, 0x0081000400880241, 0x0000009008024124, 0x0048122980410402,
+];
+
+/// Numeros magicos de ALFIL, precalculados (ver `build_magics`).
+static MAGICOS_ALFIL: [u64; 64] = [
+    0x0848020822040013, 0x8010A40085821200, 0x0008008430840822, 0x0808048108040000,
+    0x1304042100008104, 0x5001012010204023, 0x81048801B8200420, 0x200A008084012000,
+    0x0040102001042084, 0x840A505042428020, 0x0000700102202920, 0x44101C0C10800002,
+    0x0040040422000000, 0x0180020802090202, 0x4020020811041202, 0x000104308C042000,
+    0x4140661002424400, 0x0028012008010460, 0x0188062102002A00, 0x0014004840102008,
+    0x0105000290400002, 0x8001022200410400, 0x104A041918013446, 0x008A000082008238,
+    0x04A0060008100430, 0x0008220008820801, 0x2508041208005010, 0x4008080200202020,
+    0x2441001013004000, 0x0030008060407000, 0x4008108000420800, 0x0012021050290100,
+    0x0210080482200500, 0xCC01112048100480, 0x0020402806500440, 0x00048E0080580080,
+    0x0040102020020080, 0x0028010440080807, 0x4601041108008800, 0x8040810E04104200,
+    0x901210110400088A, 0xA003080212081050, 0x00C1004048401004, 0x900000A014400800,
+    0x0008021040405401, 0x4020008206002090, 0x0004190424030100, 0x0424008A02026250,
+    0x8004088250900040, 0x1C00430088A04200, 0x0001020094040001, 0x8040210020880061,
+    0x2010040450442032, 0x0800840850044001, 0x0004040802140004, 0x0004080A04222020,
+    0x8088802110022000, 0x1081A10416114400, 0x0205010A24060820, 0x0000000720411080,
+    0x1008000208430400, 0x580C026028810840, 0x802020441020A110, 0x12C0022401020018,
+];
+
 static MAGICS: OnceLock<Magics> = OnceLock::new();
 
 fn relevant_mask(sq: Square, dirs: &[(usize, bool); 4]) -> Bitboard {
@@ -337,7 +395,7 @@ fn build_magics() -> Magics {
     let mut rook: Vec<MagicEntry> = Vec::with_capacity(64);
     let mut bishop: Vec<MagicEntry> = Vec::with_capacity(64);
 
-    for (dirs, out) in [(&ROOK_RAYS, &mut rook), (&BISHOP_RAYS, &mut bishop)] {
+    for (es_torre, (dirs, out)) in [(true, (&ROOK_RAYS, &mut rook)), (false, (&BISHOP_RAYS, &mut bishop))] {
         for sq in 0..64u8 {
             let mask = relevant_mask(sq, dirs);
             let bits = popcount(mask);
@@ -360,9 +418,17 @@ fn build_magics() -> Magics {
 
             let offset = table.len();
             table.resize(offset + size, 0);
+            // Se toma el magico ya resuelto para esta casilla en vez de
+            // buscarlo (ver la nota de MAGICOS_TORRE/MAGICOS_ALFIL arriba).
+            // El bucle se conserva porque si algun magico precalculado no
+            // sirviera, cae a la busqueda de siempre en vez de romperse.
+            let mut precalculado = Some(if es_torre { MAGICOS_TORRE[sq as usize] } else { MAGICOS_ALFIL[sq as usize] });
             'busqueda: loop {
-                // Candidato disperso (AND de tres aleatorios) -- converge rápido.
-                let magic = xorshift(&mut rng) & xorshift(&mut rng) & xorshift(&mut rng);
+                let magic = match precalculado.take() {
+                    Some(m) => m,
+                    // Candidato disperso (AND de tres aleatorios) -- converge rápido.
+                    None => xorshift(&mut rng) & xorshift(&mut rng) & xorshift(&mut rng),
+                };
                 if popcount(mask.wrapping_mul(magic) & 0xFF00_0000_0000_0000) < 6 {
                     continue;
                 }
@@ -695,6 +761,81 @@ mod pawn_set_tests {
                     "color={:?} pawns={:#x}",
                     color,
                     pawns
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod magicos_tests {
+    use super::*;
+
+    /// Los magicos precalculados tienen que ser VALIDOS: cada uno debe indexar
+    /// todos los subconjuntos de su mascara sin colisiones destructivas.
+    ///
+    /// Importa que este test exista porque el fallo seria SILENCIOSO: si un
+    /// magico estuviera mal, `build_magics` cae a buscar uno nuevo y el motor
+    /// sigue jugando bien... pero perdiendo los ~800 ms de arranque que este
+    /// cambio vino a ahorrar, sin que nadie se entere.
+    #[test]
+    fn magicos_precalculados_siguen_siendo_validos() {
+        for (es_torre, dirs) in [(true, &ROOK_RAYS), (false, &BISHOP_RAYS)] {
+            for sq in 0..64u8 {
+                let mask = relevant_mask(sq, dirs);
+                let bits = popcount(mask);
+                let size = 1usize << bits;
+                let shift = 64 - bits;
+                let magic = if es_torre {
+                    MAGICOS_TORRE[sq as usize]
+                } else {
+                    MAGICOS_ALFIL[sq as usize]
+                };
+
+                let mut tabla = vec![0u64; size];
+                let mut usado = vec![false; size];
+                let mut sub: Bitboard = 0;
+                loop {
+                    let referencia = slider_attacks_ref(sq, sub, dirs);
+                    let idx = (sub.wrapping_mul(magic) >> shift) as usize;
+                    if usado[idx] {
+                        assert_eq!(
+                            tabla[idx], referencia,
+                            "colision destructiva: {} en la casilla {} con el magico 0x{:016X}",
+                            if es_torre { "torre" } else { "alfil" },
+                            sq,
+                            magic
+                        );
+                    } else {
+                        usado[idx] = true;
+                        tabla[idx] = referencia;
+                    }
+                    sub = sub.wrapping_sub(mask) & mask;
+                    if sub == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Los ataques que produce la tabla ya construida tienen que coincidir con
+    /// la referencia lenta, para cualquier ocupacion.
+    #[test]
+    fn los_ataques_coinciden_con_la_referencia() {
+        let mut estado: u64 = 0xDEAD_BEEF_1234_5678;
+        for sq in 0..64u8 {
+            for _ in 0..40 {
+                let occ = xorshift(&mut estado) & xorshift(&mut estado);
+                assert_eq!(
+                    rook_attacks(sq, occ),
+                    slider_attacks_ref(sq, occ, &ROOK_RAYS),
+                    "torre en {sq} con ocupacion 0x{occ:016X}"
+                );
+                assert_eq!(
+                    bishop_attacks(sq, occ),
+                    slider_attacks_ref(sq, occ, &BISHOP_RAYS),
+                    "alfil en {sq} con ocupacion 0x{occ:016X}"
                 );
             }
         }
