@@ -1241,6 +1241,112 @@ fn evaluar_clasica(b: &Board, cache: Option<&ClassicalAccumulator>) -> i32 {
     perspectiva + TEMPO
 }
 
+/// Casillas claras del tablero (a1 = indice 0 es OSCURA). Sirve para saber
+/// si dos alfiles caminan por el mismo color de casillas.
+const CASILLAS_CLARAS: Bitboard = 0x55AA_55AA_55AA_55AA;
+
+/// Configuraciones de material donde NO se puede dar mate y la posicion es
+/// tablas muertas, sin importar como se juegue.
+///
+/// POR QUE existe: en una partida real entre dos versiones del motor la
+/// posicion final `8/5k2/7B/1K6/8/8/8/8 b - - 0 64` (rey+alfil contra rey)
+/// se evaluaba en +2.83 / -2.50, o sea el motor se creia casi tres peones
+/// arriba en una posicion matematicamente muerta. Eso no es un numero feo en
+/// pantalla: un motor que cree que K+A vs K vale +2.8 CAMBIA PIEZAS
+/// contento hacia ese final "ganado" y tira victorias reales. La red neuronal
+/// nunca va a aprender esto de forma confiable (es una regla del reglamento,
+/// no un patron posicional), asi que el chequeo va ANTES de consultarla.
+///
+/// Casos cubiertos (todos SIN peones en el tablero, porque un peon puede
+/// coronar y entonces nunca es material insuficiente):
+///   - K vs K
+///   - K+alfil vs K
+///   - K+caballo vs K
+///   - K+alfil vs K+alfil con ambos alfiles en casillas del MISMO color
+///   - K+2 caballos vs K (ver la nota de abajo)
+///
+/// K+2 CABALLOS vs K: por reglamento FIDE no son tablas automaticas, porque
+/// existe una secuencia legal que termina en mate si el rival COLABORA. Pero
+/// el mate no se puede FORZAR: con defensa correcta siempre es tablas, y la
+/// evaluacion estima el valor bajo juego correcto, no bajo colaboracion del
+/// rival. Se devuelve 0 porque el riesgo de decision es exactamente el mismo
+/// que el bug original: dejarlo en ~+6.4 (dos caballos) invita al motor a
+/// cambiar una torre por un final "ganado" que en realidad es tablas. No se
+/// pierde nada al valorarlo 0: el bando de los caballos no tiene ningun plan
+/// ganador contra defensa correcta. Ojo: dos caballos CON un peon rival en el
+/// tablero si suele ganarse (posiciones de Troitsky), pero ese caso queda
+/// fuera porque cualquier peon corta el chequeo antes.
+///
+/// Casos deliberadamente NO cubiertos: K+A vs K+C y K+C vs K+C tampoco tienen
+/// mate forzado, pero el material esta EQUILIBRADO, asi que la evaluacion ya
+/// da un numero cercano a 0 y no hay error de decision que corregir. Meterlos
+/// aca solo agregaria trabajo sin arreglar nada. K+2 alfiles vs K y
+/// K+alfil+caballo vs K si tienen mate forzado: son victorias, no se tocan.
+///
+/// RENDIMIENTO: esto corre en CADA evaluacion (millones por segundo). El
+/// primer paso es un unico popcount sobre `occupied`: como el maximo de piezas
+/// en cualquier caso de tablas es 4 (K+A vs K+A), toda posicion con 5 o mas
+/// piezas sale por ahi, que es la abrumadora mayoria de los nodos.
+#[inline(always)]
+pub fn material_insuficiente(b: &Board) -> bool {
+    // Salida temprana barata: un popcount y una comparacion.
+    if b.occupied.count_ones() > 4 {
+        return false;
+    }
+
+    const BLANCAS: usize = Color::White as usize;
+    const NEGRAS: usize = Color::Black as usize;
+    const PEON: usize = PieceType::Pawn as usize;
+    const CABALLO: usize = PieceType::Knight as usize;
+    const ALFIL: usize = PieceType::Bishop as usize;
+    const TORRE: usize = PieceType::Rook as usize;
+    const DAMA: usize = PieceType::Queen as usize;
+
+    // Un peon puede coronar; torre y dama dan mate solas. Cualquiera de ellas
+    // descarta el caso de inmediato.
+    if (b.pieces[BLANCAS][PEON]
+        | b.pieces[NEGRAS][PEON]
+        | b.pieces[BLANCAS][TORRE]
+        | b.pieces[NEGRAS][TORRE]
+        | b.pieces[BLANCAS][DAMA]
+        | b.pieces[NEGRAS][DAMA])
+        != 0
+    {
+        return false;
+    }
+
+    // Solo quedan reyes y piezas menores (a lo sumo dos, por el popcount).
+    let alfiles_w = b.pieces[BLANCAS][ALFIL];
+    let alfiles_b = b.pieces[NEGRAS][ALFIL];
+    let menores_w = alfiles_w | b.pieces[BLANCAS][CABALLO];
+    let menores_b = alfiles_b | b.pieces[NEGRAS][CABALLO];
+    let n_w = menores_w.count_ones();
+    let n_b = menores_b.count_ones();
+
+    match n_w + n_b {
+        // K vs K, y K+menor vs K.
+        0 | 1 => true,
+        2 => {
+            if n_w == 1 && n_b == 1 {
+                // Una menor por bando: tablas SOLO si son dos alfiles del
+                // mismo color de casillas (ninguno puede atacar las casillas
+                // del otro color, asi que el mate es imposible). Con alfiles
+                // de distinto color, o con caballos de por medio, no se
+                // declara tablas.
+                let dos_alfiles = alfiles_w != 0 && alfiles_b != 0;
+                dos_alfiles && ((alfiles_w | alfiles_b) & CASILLAS_CLARAS).count_ones() != 1
+            } else {
+                // Las dos menores del mismo bando: solo K+2 caballos vs K es
+                // tablas. K+2 alfiles y K+alfil+caballo dan mate forzado.
+                let caballos = if n_w == 2 { menores_w } else { menores_b };
+                let alfiles = if n_w == 2 { alfiles_w } else { alfiles_b };
+                alfiles == 0 && caballos.count_ones() == 2
+            }
+        }
+        _ => false,
+    }
+}
+
 // Subido de 0.5 a 1.5 tras h2h: PESO_RED=1.0 y 1.5 dieron ambos 63.3% (30
 // partidas) contra el 0.5 original; NNUE 100% pura (clasica anulada) dio
 // solo 55.0%, peor que subir el peso manteniendo la clasica completa. La
@@ -1253,6 +1359,10 @@ pub const PESO_RED: f64 = 1.5;
 /// clásicos que no cambiaron.
 #[allow(dead_code)]
 pub fn evaluate_with_nnue(b: &Board, nnue: Option<&crate::neural::NnueAccumulator>) -> i32 {
+    // Material insuficiente: tablas muertas, ni la clasica ni la red opinan.
+    if material_insuficiente(b) {
+        return 0;
+    }
     let clasica = evaluar_clasica(b, None);
     match nnue {
         Some(acumulador) => {
@@ -1273,6 +1383,12 @@ pub fn evaluate_with_state(
     state: &EvalState,
     nnue: Option<&crate::neural::NnueAccumulator>,
 ) -> i32 {
+    // Material insuficiente ANTES de consultar la red: es una regla del
+    // reglamento, no un patron posicional, y la NNUE no la aprende de forma
+    // confiable. Ver `material_insuficiente` para el bug que motivo esto.
+    if material_insuficiente(b) {
+        return 0;
+    }
     // RENDIMIENTO: la clasica se calcula SOLO si su valor se va a usar. En
     // modo "red pura" (el default desde 2026-08-13) el resultado era
     // `red + TEMPO` y la clasica se descartaba entera, pero se calculaba
@@ -1300,7 +1416,131 @@ pub fn evaluate_with_state(
 /// Evaluación clásica desde el acumulador incremental ya disponible.
 /// La quiescence puede usar esta ruta sin recomputar componentes clásicos.
 pub fn evaluate_classical_with_state(b: &Board, state: &EvalState) -> i32 {
+    // Tambien aca: la quiescence y el contempt de `draw_score` pasan por esta
+    // ruta, y deben ver 0 en un final muerto igual que la ruta principal.
+    if material_insuficiente(b) {
+        return 0;
+    }
     state.clasica(b)
+}
+
+#[cfg(test)]
+mod material_insuficiente_tests {
+    use super::*;
+
+    /// Evalua la FEN por las TRES rutas publicas y devuelve los tres valores.
+    /// Se prueban las tres a proposito: la busqueda usa `evaluate_with_state`,
+    /// la quiescence y el contempt de `draw_score` usan la clasica, y
+    /// `evaluate_with_nnue` es la referencia de herramientas externas. Un
+    /// arreglo que solo tapara una de las tres dejaria el bug vivo en las
+    /// otras dos.
+    ///
+    /// Nota sobre la NNUE: el chequeo vive ANTES del `match` sobre el
+    /// acumulador dentro de `evaluate_with_state`, asi que cubre por
+    /// construccion tanto la rama con red como la rama sin red. No se carga la
+    /// red embebida en los tests porque el almacenamiento de la NNUE es global
+    /// y contaminaria a los demas tests, que corren en paralelo y esperan
+    /// evaluacion clasica (el bench de nodos, entre ellos).
+    fn evaluaciones(fen: &str) -> (i32, i32, i32) {
+        let b = Board::from_fen(fen).unwrap_or_else(|_| panic!("FEN invalida: {fen}"));
+        let estado = crear_eval_state(&b);
+        (
+            evaluate_with_state(&b, &estado, None),
+            evaluate_classical_with_state(&b, &estado),
+            evaluate_with_nnue(&b, None),
+        )
+    }
+
+    fn es_insuficiente(fen: &str) -> bool {
+        let b = Board::from_fen(fen).unwrap_or_else(|_| panic!("FEN invalida: {fen}"));
+        material_insuficiente(&b)
+    }
+
+    /// La posicion EXACTA de la partida real que destapo el bug: rey+alfil
+    /// contra rey, evaluada en +2.83 / -2.50 antes del arreglo.
+    #[test]
+    fn rey_y_alfil_contra_rey_de_la_partida_real_es_cero() {
+        let fen = "8/5k2/7B/1K6/8/8/8/8 b - - 0 64";
+        assert!(es_insuficiente(fen));
+        let (busqueda, clasica, referencia) = evaluaciones(fen);
+        assert_eq!(busqueda, 0, "evaluate_with_state debe ver tablas muertas");
+        assert_eq!(clasica, 0, "la ruta clasica debe ver tablas muertas");
+        assert_eq!(referencia, 0, "evaluate_with_nnue debe ver tablas muertas");
+    }
+
+    #[test]
+    fn casos_de_material_insuficiente_evaluan_cero() {
+        let casos = [
+            // K vs K.
+            ("8/5k2/8/1K6/8/8/8/8 w - - 0 1", "rey contra rey"),
+            // K+alfil vs K, en los dos bandos y con el turno de los dos.
+            ("8/5k2/7B/1K6/8/8/8/8 w - - 0 1", "alfil blanco"),
+            ("8/5k2/7b/1K6/8/8/8/8 w - - 0 1", "alfil negro, turno B"),
+            ("8/5k2/7b/1K6/8/8/8/8 b - - 0 1", "alfil negro, turno N"),
+            // K+caballo vs K, en los dos bandos.
+            ("8/5k2/8/1K6/8/5N2/8/8 w - - 0 1", "caballo blanco"),
+            ("8/5k2/8/1K6/8/5n2/8/8 b - - 0 1", "caballo negro"),
+            // K+alfil vs K+alfil, ambos alfiles por casillas OSCURAS (c1 y f6).
+            ("7k/8/5b2/8/8/8/8/2B1K3 w - - 0 1", "alfiles en oscuras"),
+            // K+alfil vs K+alfil, ambos por casillas CLARAS (b1 y g8).
+            ("6b1/8/7k/8/8/8/8/1B2K3 w - - 0 1", "alfiles en claras"),
+            // K+2 caballos vs K: decision documentada en material_insuficiente.
+            ("8/5k2/8/1K6/8/2N2N2/8/8 w - - 0 1", "2 caballos blancos"),
+            ("8/5k2/8/8/8/2n2n2/8/K7 b - - 0 1", "2 caballos negros"),
+        ];
+        for (fen, que) in casos {
+            assert!(es_insuficiente(fen), "deberia ser tablas muertas: {que}");
+            let (busqueda, clasica, referencia) = evaluaciones(fen);
+            assert_eq!(busqueda, 0, "evaluate_with_state en {que}");
+            assert_eq!(clasica, 0, "evaluate_classical_with_state en {que}");
+            assert_eq!(referencia, 0, "evaluate_with_nnue en {que}");
+        }
+    }
+
+    /// Casos de control: posiciones que NO son material insuficiente y que el
+    /// chequeo no debe tocar. Si alguna cayera aca, el motor dejaria de ver
+    /// finales ganados (por ejemplo, tiraria a la basura un K+torre vs K).
+    #[test]
+    fn casos_que_no_son_tablas_no_se_tocan() {
+        let casos = [
+            // Con peones NUNCA es material insuficiente: pueden coronar.
+            ("8/5k2/7B/1K6/8/8/4P3/8 w - - 0 1", "alfil + peon"),
+            ("8/5k2/8/1K6/8/8/4p3/8 w - - 0 1", "solo peon negro"),
+            ("8/5k2/8/1K6/8/8/4P3/8 w - - 0 1", "solo peon blanco"),
+            // Piezas pesadas: mate elemental.
+            ("8/5k2/8/1K6/8/8/8/4R3 w - - 0 1", "torre"),
+            ("8/5k2/8/1K6/8/8/8/4Q3 w - - 0 1", "dama"),
+            // Alfiles de DISTINTO color de casillas (c1 oscura, g8 clara).
+            ("6bk/8/8/8/8/8/8/2B1K3 w - - 0 1", "alfiles distinto color"),
+            // Pareja de alfiles y alfil+caballo: dan mate FORZADO.
+            ("8/5k2/8/1K6/8/2B2B2/8/8 w - - 0 1", "dos alfiles"),
+            ("8/5k2/8/1K6/8/2B2N2/8/8 w - - 0 1", "alfil y caballo"),
+            // Material menor equilibrado: sin mate forzado, pero la evaluacion
+            // ya ronda 0 sola y no hay error de decision que corregir.
+            ("8/5k2/5n2/1K6/8/5B2/8/8 w - - 0 1", "alfil vs caballo"),
+            // Posicion inicial: el caso normal, debe salir por el popcount.
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "posicion inicial",
+            ),
+        ];
+        for (fen, que) in casos {
+            assert!(!es_insuficiente(fen), "NO son tablas muertas: {que}");
+        }
+
+        // Ademas, los finales ganados deben seguir evaluandose como ganados y
+        // no colarse a 0 por otra via.
+        for (fen, que) in [
+            ("8/5k2/8/1K6/8/8/8/4R3 w - - 0 1", "torre"),
+            ("8/5k2/8/1K6/8/2B2B2/8/8 w - - 0 1", "dos alfiles"),
+        ] {
+            let (busqueda, _, _) = evaluaciones(fen);
+            assert!(
+                busqueda.abs() > 300,
+                "{que} deberia seguir viendose como ventaja grande, dio {busqueda}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
