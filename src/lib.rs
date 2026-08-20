@@ -1575,6 +1575,71 @@ pub fn uci_loop() {
                     .and_then(|s| s.parse().ok());
                 if let Some(i) = partes.iter().position(|&p| p == "depth") {
                     let depth: i32 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(6);
+                    // BUG corregido (2026-08-20): "go depth N" tomaba SIEMPRE
+                    // el searcher de un solo hilo, ignorando la opcion
+                    // Threads -- cualquier analisis a profundidad fija (GUIs,
+                    // testers) corria con 1 hilo aunque el usuario pidiera 8,
+                    // y toda medicion de escalado SMP hecha con "go depth"
+                    // media un solo hilo determinista (nodos identicos entre
+                    // corridas). Ahora con Threads>1 se enruta por
+                    // buscar_lazy_smp igual que movetime/reloj, con el limite
+                    // de profundidad pedido y sin deadline de tiempo.
+                    if n_hilos > 1 {
+                        let modo_lmr = searcher_slot.as_ref().unwrap().modo_lmr;
+                        let qsearch_nnue = searcher_slot.as_ref().unwrap().qsearch_nnue;
+                        let nnue_classical_depth =
+                            searcher_slot.as_ref().unwrap().nnue_classical_depth;
+                        let tt = Arc::clone(&smp_tt);
+                        let mask = smp_tt_mask;
+                        let generacion = Arc::clone(&smp_generacion);
+                        let stop_flag = Arc::new(AtomicBool::new(false));
+                        let flag = Arc::clone(&stop_flag);
+                        let hist_copy = game_history.clone();
+                        let board_copy = board;
+                        let mut pool =
+                            pool_slot.take().unwrap_or_else(search::PoolMemoriaSMP::nuevo);
+                        let handle = std::thread::spawn(move || {
+                            let t0 = std::time::Instant::now();
+                            let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
+                                &board_copy,
+                                None,
+                                depth,
+                                n_hilos,
+                                &tt,
+                                &generacion,
+                                mask,
+                                modo_lmr,
+                                qsearch_nnue,
+                                nnue_classical_depth,
+                                &hist_copy,
+                                flag,
+                                None,
+                                &mut pool,
+                                nodes_limit,
+                            );
+                            let profundidad =
+                                resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
+                            let ms = t0.elapsed().as_millis().max(1) as u64;
+                            let nps = nodos.saturating_mul(1000) / ms;
+                            let lector =
+                                Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, modo_lmr);
+                            let pv = lector.extraer_pv(&board_copy, profundidad.max(1) as usize);
+                            let pv_txt =
+                                pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
+                            println!(
+                                "info depth {} score {} nodes {} time {} nps {} pv {}",
+                                profundidad, formatear_score_uci(sc), nodos, ms, nps, pv_txt
+                            );
+                            println!(
+                                "bestmove {}",
+                                mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
+                            );
+                            io::stdout().flush().ok();
+                            (None, Some(pool))
+                        });
+                        activa = Some(BusquedaActiva { handle, stop_flag });
+                        continue;
+                    }
                     let mut s = searcher_slot.take().unwrap();
                     s.set_game_history(game_history.clone());
                     s.nodes_limit = nodes_limit;
