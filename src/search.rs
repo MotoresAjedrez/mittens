@@ -737,10 +737,20 @@ pub struct Searcher {
     corr_nonpawn: [Vec<i32>; 2],
     // Continuation corrhist: (pieza_rival, destino_rival, bando) aplanado.
     corr_cont: Vec<i32>,
-    // Lazy SMP: si esta activo, este hilo intercambia las 2 primeras
-    // jugadas del orden en la RAIZ (una vez, al armar el orden inicial) para
-    // no explorar exactamente la misma linea primero que los demas hilos.
-    pub variante_orden_raiz: bool,
+    // Lazy SMP: escalonamiento de profundidad (skip arrays al estilo
+    // Stockfish clasico). `Some((size, phase))` hace que este hilo AYUDANTE
+    // se saltee bloques de iteraciones de la profundizacion: salta la
+    // profundidad d cuando ((d + phase) / size) % 2 == 1 (d=1 nunca se
+    // salta). El efecto es que en todo momento ~la mitad de los ayudantes
+    // esta buscando 1-2 plies POR DELANTE del hilo principal, y sus entradas
+    // de TT (mas profundas que lo que el principal ya tiene) le aceleran las
+    // iteraciones. Esta era exactamente la pieza que faltaba: medido el
+    // 2026-08-20, sin esto 8 hilos quemaban 5-6x los nodos de 1 hilo para
+    // ganar ~0-1 ply de profundidad efectiva (ver HALLAZGOS_SMP_2026-08-20.md).
+    // Reemplaza a la diversificacion anterior (swap de las 2 primeras
+    // jugadas de la raiz en hilos impares), que desperdiciaba la ventana de
+    // aspiration buscando la 2a mejor jugada primero sin adelantar a nadie.
+    pub salto_smp: Option<(u32, u32)>,
     // UCI "searchmoves": si Some, la RAIZ solo explora estas jugadas (util
     // para repartir el arbol entre varias maquinas -- cada una busca un
     // subconjunto disjunto de jugadas raiz y se compara el mejor resultado
@@ -824,7 +834,7 @@ impl Searcher {
             corr_pawn: vec![0; 2 * CORR_SIZE],
             corr_nonpawn: [vec![0; 2 * CORR_SIZE], vec![0; 2 * CORR_SIZE]],
             corr_cont: vec![0; 6 * 64 * 2],
-            variante_orden_raiz: false,
+            salto_smp: None,
             root_moves_filtro: None,
             null_move_r_extra: 0,
             external_stop: None,
@@ -921,7 +931,7 @@ impl Searcher {
             corr_pawn: vec![0; 2 * CORR_SIZE],
             corr_nonpawn: [vec![0; 2 * CORR_SIZE], vec![0; 2 * CORR_SIZE]],
             corr_cont: vec![0; 6 * 64 * 2],
-            variante_orden_raiz: false,
+            salto_smp: None,
             root_moves_filtro: None,
             null_move_r_extra: 0,
             external_stop: None,
@@ -3335,6 +3345,17 @@ impl Searcher {
         let mut esfuerzo_mejor: i32 = 0;
 
         for d in 1..=max_depth {
+            // Escalonamiento Lazy SMP (ver `salto_smp`): los hilos ayudantes
+            // saltan bloques de iteraciones para ir POR DELANTE del hilo
+            // principal y alimentar la TT compartida con entradas mas
+            // profundas. d=1 nunca se salta: garantiza `mejor_mv` valido
+            // (mismo contrato que `blindar_stop`).
+            if let Some((size, phase)) = self.salto_smp
+                && d > 1
+                && ((d as u32 + phase) / size) % 2 == 1
+            {
+                continue;
+            }
             // Blindaje de la profundidad 1 (ver `blindar_stop`): sin esto, un
             // "stop" que llega en el primer milisegundo abortaba antes de
             // puntuar una sola jugada de raiz y se devolvia el fallback de
@@ -3350,9 +3371,6 @@ impl Searcher {
                 break;
             }
             self.order_moves_ply(b, &mut moves, mejor_mv, 0, None, None);
-            if self.variante_orden_raiz && moves.len() >= 2 {
-                moves.swap(0, 1);
-            }
 
             // Aspiration windows: a partir de la 2da profundidad ya hay un
             // puntaje de referencia (el de la iteracion anterior), asi que en
@@ -3821,7 +3839,25 @@ pub fn buscar_lazy_smp(
                 s.set_qsearch_nnue(qsearch_nnue);
                 s.set_nnue_classical_depth(nnue_classical_depth);
                 s.root_moves_filtro = root_moves_filtro;
-                s.variante_orden_raiz = i % 2 == 1;
+                // Escalonamiento de profundidad para los AYUDANTES (i >= 1):
+                // tabla de (size, phase) al estilo de los SkipSize/SkipPhase
+                // del Stockfish clasico. El hilo 0 (principal) nunca salta;
+                // los ayudantes se saltean bloques de iteraciones y quedan
+                // 1-2 plies por delante, llenando la TT compartida con
+                // entradas mas profundas que aceleran al principal. Antes de
+                // esto la unica diversificacion era swap(0,1) en la raiz de
+                // los hilos impares -- medido el 2026-08-20: 8 hilos ganaban
+                // ~0-1 ply sobre 1 hilo (ver HALLAZGOS_SMP_2026-08-20.md).
+                const SALTOS: [(u32, u32); 20] = [
+                    (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2), (2, 3),
+                    (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2),
+                    (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 2),
+                ];
+                s.salto_smp = if i == 0 {
+                    None
+                } else {
+                    Some(SALTOS[(i - 1) % SALTOS.len()])
+                };
                 s.null_move_r_extra = match i % 3 {
                     1 => 1,
                     2 => -1,
