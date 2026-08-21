@@ -90,8 +90,8 @@ pub struct TTEntry {
     flag: TTFlag,
     best: Option<Move>,
     // Generacion de la busqueda que escribio esta entrada (aging): se
-    // incrementa al inicio de cada busqueda y permite que tt_store prefiera
-    // reemplazar entradas de busquedas ANTERIORES aunque sean mas profundas.
+    // incrementa al inicio de cada busqueda y permite que tt_store penalice
+    // la profundidad de las entradas de busquedas ANTERIORES (TT_BONUS_EDAD).
     generation: u8,
 }
 
@@ -419,6 +419,20 @@ type SharedTT = Vec<AtomicU64>;
 type LocalTT = Vec<Option<TTEntry>>;
 
 const TT_OCUPADO: u64 = 1 << 48;
+
+/// Plies de profundidad que se le descuentan a una entrada de la TT por cada
+/// generacion de antiguedad al decidir el reemplazo (ver `tt_store`).
+///
+/// La edad es una PENALIZACION, no un veto. Antes bastaba con que la
+/// generacion difiriera para pisar el casillero sin mirar la profundidad, y
+/// como la TT persiste entre jugadas mientras la generacion avanza una vez
+/// por "go", la primera escritura de quiescence (depth 0) de la jugada nueva
+/// desalojaba entradas de depth 20 de la jugada anterior -- justo el arrastre
+/// entre jugadas que la TT persistente busca aprovechar. Con la penalizacion,
+/// una entrada vieja profunda sobrevive a las hojas de quiescence pero cede
+/// ante una entrada nueva de profundidad comparable, y a partir de unas pocas
+/// generaciones de antiguedad queda libremente reemplazable.
+const TT_BONUS_EDAD: i32 = 4;
 
 fn tt_empaquetar_move(mv: Option<Move>) -> u64 {
     match mv {
@@ -1293,10 +1307,10 @@ impl Searcher {
 
     // Reemplazo por profundidad, pero una colision de OTRA clave siempre debe
     // poder ocupar el casillero. A igual profundidad se prefiere una entrada
-    // Exact sobre una cota Alpha/Beta. Con AGING, una entrada de una busqueda
-    // ANTERIOR (generacion distinta) se reemplaza de inmediato aunque sea mas
-    // profunda: su informacion ya no corresponde a la busqueda en curso y
-    // conservarla solo satura la TT con posiciones que ya no se visitaran.
+    // Exact sobre una cota Alpha/Beta. El AGING entra como PENALIZACION de
+    // profundidad (`TT_BONUS_EDAD` plies por generacion de antiguedad), no
+    // como veto: una entrada de una busqueda anterior vale menos, pero no la
+    // desaloja cualquier hoja de quiescence de depth 0 de la busqueda nueva.
     fn tt_store(
         &mut self,
         key: u64,
@@ -1316,8 +1330,8 @@ impl Searcher {
         // entradas profundas de negamax que caian en el mismo casillero,
         // reduciendo la TT efectiva de la busqueda principal. Ahora una
         // colision de otra clave se trata igual que una de la MISMA clave:
-        // solo reemplaza si es al menos tan profunda (o si la entrada previa
-        // es de una generacion vieja, que siempre se descarta).
+        // solo reemplaza si es al menos tan profunda, con la profundidad de
+        // la entrada previa descontada por su antiguedad (ver TT_BONUS_EDAD).
         //
         // OJO (bug corregido): esta regla se evaluaba sobre el resultado de
         // `tt_desempaquetar`, que devuelve None cuando los bits de
@@ -1329,10 +1343,14 @@ impl Searcher {
         // con `tt_ocupante`, que no exige que la clave coincida.
         let reemplazar = |slot: Option<OcupanteTT>| match slot {
             None => true,
-            Some(existing) if existing.generation != generacion => true,
             Some(existing) => {
-                depth > existing.depth
-                    || (depth == existing.depth
+                // Antiguedad en generaciones (el contador es de 5 bits y da
+                // la vuelta, por eso la resta se hace modulo 32).
+                let antiguedad =
+                    (generacion.wrapping_add(32).wrapping_sub(existing.generation) & 0x1F) as i32;
+                let bonus = TT_BONUS_EDAD * antiguedad;
+                depth + bonus > existing.depth
+                    || (depth + bonus == existing.depth
                         && (!existing.misma_clave
                             || (flag == TTFlag::Exact && existing.flag != TTFlag::Exact)))
             }
