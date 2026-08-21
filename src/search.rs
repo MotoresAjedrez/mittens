@@ -1360,6 +1360,14 @@ impl Searcher {
         // profundidad. La politica descrita arriba solo estaba viva en la TT
         // Local (un solo hilo, camino de tests). Ahora el ocupante se decodifica
         // con `tt_ocupante`, que no exige que la clave coincida.
+        // Holgura acotada: para escrituras de negamax (depth > 0) se permite
+        // pisar una entrada hasta TT_HOLGURA_PROFUNDIDAD plies mas profunda
+        // de la MISMA generacion. depth == 0 (quiescence) queda excluido a
+        // proposito y conserva la regla estricta de arriba -- es la escritura
+        // que origino el bug documentado en el comentario de mas arriba, y
+        // ese caso ya quedaba cubierto por `depth > existing.depth` sin
+        // holgura porque quiescence casi siempre choca con depth=0 tambien.
+        const TT_HOLGURA_PROFUNDIDAD: i32 = 3;
         let reemplazar = |slot: Option<OcupanteTT>| match slot {
             None => true,
             Some(existing) if existing.generation != generacion => true,
@@ -1368,6 +1376,7 @@ impl Searcher {
                     || (depth == existing.depth
                         && (!existing.misma_clave
                             || (flag == TTFlag::Exact && existing.flag != TTFlag::Exact)))
+                    || (depth > 0 && depth + TT_HOLGURA_PROFUNDIDAD > existing.depth)
             }
         };
         let entry = TTEntry {
