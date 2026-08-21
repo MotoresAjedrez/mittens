@@ -432,8 +432,9 @@ fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
 //   bits 18..34  (16): score, como i16 (ya normalizado a mate-por-ply)
 //   bits 34..41  ( 7): profundidad (0..127, de sobra: nunca llegamos ahi)
 //   bits 41..43  ( 2): flag de TT (Exact/Alpha/Beta)
-//   bits 43..48  ( 5): generacion de la busqueda que escribio la entrada
-//                       (aging: 0..31, se incrementa por busqueda)
+//   bits 43..47  ( 4): generacion de la busqueda que escribio la entrada
+//                       (aging: 0..15, se incrementa por busqueda)
+//   bit  47      ( 1): was_pv -- "estuvo en PV alguna vez" (persistente)
 //   bit  48      ( 1): "ocupado" -- distingue un casillero vacio de una
 //                       entrada real con todos los demas bits en cero
 //   bits 49..64  (15): verificacion de clave (parte alta del zobrist, en
@@ -527,12 +528,24 @@ fn tt_flag_desde_u64(v: u64) -> TTFlag {
 // bits 49..64 (15): verificacion de clave
 const TT_WAS_PV: u64 = 1 << 47;
 
+/// Mascara del contador de generacion de la TT. DEBE coincidir con el ancho
+/// del campo empaquetado (4 bits, ver layout arriba): TODO lugar que
+/// incremente o siembre `tt_generation` tiene que envolver con ESTA mascara.
+/// Si el contador envolviera mas ancho que el campo (el bug del recorte de
+/// 5 a 4 bits: contadores en `& 0x1F` contra un campo de 4 bits), a partir
+/// de la generacion 16 el valor guardado nunca coincidiria con el contador,
+/// toda entrada pareceria "vieja" para tt_store -- incluidas las de la
+/// busqueda EN CURSO -- y el reemplazo degeneraria en incondicional (las
+/// escrituras depth-0 de quiescence expulsando a las entradas profundas de
+/// su propia busqueda) durante 16 de cada 32 jugadas de la partida.
+const TT_GEN_MASK: u8 = 0xF;
+
 fn tt_empaquetar(entry: &TTEntry, key: u64, generation: u8) -> u64 {
     let mv = tt_empaquetar_move(entry.best) & 0x3FFFF; // 18 bits
     let score = (entry.score as i16 as u16) as u64; // 16 bits, con signo preservado
     let depth = (entry.depth.clamp(0, 127) as u64) & 0x7F; // 7 bits
     let flag = (entry.flag as u64) & 0x3; // 2 bits
-    let generacion = (generation as u64) & 0xF; // 4 bits
+    let generacion = (generation & TT_GEN_MASK) as u64; // 4 bits
     let was_pv = if entry.was_pv { TT_WAS_PV } else { 0 };
     let verif = (key >> (64 - 15)) & 0x7FFF; // 15 bits altos de la clave real
     mv | (score << 18)
@@ -567,7 +580,7 @@ fn tt_ocupante(paquete: u64, key: u64) -> Option<OcupanteTT> {
     Some(OcupanteTT {
         depth: ((paquete >> 34) & 0x7F) as i32,
         flag: tt_flag_desde_u64((paquete >> 41) & 0x3),
-        generation: ((paquete >> 43) & 0xF) as u8,
+        generation: ((paquete >> 43) as u8) & TT_GEN_MASK,
         misma_clave: ((paquete >> 49) & 0x7FFF) == ((key >> (64 - 15)) & 0x7FFF),
     })
 }
@@ -585,7 +598,7 @@ fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
     let score = ((paquete >> 18) & 0xFFFF) as u16 as i16 as i32;
     let depth = ((paquete >> 34) & 0x7F) as i32;
     let flag = tt_flag_desde_u64((paquete >> 41) & 0x3);
-    let generation = ((paquete >> 43) & 0xF) as u8;
+    let generation = ((paquete >> 43) as u8) & TT_GEN_MASK;
     let was_pv = paquete & TT_WAS_PV != 0;
     Some(TTEntry { key, depth, score, flag, best: mv, generation, was_pv })
 }
@@ -650,7 +663,8 @@ pub struct Searcher {
     /// antes de que el chequeo entre depths llegue a ejecutarse.
     pub nodes_limit: Option<u64>,
     stop: bool,
-    // Generacion de la busqueda actual para aging de la TT (0..31): se
+    // Generacion de la busqueda actual para aging de la TT (0..15, el ancho
+    // del campo empaquetado -- ver TT_GEN_MASK): se
     // incrementa al inicio de cada busqueda y las entradas de la generacion
     // anterior se prefieren para reemplazo en tt_store.
     tt_generation: u8,
@@ -990,7 +1004,7 @@ impl Searcher {
     /// (Searcher persistente) no la necesita: `search_time` ya la incrementa
     /// en cada "go".
     pub fn set_tt_generacion(&mut self, generacion: u8) {
-        self.tt_generation = generacion & 0x1F;
+        self.tt_generation = generacion & TT_GEN_MASK;
     }
 
     /// Reinicia el acumulador NNUE del hilo a la posicion `b`. Se llama en
@@ -3122,7 +3136,7 @@ impl Searcher {
         self.stop = false;
         // Nueva generacion: las entradas de la busqueda anterior quedan
         // "viejas" y seran las primeras candidatas a reemplazo (aging).
-        self.tt_generation = (self.tt_generation + 1) & 0x1F;
+        self.tt_generation = (self.tt_generation + 1) & TT_GEN_MASK;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         // Truncamiento del historial de la partida (BUG 1): conservar los
         // ULTIMOS MAX_PATH elementos (los mas recientes), no los primeros --
@@ -3290,7 +3304,7 @@ impl Searcher {
         self.nodes = 0;
         self.stop = false;
         // Nueva generacion para aging de la TT (ver tt_generation en Searcher).
-        self.tt_generation = (self.tt_generation + 1) & 0x1F;
+        self.tt_generation = (self.tt_generation + 1) & TT_GEN_MASK;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.decaer_history();
         // Truncamiento del historial de la partida (BUG 1): conservar los
@@ -3857,7 +3871,7 @@ pub fn buscar_lazy_smp(
     // MISMO valor, asi que las entradas que escriben llevan una generacion
     // DISTINTA a la de jugadas anteriores y la regla de reemplazo de tt_store
     // puede expulsarlas de inmediato (aging vivo en Lazy SMP).
-    let generacion = generacion_compartida.fetch_add(1, Ordering::Relaxed) & 0x1F;
+    let generacion = generacion_compartida.fetch_add(1, Ordering::Relaxed) & TT_GEN_MASK;
     // Una ranura de memoria persistente por hilo (ver PoolMemoriaSMP).
     pool.reservar(n_hilos.max(1));
     if n_hilos <= 1 {
@@ -4140,7 +4154,7 @@ mod regression_tests {
             ] {
                 clave = clave.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
                 s.clear_hash();
-                s.tt_store(clave, 5, score, ply, TTFlag::Exact, None);
+                s.tt_store(clave, 5, score, ply, TTFlag::Exact, None, false);
                 let e = s
                     .tt_probe(clave)
                     .unwrap_or_else(|| panic!("no se recupero la entrada (ply={ply}, score={score})"));
@@ -4209,17 +4223,17 @@ mod regression_tests {
         // Misma posicion en la tabla, bits de verificacion (49..64) distintos.
         let k1 = (0x1234u64 & mask as u64) | (0x1111u64 << 49);
         let k2 = (0x1234u64 & mask as u64) | (0xABCDu64 << 49);
-        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None, false);
         // Menos profunda (tipica escritura de quiescence, depth=0): NO debe
         // desalojar la entrada profunda de negamax.
-        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(
             s.tt_probe(k1).map(|e| e.depth),
             Some(12),
             "una colision menos profunda desalojo la entrada profunda"
         );
         // Al menos tan profunda: SI debe pisar.
-        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
         assert!(s.tt_probe(k1).is_none());
     }
@@ -4233,13 +4247,13 @@ mod regression_tests {
         let mut s = Searcher::new(1);
         let k1 = 0x10u64;
         let k2 = k1.wrapping_add((s.tt_mask as u64) + 1);
-        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None, false);
         // Menos profunda: NO debe pisar.
-        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
         assert!(s.tt_probe(k2).is_none());
         // Al menos tan profunda: SI debe pisar.
-        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
         assert!(s.tt_probe(k1).is_none());
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
@@ -4255,7 +4269,7 @@ mod regression_tests {
 
         // Roundtrip con jugada simple, sin promocion.
         let mv1 = Move { from: 8, to: 16, promotion: None, flag: MoveFlag::Quiet };
-        s.tt_store(0xABCD, 10, 55, 0, TTFlag::Exact, Some(mv1));
+        s.tt_store(0xABCD, 10, 55, 0, TTFlag::Exact, Some(mv1), false);
         let e1 = s.tt_probe(0xABCD).expect("deberia encontrarse (misma clave)");
         assert_eq!(e1.depth, 10);
         assert_eq!(e1.score, 55);
@@ -4265,7 +4279,7 @@ mod regression_tests {
         // Roundtrip con score negativo y jugada CON promocion (probando los
         // 3 bits de promocion del empaquetado, no solo el caso None).
         let mv2 = Move { from: 48, to: 56, promotion: Some(PieceType::Queen), flag: MoveFlag::Capture };
-        s.tt_store(0x9999, 3, -1200, 0, TTFlag::Beta, Some(mv2));
+        s.tt_store(0x9999, 3, -1200, 0, TTFlag::Beta, Some(mv2), false);
         let e2 = s.tt_probe(0x9999).expect("deberia encontrarse (misma clave)");
         assert_eq!(e2.score, -1200);
         assert_eq!(e2.flag, TTFlag::Beta);
@@ -4281,13 +4295,13 @@ mod regression_tests {
         // todos sus bits, este caso degenerado no ocurre.
         let k1 = 0x1234u64;
         let k2 = (k1 & mask as u64) | (0xABCDu64 << 49);
-        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None, false);
         // Igual que en la TT Local: una colision MENOS profunda no desaloja
         // (antes si lo hacia, ver tt_ocupante); una al menos tan profunda si.
-        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
         assert!(s.tt_probe(k2).is_none());
-        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
         assert!(s.tt_probe(k1).is_none());
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
@@ -4381,7 +4395,9 @@ mod regression_tests {
                     if raw & TT_OCUPADO == 0 {
                         None
                     } else {
-                        Some(((raw >> 43) & 0x1F) as u8)
+                        // Solo los 4 bits del campo de generacion: el bit 47
+                        // ya es was_pv y contaminaria el valor leido.
+                        Some(((raw >> 43) as u8) & TT_GEN_MASK)
                     }
                 })
                 .collect();
@@ -4447,6 +4463,41 @@ mod regression_tests {
         assert!(
             !g1.contains(&2),
             "la generacion 2 no debe existir tras la primera llamada"
+        );
+    }
+
+    // BUG (2026-08-21): al empaquetar was_pv en la TT compartida, el campo de
+    // generacion se recorto de 5 a 4 bits (0..15, ver tt_empaquetar), pero los
+    // CONTADORES que lo alimentan siguieron envolviendo a 5 bits (& 0x1F,
+    // 0..31) en set_tt_generacion, search_time, search_fixed_depth y
+    // buscar_lazy_smp. Resultado: en las generaciones 16..31 -- de la 16a a la
+    // 31a busqueda de una partida, y de nuevo cada 32 -- el valor empaquetado
+    // (gen & 0xF) NUNCA coincidia con el contador (gen), asi que para
+    // tt_store TODA entrada parecia de una generacion vieja, incluidas las de
+    // la BUSQUEDA EN CURSO, y el reemplazo degeneraba en incondicional: las
+    // escrituras superficiales de quiescence (depth 0) expulsaban a las
+    // entradas profundas de esa misma busqueda -- exactamente la patologia
+    // que la politica de reemplazo por profundidad habia corregido. La TT
+    // Local (tests/un hilo sin SMP) no sufria el bug porque guarda el u8
+    // completo sin empaquetar.
+    #[test]
+    fn tt_generacion_empaquetada_coincide_con_el_contador() {
+        let (tt, mask) = construir_tt(1);
+        let mut s = Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, true);
+        // 17a busqueda de una partida: el contador compartido entrega 16.
+        s.set_tt_generacion(16);
+        let key = 0x9E37_79B9_7F4A_7C15u64;
+        s.tt_store(key, 10, 50, 0, TTFlag::Exact, None, false);
+        assert_eq!(s.tt_probe(key).map(|e| e.depth), Some(10));
+        // Una escritura superficial (depth 0, tipica de quiescence) de la
+        // MISMA busqueda no debe expulsar a la entrada profunda.
+        s.tt_store(key, 0, -20, 0, TTFlag::Alpha, None, false);
+        assert_eq!(
+            s.tt_probe(key).map(|e| e.depth),
+            Some(10),
+            "una escritura superficial expulso a la entrada profunda de su propia \
+             busqueda: el contador de generacion (envuelto a 5 bits) no coincide \
+             con el campo empaquetado en la TT (4 bits)"
         );
     }
 
