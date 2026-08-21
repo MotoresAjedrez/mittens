@@ -2817,6 +2817,21 @@ impl Searcher {
                         r -= 1;
                     }
                 }
+                // "Corrplexity": cuanto mas grande la magnitud de la
+                // correction history (mas "sorprendida" esta la NNUE por
+                // esta posicion respecto de su eval estatica cruda), menos
+                // se reduce -- idea usada por Stormphrax/Alexandria/Sirius/
+                // Obsidian. Reusa la MISMA magnitud que ya calcula
+                // eval_corregida(), sin estado nuevo. Divisor conservador
+                // para que el ajuste quede en el orden de 0-1 plies en el
+                // rango tipico de corrhist.
+                {
+                    let raw_ce = *static_eval_cache
+                        .get_or_insert_with(|| self.evaluar_completo(b, eval_state));
+                    let corregida = self.eval_corregida(b, raw_ce, prev);
+                    const CORRPLEXITY_DIV: i32 = 100;
+                    r -= (corregida - raw_ce).abs() / CORRPLEXITY_DIV;
+                }
                 // El tope se descuenta con la parte NEGATIVA de ext (si la
                 // jugada recibio extension negativa, la profundidad hija ya
                 // bajo y la reduccion no puede comerse lo que queda). Con
