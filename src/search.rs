@@ -93,6 +93,12 @@ pub struct TTEntry {
     // incrementa al inicio de cada busqueda y permite que tt_store prefiera
     // reemplazar entradas de busquedas ANTERIORES aunque sean mas profundas.
     generation: u8,
+    // "Estuvo en PV alguna vez": distinto de es_pv (ventana actual). Persiste
+    // en la TT para que, aunque el nodo se revisite luego con ventana nula
+    // (por ejemplo por LMR/null-move desde otro camino), la busqueda sepa
+    // que esa posicion fue parte de una linea principal y trate RFP/LMR con
+    // mas cuidado ahi.
+    was_pv: bool,
 }
 
 #[inline]
@@ -507,14 +513,35 @@ fn tt_flag_desde_u64(v: u64) -> TTFlag {
     }
 }
 
+// bits  0..18 (18): jugada
+// bits 18..34 (16): score
+// bits 34..41 ( 7): profundidad
+// bits 41..43 ( 2): flag de TT
+// bits 43..47 ( 4): generacion (0..15; antes 5 bits/0..31, se recorto uno
+//                    para robarle a este campo un bit gratis -- solo cambia
+//                    cada cuantas busquedas se reinicia el aging, no afecta
+//                    corretitud)
+// bit  47     ( 1): was_pv -- "estuvo en PV alguna vez" (persistente,
+//                    distinto de es_pv que es la ventana ACTUAL)
+// bit  48     ( 1): "ocupado"
+// bits 49..64 (15): verificacion de clave
+const TT_WAS_PV: u64 = 1 << 47;
+
 fn tt_empaquetar(entry: &TTEntry, key: u64, generation: u8) -> u64 {
     let mv = tt_empaquetar_move(entry.best) & 0x3FFFF; // 18 bits
     let score = (entry.score as i16 as u16) as u64; // 16 bits, con signo preservado
     let depth = (entry.depth.clamp(0, 127) as u64) & 0x7F; // 7 bits
     let flag = (entry.flag as u64) & 0x3; // 2 bits
-    let generacion = (generation as u64) & 0x1F; // 5 bits
+    let generacion = (generation as u64) & 0xF; // 4 bits
+    let was_pv = if entry.was_pv { TT_WAS_PV } else { 0 };
     let verif = (key >> (64 - 15)) & 0x7FFF; // 15 bits altos de la clave real
-    mv | (score << 18) | (depth << 34) | (flag << 41) | (generacion << 43) | TT_OCUPADO | (verif << 49)
+    mv | (score << 18)
+        | (depth << 34)
+        | (flag << 41)
+        | (generacion << 43)
+        | was_pv
+        | TT_OCUPADO
+        | (verif << 49)
 }
 
 /// Datos del OCUPANTE de un casillero de la TT compartida que necesita la
@@ -540,7 +567,7 @@ fn tt_ocupante(paquete: u64, key: u64) -> Option<OcupanteTT> {
     Some(OcupanteTT {
         depth: ((paquete >> 34) & 0x7F) as i32,
         flag: tt_flag_desde_u64((paquete >> 41) & 0x3),
-        generation: ((paquete >> 43) & 0x1F) as u8,
+        generation: ((paquete >> 43) & 0xF) as u8,
         misma_clave: ((paquete >> 49) & 0x7FFF) == ((key >> (64 - 15)) & 0x7FFF),
     })
 }
@@ -558,8 +585,9 @@ fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
     let score = ((paquete >> 18) & 0xFFFF) as u16 as i16 as i32;
     let depth = ((paquete >> 34) & 0x7F) as i32;
     let flag = tt_flag_desde_u64((paquete >> 41) & 0x3);
-    let generation = ((paquete >> 43) & 0x1F) as u8;
-    Some(TTEntry { key, depth, score, flag, best: mv, generation })
+    let generation = ((paquete >> 43) & 0xF) as u8;
+    let was_pv = paquete & TT_WAS_PV != 0;
+    Some(TTEntry { key, depth, score, flag, best: mv, generation, was_pv })
 }
 
 /// Un solo hilo no necesita sincronización para su tabla de transposición.
@@ -1338,6 +1366,7 @@ impl Searcher {
         ply: u32,
         flag: TTFlag,
         best: Option<Move>,
+        was_pv: bool,
     ) {
         // Copiar la generacion antes del closure: el closure se usa mientras
         // `self.tt` esta prestado mutablemente, asi que no puede capturar
@@ -1377,6 +1406,7 @@ impl Searcher {
             flag,
             best,
             generation: generacion,
+            was_pv,
         };
         let idx = self.tt_index(key);
         match &mut self.tt {
@@ -1660,7 +1690,7 @@ impl Searcher {
             } else {
                 TTFlag::Exact
             };
-            self.tt_store(key, 0, best, ply, flag, best_mv);
+            self.tt_store(key, 0, best, ply, flag, best_mv, false);
             return Ok(best);
         }
 
@@ -1679,7 +1709,7 @@ impl Searcher {
             return Ok(stand_pat);
         }
         if stand_pat >= beta {
-            self.tt_store(key, 0, stand_pat, ply, TTFlag::Beta, None);
+            self.tt_store(key, 0, stand_pat, ply, TTFlag::Beta, None, false);
             return Ok(beta);
         }
         alpha = alpha.max(stand_pat);
@@ -1801,7 +1831,7 @@ impl Searcher {
         } else {
             TTFlag::Exact
         };
-        self.tt_store(key, 0, best, ply, flag, best_mv);
+        self.tt_store(key, 0, best, ply, flag, best_mv, false);
         Ok(best)
     }
 
@@ -1937,6 +1967,12 @@ impl Searcher {
         // define aca (antes de RFP) porque tanto razoring como la poda LMP
         // mas abajo la necesitan.
         let es_pv = beta - alpha > 1;
+        // "Estuvo en PV alguna vez": la ventana ACTUAL puede ser nula (por
+        // LMR/null-move desde otro camino) pero si la entrada de TT de este
+        // nodo quedo marcada was_pv en una visita anterior con ventana
+        // abierta, sigue siendo una posicion "interesante" -- se trata con
+        // mas cuidado en RFP/LMR aunque ahora mismo no sea nodo PV.
+        let fue_pv = es_pv || tt_entry_full.as_ref().is_some_and(|e| e.was_pv);
 
         // Mate distance pruning: un mate no puede tardar menos de `ply` plies
         // en aparecer desde la raiz (los plies ya caminados), asi que ninguna
@@ -1986,7 +2022,14 @@ impl Searcher {
                 self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
             // improving: con mejora el margen se achica (poda mas agresivo);
             // sin mejora se agranda (mas conservador, poda menos).
-            let margen_ply = if improving { rfp_margen_base * 3 / 5 } else { rfp_margen_base };
+            let mut margen_ply = if improving { rfp_margen_base * 3 / 5 } else { rfp_margen_base };
+            // fue_pv (persistente, ver tt_store/was_pv): un nodo que fue PV
+            // alguna vez merece mas cuidado aunque ahora la ventana sea
+            // nula -- se agranda el margen (poda menos agresiva), igual que
+            // ya se hace con "improving".
+            if fue_pv {
+                margen_ply += margen_ply / 4;
+            }
             if static_eval - margen_ply * depth >= beta {
                 return Ok(static_eval - margen_ply * depth);
             }
@@ -2211,6 +2254,7 @@ impl Searcher {
                     ply,
                     TTFlag::Beta,
                     probcut_move,
+                    false,
                 );
                 self.path_len = self.path_len.saturating_sub(1);
                 return Ok(probcut_score);
@@ -2766,6 +2810,12 @@ impl Searcher {
                 let mut r = tabla_lmr()[(depth as usize).min(63)][(idx + 1).min(63)].max(1);
                 if es_pv {
                     r -= 1;
+                } else if fue_pv {
+                    // No es PV en la ventana actual, pero fue PV alguna vez
+                    // (persistido en la TT, ver was_pv): reducir un poco
+                    // menos que a un nodo comun, sin llegar al trato de un
+                    // nodo PV real.
+                    r -= 1;
                 }
                 if !improving {
                     r += 1;
@@ -2996,7 +3046,7 @@ impl Searcher {
         } else {
             TTFlag::Exact
         };
-        self.tt_store(key, depth, best_score, ply, flag, best_move);
+        self.tt_store(key, depth, best_score, ply, flag, best_move, fue_pv);
 
         // Correction history: registrar el error entre el score REAL de la
         // busqueda y la eval estatica cruda. Solo cuando la cota es coherente
@@ -3555,7 +3605,7 @@ impl Searcher {
             // iteracion, solo para que el reporte informativo tenga de donde
             // arrancar; no afecta la busqueda en si (el valor final se
             // vuelve a escribir igual al terminar el loop).
-            self.tt_store(b.zobrist, mejor_prof, mejor_sc, 0, TTFlag::Exact, mejor_mv);
+            self.tt_store(b.zobrist, mejor_prof, mejor_sc, 0, TTFlag::Exact, mejor_mv, true);
             // El PV mostrado en "info" es puramente informativo (no
             // participa de la busqueda): se reconstruye caminando la TT
             // desde la raiz, acotado a la profundidad ya completada para no
@@ -3631,7 +3681,7 @@ impl Searcher {
         // extraer_pv() no puede ni arrancar a caminarla. Guardarla aca no
         // afecta la busqueda en si (pasa DESPUES del loop).
         if let Some(mv) = mejor_mv {
-            self.tt_store(b.zobrist, mejor_prof, mejor_sc, 0, TTFlag::Exact, Some(mv));
+            self.tt_store(b.zobrist, mejor_prof, mejor_sc, 0, TTFlag::Exact, Some(mv), true);
         }
         let sc_final = if raiz_tablas { sc_tablas } else { mejor_sc };
         (mejor_mv, sc_final, mejor_prof)
