@@ -1416,8 +1416,8 @@ pub fn evaluate_with_state(
 /// Evaluación clásica desde el acumulador incremental ya disponible.
 /// La quiescence puede usar esta ruta sin recomputar componentes clásicos.
 pub fn evaluate_classical_with_state(b: &Board, state: &EvalState) -> i32 {
-    // Tambien aca: la quiescence y el contempt de `draw_score` pasan por esta
-    // ruta, y deben ver 0 en un final muerto igual que la ruta principal.
+    // Tambien aca: la quiescence sin NNUE pasa por esta ruta, y debe ver 0 en
+    // un final muerto igual que la ruta principal.
     if material_insuficiente(b) {
         return 0;
     }
@@ -1429,9 +1429,10 @@ mod material_insuficiente_tests {
     use super::*;
 
     /// Evalua la FEN por las TRES rutas publicas y devuelve los tres valores.
-    /// Se prueban las tres a proposito: la busqueda usa `evaluate_with_state`,
-    /// la quiescence y el contempt de `draw_score` usan la clasica, y
-    /// `evaluate_with_nnue` es la referencia de herramientas externas. Un
+    /// Se prueban las tres a proposito: la busqueda y el contempt de
+    /// `draw_score` usan `evaluate_with_state`, la quiescence sin NNUE usa la
+    /// clasica, y `evaluate_with_nnue` es la referencia de herramientas
+    /// externas. Un
     /// arreglo que solo tapara una de las tres dejaria el bug vivo en las
     /// otras dos.
     ///

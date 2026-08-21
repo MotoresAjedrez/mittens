@@ -44,23 +44,26 @@ fn draw_score(
 ) -> i32 {
     // Para decidir el signo del contempt en tablas (repeticion/regla de 50)
     // solo importa si la posicion esta CLARAMENTE ganada o perdida (fuera
-    // del umbral de 500cp). La evaluacion clasica es mucho mas barata que la
-    // NNUE completa, asi que se usa primero; solo si el resultado clasico
-    // cae en la zona ambigua cerca del umbral se confirma con la NNUE.
-    let se_clasico = evaluate_classical_with_state(b, eval_state);
-    if se_clasico > CONTEMPT_UMBRAL {
+    // del umbral). Se consulta la MISMA evaluacion con la que juega el motor,
+    // no la clasica, por dos razones:
+    //   - ESCALA: CONTEMPT_UMBRAL tiene que estar en las mismas unidades que
+    //     alfa/beta, la TT y los margenes de poda, que son las de
+    //     `evaluate_with_state`. La clasica no pasa por `peso_bullet` (1.6
+    //     por defecto), asi que compararla contra la misma constante 500
+    //     significaba dos umbrales reales distintos segun cual de los dos
+    //     evaluadores contestara primero.
+    //   - COSTO: el viejo comentario decia que la clasica era "mucho mas
+    //     barata"; con red pura (el default) dejo de serlo. Ahi el
+    //     acumulador clasico ya no se mantiene por delta y la clasica se
+    //     recalcula ENTERA desde el tablero, mientras que la red solo aplica
+    //     su capa de salida sobre el acumulador que ya viene actualizado.
+    let se = evaluate_with_state(b, eval_state, nnue);
+    if se > CONTEMPT_UMBRAL {
         -CONTEMPT_PENALIZACION
-    } else if se_clasico < -CONTEMPT_UMBRAL {
+    } else if se < -CONTEMPT_UMBRAL {
         CONTEMPT_PENALIZACION
     } else {
-        let se = evaluate_with_state(b, eval_state, nnue);
-        if se > CONTEMPT_UMBRAL {
-            -CONTEMPT_PENALIZACION
-        } else if se < -CONTEMPT_UMBRAL {
-            CONTEMPT_PENALIZACION
-        } else {
-            0
-        }
+        0
     }
 }
 
@@ -989,9 +992,9 @@ impl Searcher {
     /// True si en ESTA configuracion la parte clasica de la evaluacion puede
     /// entrar en el puntaje de algun nodo. Cuando es false, mantener el
     /// acumulador clasico por delta en cada nodo es trabajo puro perdido
-    /// (era ~10% del tiempo de busqueda segun el perfilado): la unica funcion
-    /// que aun la consulta es `draw_score`, que la recalcula desde el
-    /// tablero en las pocas posiciones de repeticion/regla de 50.
+    /// (era ~10% del tiempo de busqueda segun el perfilado): ninguna ruta de
+    /// puntuacion la consulta (`draw_score` tambien evalua con la red, para
+    /// que su umbral quede en la escala de la busqueda).
     ///
     /// Se exige que las TRES condiciones se cumplan para poder saltarla:
     ///   - hay acumulador NNUE y su red es "pura" (evalua sola),
