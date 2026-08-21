@@ -236,6 +236,26 @@ fn hash_no_peones(b: &Board, color: usize) -> u64 {
     h
 }
 
+/// Hash Zobrist solo de las piezas menores (caballos y alfiles) de AMBOS
+/// colores. Stockfish le da 17-45% mas peso que a pawn/nonpawn: la
+/// estructura de piezas menores (fianchetto, alfil malo, caballo mal
+/// ubicado) suele explicar errores sistematicos de la eval estatica que
+/// pawn/nonpawn (que mezcla todas las piezas no-peon) no aisla bien.
+fn hash_menores(b: &Board) -> u64 {
+    let k = crate::zobrist::keys();
+    let mut h = 0u64;
+    for color in 0..2usize {
+        for pt in [PieceType::Knight as usize, PieceType::Bishop as usize] {
+            let mut bb = b.pieces[color][pt];
+            while bb != 0 {
+                let sq = crate::bitboard::pop_lsb(&mut bb);
+                h ^= k.piece_square[color][pt][sq as usize];
+            }
+        }
+    }
+    h
+}
+
 /// Actualizacion con "gravedad" (Stockfish): el bonus crece con la
 /// profundidad y con el error, y se amortigua a medida que la entrada se
 /// aleja de cero -- acota la tabla sin resets bruscos.
@@ -283,6 +303,16 @@ const CONT_HIST_SIZE: usize = 6 * 64 * 6 * 64;
 #[inline]
 fn cont_idx(prev_pt: usize, prev_to: usize, pt: usize, to: usize) -> usize {
     ((prev_pt * 64 + prev_to) * 6 + pt) * 64 + to
+}
+
+// Correction history de continuacion a 2 plies: mismo formato que
+// `cont_idx` (pieza+destino de la jugada rival previa, aqui la de HACE 2
+// plies, combinada con la de 1 ply), un casillero por lado a mover.
+const CORR_CONT2_SIZE: usize = 6 * 64 * 6 * 64;
+
+#[inline]
+fn corr_cont2_idx(p2_pt: usize, p2_to: usize, p1_pt: usize, p1_to: usize, stm: usize) -> usize {
+    cont_idx(p2_pt, p2_to, p1_pt, p1_to) * 2 + stm
 }
 
 // Capture history: 6 tipos de pieza que mueve x 64 destinos x 6 tipos de
@@ -737,6 +767,12 @@ pub struct Searcher {
     corr_nonpawn: [Vec<i32>; 2],
     // Continuation corrhist: (pieza_rival, destino_rival, bando) aplanado.
     corr_cont: Vec<i32>,
+    // Minor-piece corrhist: hash solo de caballos+alfiles de ambos colores,
+    // mismo estilo/tamano que corr_pawn: [bando][hash].
+    corr_minor: Vec<i32>,
+    // Continuation corrhist a 2 plies: (pieza/destino de hace 2 plies,
+    // pieza/destino de hace 1 ply, bando) aplanado -- ver corr_cont2_idx.
+    corr_cont2: Vec<i32>,
     // Lazy SMP: escalonamiento de profundidad (skip arrays al estilo
     // Stockfish clasico). `Some((size, phase))` hace que este hilo AYUDANTE
     // se saltee bloques de iteraciones de la profundizacion: salta la
@@ -834,6 +870,8 @@ impl Searcher {
             corr_pawn: vec![0; 2 * CORR_SIZE],
             corr_nonpawn: [vec![0; 2 * CORR_SIZE], vec![0; 2 * CORR_SIZE]],
             corr_cont: vec![0; 6 * 64 * 2],
+            corr_minor: vec![0; 2 * CORR_SIZE],
+            corr_cont2: vec![0; CORR_CONT2_SIZE * 2],
             salto_smp: None,
             root_moves_filtro: None,
             null_move_r_extra: 0,
@@ -856,6 +894,8 @@ impl Searcher {
             corr_pawn: self.corr_pawn,
             corr_nonpawn: self.corr_nonpawn,
             corr_cont: self.corr_cont,
+            corr_minor: self.corr_minor,
+            corr_cont2: self.corr_cont2,
         }))
     }
 
@@ -875,7 +915,9 @@ impl Searcher {
             && t.corr_pawn.len() == self.corr_pawn.len()
             && t.corr_nonpawn[0].len() == self.corr_nonpawn[0].len()
             && t.corr_nonpawn[1].len() == self.corr_nonpawn[1].len()
-            && t.corr_cont.len() == self.corr_cont.len();
+            && t.corr_cont.len() == self.corr_cont.len()
+            && t.corr_minor.len() == self.corr_minor.len()
+            && t.corr_cont2.len() == self.corr_cont2.len();
         if !compatible {
             return;
         }
@@ -888,6 +930,8 @@ impl Searcher {
         self.corr_pawn = t.corr_pawn;
         self.corr_nonpawn = t.corr_nonpawn;
         self.corr_cont = t.corr_cont;
+        self.corr_minor = t.corr_minor;
+        self.corr_cont2 = t.corr_cont2;
     }
 
     /// Crea un Searcher que comparte la TT (Arc clonado, mismo mask) de otro
@@ -931,6 +975,8 @@ impl Searcher {
             corr_pawn: vec![0; 2 * CORR_SIZE],
             corr_nonpawn: [vec![0; 2 * CORR_SIZE], vec![0; 2 * CORR_SIZE]],
             corr_cont: vec![0; 6 * 64 * 2],
+            corr_minor: vec![0; 2 * CORR_SIZE],
+            corr_cont2: vec![0; CORR_CONT2_SIZE * 2],
             salto_smp: None,
             root_moves_filtro: None,
             null_move_r_extra: 0,
@@ -1151,6 +1197,12 @@ impl Searcher {
         for v in self.corr_cont.iter_mut() {
             *v /= 2;
         }
+        for v in self.corr_minor.iter_mut() {
+            *v /= 2;
+        }
+        for v in self.corr_cont2.iter_mut() {
+            *v /= 2;
+        }
     }
 
     /// Eval estatica corregida por correction history: promedia las tres
@@ -1180,7 +1232,13 @@ impl Searcher {
         }
     }
 
-    fn eval_corregida(&self, b: &Board, static_eval: i32, prev: Option<(usize, usize)>) -> i32 {
+    fn eval_corregida(
+        &self,
+        b: &Board,
+        static_eval: i32,
+        prev: Option<(usize, usize)>,
+        prev2: Option<(usize, usize)>,
+    ) -> i32 {
         let stm = b.turn as usize;
         let base = stm * CORR_SIZE;
         let pawn = self.corr_pawn[base + (hash_peones(b) as usize & CORR_MASK)];
@@ -1188,11 +1246,20 @@ impl Searcher {
             [base + (hash_no_peones(b, 0) as usize & CORR_MASK)];
         let npb = self.corr_nonpawn[1]
             [base + (hash_no_peones(b, 1) as usize & CORR_MASK)];
+        let minor = self.corr_minor[base + (hash_menores(b) as usize & CORR_MASK)];
         let cont = match prev {
             Some((pt, to)) => self.corr_cont[(pt * 64 + to) * 2 + stm],
             None => 0,
         };
-        static_eval + (pawn + (npw + npb) / 2 + cont / 2) / 2
+        let cont2 = match (prev, prev2) {
+            (Some((p1_pt, p1_to)), Some((p2_pt, p2_to))) => {
+                self.corr_cont2[corr_cont2_idx(p2_pt, p2_to, p1_pt, p1_to, stm)]
+            }
+            _ => 0,
+        };
+        // minor pesa 4/3 (Stockfish: 17-45% mas que pawn/nonpawn); cont2 se
+        // suma a cont en la misma cascada de blend, mismo peso relativo.
+        static_eval + (pawn + (npw + npb) / 2 + minor * 4 / 3 + (cont + cont2) / 2) / 2
     }
 
     /// Registra el error entre el score real de la busqueda y la eval
@@ -1204,6 +1271,7 @@ impl Searcher {
         score_real: i32,
         depth: i32,
         prev: Option<(usize, usize)>,
+        prev2: Option<(usize, usize)>,
     ) {
         let diff = score_real - static_eval;
         let stm = b.turn as usize;
@@ -1214,9 +1282,15 @@ impl Searcher {
         corrhist_update(&mut self.corr_nonpawn[0][idx_npw], diff, depth);
         let idx_npb = base + (hash_no_peones(b, 1) as usize & CORR_MASK);
         corrhist_update(&mut self.corr_nonpawn[1][idx_npb], diff, depth);
+        let idx_minor = base + (hash_menores(b) as usize & CORR_MASK);
+        corrhist_update(&mut self.corr_minor[idx_minor], diff, depth);
         if let Some((pt, to)) = prev {
             let idx = (pt * 64 + to) * 2 + stm;
             corrhist_update(&mut self.corr_cont[idx], diff, depth);
+        }
+        if let (Some((p1_pt, p1_to)), Some((p2_pt, p2_to))) = (prev, prev2) {
+            let idx2 = corr_cont2_idx(p2_pt, p2_to, p1_pt, p1_to, stm);
+            corrhist_update(&mut self.corr_cont2[idx2], diff, depth);
         }
     }
 
@@ -1673,7 +1747,7 @@ impl Searcher {
         // piezas, que son las de mayor peso.
         let stand_pat = {
             let raw = self.evaluar_quiescence(b, eval_state);
-            self.eval_corregida(b, raw, None)
+            self.eval_corregida(b, raw, None, None)
         };
         if ply >= MAX_PLY {
             return Ok(stand_pat);
@@ -1983,7 +2057,7 @@ impl Searcher {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let static_eval =
-                self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
+                self.eval_con_tt(self.eval_corregida(b, raw, prev, prev2), tt_entry_full.as_ref());
             // improving: con mejora el margen se achica (poda mas agresivo);
             // sin mejora se agranda (mas conservador, poda menos).
             let margen_ply = if improving { rfp_margen_base * 3 / 5 } else { rfp_margen_base };
@@ -2006,7 +2080,7 @@ impl Searcher {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let static_eval =
-                self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
+                self.eval_con_tt(self.eval_corregida(b, raw, prev, prev2), tt_entry_full.as_ref());
             // improving: con mejora el margen se achica; sin mejora se agranda
             // (mas conservador, se razorea menos).
             let margen_base = if improving { RAZOR_MARGEN_BASE * 3 / 5 } else { RAZOR_MARGEN_BASE };
@@ -2079,7 +2153,7 @@ impl Searcher {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let eval_nmp =
-                self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
+                self.eval_con_tt(self.eval_corregida(b, raw, prev, prev2), tt_entry_full.as_ref());
             if eval_nmp >= beta {
                 let r_eval = ((eval_nmp - beta) / NULL_MOVE_EVAL_DIV).min(NULL_MOVE_EVAL_MAX);
                 let r_adaptativo = NULL_MOVE_R_BASE + depth / NULL_MOVE_DEPTH_DIV + r_eval;
@@ -2572,7 +2646,7 @@ impl Searcher {
                 let ev = *fut_eval.get_or_insert_with(|| {
                     let raw =
                         *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
-                    self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref())
+                    self.eval_con_tt(self.eval_corregida(b, raw, prev, prev2), tt_entry_full.as_ref())
                 });
                 // improving: con mejora el margen de futilidad se achica -- se
                 // descartan mas jugadas silenciosas tardias; sin mejora el
@@ -3012,7 +3086,7 @@ impl Searcher {
                 TTFlag::Alpha => best_score < se,
             };
             if coherente {
-                self.corrhist_registrar(b, se, best_score, depth, prev);
+                self.corrhist_registrar(b, se, best_score, depth, prev, prev2);
             }
         }
 
@@ -3680,6 +3754,8 @@ pub struct TablasPersistentes {
     corr_pawn: Vec<i32>,
     corr_nonpawn: [Vec<i32>; 2],
     corr_cont: Vec<i32>,
+    corr_minor: Vec<i32>,
+    corr_cont2: Vec<i32>,
 }
 
 /// Memoria persistente de UN hilo de Lazy SMP entre llamadas a "go".
