@@ -214,22 +214,32 @@ const CORR_SIZE: usize = 16384;
 const CORR_MASK: usize = CORR_SIZE - 1;
 const CORR_MAX: i32 = 128;
 
+// `Board::corr_hash` guarda los tres hashes parciales con 16 bits cada uno.
+// Eso alcanza para indexar las tablas de correction history mientras el
+// enmascarado use como mucho 16 bits. Si algun dia se agranda CORR_SIZE por
+// encima de 65536, esto falla EN COMPILACION en vez de silenciosamente
+// indexar con bits que no existen.
+const _: () = assert!(
+    CORR_SIZE <= 1 << 16,
+    "CORR_SIZE no entra en los 16 bits por ranura de Board::corr_hash"
+);
+
 /// Hash Zobrist solo de los peones (estructura de peones).
 ///
-/// Ya no se recorre el tablero: `Board` lo mantiene incrementalmente en
-/// `corr_hash[0]`, con el mismo XOR de claves `piece_square` que este bucle
-/// hacia (ver `Board::corr_hash`). Mismo valor exacto, coste cero.
+/// Ya no se recorre el tablero: `Board` lo mantiene incrementalmente, con el
+/// mismo XOR de claves `piece_square` que este bucle hacia (ver
+/// `Board::corr_hash`). Mismos bits bajos exactos, coste cero.
 #[inline(always)]
 fn hash_peones(b: &Board) -> u64 {
-    b.corr_hash[0]
+    b.corr_hash & 0xFFFF
 }
 
 /// Hash Zobrist de las piezas que NO son peones de un color dado.
-/// Mantenido incrementalmente en `Board::corr_hash[1 + color]`.
+/// Mantenido incrementalmente en la ranura `1 + color` de `Board::corr_hash`.
 #[inline(always)]
 fn hash_no_peones(b: &Board, color: usize) -> u64 {
     debug_assert!(color < 2);
-    b.corr_hash[1 + color]
+    (b.corr_hash >> (16 * (1 + color))) & 0xFFFF
 }
 
 /// Actualizacion con "gravedad" (Stockfish): el bonus crece con la

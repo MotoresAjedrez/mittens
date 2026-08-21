@@ -72,18 +72,28 @@ fn rey_puede_capturar(
     occupied: Bitboard,
     bb: &[[Bitboard; 6]; 2],
 ) -> bool {
-    let mut occ2 = occupied;
-    let mut bb2 = *bb;
-    occ2 &= !bit(from_sq);
-    bb2[color as usize][PieceType::King as usize] &= !bit(from_sq);
-    let ataques = atacantes_a(color.opposite(), to_sq, occ2, &bb2) & !bit(to_sq);
+    // Antes se copiaba el arreglo entero de bitboards (96 bytes) para quitarle
+    // el rey de `color`... y despues se preguntaba por los atacantes de
+    // `color.opposite()`. `atacantes_a` lee UNICAMENTE `bb[color_que_ataca]`,
+    // asi que esa modificacion nunca se leia: la copia era trabajo muerto.
+    // Lo unico que de verdad importa es sacar al rey de la OCUPACION (para
+    // que no se tape a si mismo de un jaque deslizante), y eso sigue igual.
+    let occ2 = occupied & !bit(from_sq);
+    let ataques = atacantes_a(color.opposite(), to_sq, occ2, bb) & !bit(to_sq);
     ataques == 0
 }
 
+/// `bb` se recibe por referencia MUTABLE y se restaura antes de volver: el
+/// atacante elegido se quita, se recursa y se vuelve a poner. Antes cada
+/// nivel copiaba el arreglo completo (`[[Bitboard; 6]; 2]`, 96 bytes) solo
+/// para apagar UN bit. Con el hacer/deshacer el estado que ve cada nivel es
+/// exactamente el mismo (quitar y volver a poner el mismo bit con `&= !b` y
+/// `|= b` es la operacion inversa exacta) y el llamador recupera su arreglo
+/// intacto, asi que el valor devuelto es identico.
 fn see_recurse(
     to_sq: Square,
     occupied: Bitboard,
-    bb: &[[Bitboard; 6]; 2],
+    bb: &mut [[Bitboard; 6]; 2],
     color_en_turno: Color,
     valor_en_to: i32,
 ) -> i32 {
@@ -98,13 +108,12 @@ fn see_recurse(
             continue;
         }
 
-        let mut occ2 = occupied;
-        let mut bb2 = *bb;
-        occ2 &= !bit(sq);
-        bb2[color_en_turno as usize][pt as usize] &= !bit(sq);
+        let occ2 = occupied & !bit(sq);
         let (nuevo_valor, bonus_promocion) = resultado_capturador(color_en_turno, pt, to_sq);
-        let g = valor_en_to + bonus_promocion
-            - see_recurse(to_sq, occ2, &bb2, color_en_turno.opposite(), nuevo_valor);
+        bb[color_en_turno as usize][pt as usize] &= !bit(sq);
+        let resto = see_recurse(to_sq, occ2, bb, color_en_turno.opposite(), nuevo_valor);
+        bb[color_en_turno as usize][pt as usize] |= bit(sq);
+        let g = valor_en_to + bonus_promocion - resto;
         return g.max(0);
     }
     0
@@ -145,7 +154,7 @@ pub fn see(b: &Board, mv: &Move) -> i32 {
         valor(atacante_tipo)
     };
 
-    let resto = see_recurse(to_sq, occupied, &bb, color_atacante.opposite(), valor_en_to);
+    let resto = see_recurse(to_sq, occupied, &mut bb, color_atacante.opposite(), valor_en_to);
     gain0 - resto
 }
 
