@@ -2463,6 +2463,10 @@ impl Searcher {
         const FUT_PROF_MAX: i32 = 4;
         const FUT_MARGEN_BASE: i32 = 150;
         const FUT_MARGEN_POR_PLY: i32 = 100;
+        // Memo EXCLUSIVO de la futilidad: guarda la eval corregida por
+        // corrhist y refinada con el score de TT. No compartirlo con otras
+        // heuristicas -- el que quiera la eval estatica CRUDA debe usar
+        // `static_eval_cache`, que es el memo de esa otra cantidad.
         let mut fut_eval: Option<i32> = None;
 
         let mut best_score = -INFINITO;
@@ -2824,9 +2828,16 @@ impl Searcher {
                 let r = r.clamp(1, (depth - 2 + ext.min(0)).max(1));
                 let child_ply = (ply + 1) as usize;
                 if child_ply < MAX_KILLER_PLY {
-                    self.hindsight_parent_eval[ply as usize] = *fut_eval.get_or_insert_with(|| {
-                        *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state))
-                    });
+                    // Eval CRUDA a proposito: el hijo (ver hindsight arriba)
+                    // compara contra su propia eval cruda, asi que los dos
+                    // lados de `eval_delta` tienen que estar en la misma
+                    // escala. Antes esto memoizaba sobre `fut_eval`, que es la
+                    // eval corregida por corrhist Y pisada por el score de TT:
+                    // al compartir el memo con la futilidad, el valor que
+                    // quedaba dependia de cual de los dos bloques corria
+                    // primero en el nodo (se solapan en depth 3-4).
+                    self.hindsight_parent_eval[ply as usize] =
+                        *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
                     self.hindsight_reduction[child_ply] = r;
                 }
                 // PVS real: el sondeo reducido usa ventana NULA (-alpha-1,-alpha)
