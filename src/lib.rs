@@ -1294,7 +1294,13 @@ pub fn uci_loop() {
                 println!("option name OwnBook type check default false");
                 println!("option name UseNNUE type check default true");
                 println!("option name NNUEPath type string default <empty>");
-                println!("option name UseNN type check default false");
+                // UseNN es un alias historico de UseNNUE: el handler de
+                // setoption escribe el MISMO estado con los dos nombres. Se
+                // sigue aceptando por compatibilidad, pero ya no se anuncia:
+                // anunciarlo declaraba un segundo check para el mismo booleano
+                // y con default opuesto (false), asi que un GUI que reenvia los
+                // defaults que el motor publica (Arena y varios puentes)
+                // terminaba apagando la NNUE en silencio.
                 println!("option name NNPath type string default <empty>");
                 println!("option name QSearchNNUE type check default true");
                 println!("option name NNUEClassicalDepth type spin default 0 min 0 max 4");
@@ -1405,6 +1411,8 @@ pub fn uci_loop() {
                                 ),
                             }
                         }
+                    // "usenn" es el alias historico de "usennue": se acepta pero
+                    // ya no se anuncia en `uci` (ver comentario alli).
                     } else if (nombre.eq_ignore_ascii_case("usennue")
                         || nombre.eq_ignore_ascii_case("usenn"))
                         && let Some(v) = valor
