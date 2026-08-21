@@ -1,0 +1,18 @@
+{
+  "completed": 357,
+  "draws": 126,
+  "losses": 97,
+  "signature": {
+    "alpha": 0.05,
+    "baseline_sha256": "5ad1f319b073b14bf55ad6855af1a05a3c85fd3ec5fc98be838d1c36332a2449",
+    "baseline_weights_sha256": "b98ffb137abe3a68ea02c3a0c42f78fa54221b42f28189b074ceba9250fad39d",
+    "beta": 0.05,
+    "candidate_sha256": "3050dd6d1f5afc16776dd73fbc42eac5b16f5708430a43cdc6a5c51f4e7ae813",
+    "candidate_weights_sha256": "b98ffb137abe3a68ea02c3a0c42f78fa54221b42f28189b074ceba9250fad39d",
+    "elo0": 0.0,
+    "elo1": 5.0,
+    "nodes": 100000,
+    "openings_sha256": "6a50a2cc269aa4e2d25000cacaeebbd9e0bd7e83e436ab2efa588a7505ed26b9"
+  },
+  "wins": 134
+}

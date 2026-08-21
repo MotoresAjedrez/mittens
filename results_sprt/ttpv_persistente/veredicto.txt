@@ -1,0 +1,5 @@
+ttpv_persistente
+Partidas: 1562 (+469 =742 -351), score=53.8%
+LLR final: 2.9587 (limites [-2.9444, 2.9444])
+H0: elo <= 0.0, H1: elo >= 5.0, alpha=0.05, beta=0.05
+Razon de corte: LLR cruzo el limite superior (2.9587 >= 2.9444): acepta H1 (candidato >= 5.0 elo)

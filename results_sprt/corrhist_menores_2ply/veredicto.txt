@@ -1,0 +1,5 @@
+corrhist_menores_2ply
+Partidas: 362 (+54 =154 -154), score=36.2%
+LLR final: -2.9632 (limites [-2.9444, 2.9444])
+H0: elo <= 0.0, H1: elo >= 5.0, alpha=0.05, beta=0.05
+Razon de corte: LLR cruzo el limite inferior (-2.9632 <= -2.9444): acepta H0 (candidato <= 0.0 elo)
