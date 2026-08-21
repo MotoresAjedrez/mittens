@@ -24,6 +24,23 @@ pub struct Board {
     pub halfmove_clock: u32,
     pub fullmove_number: u32,
     pub zobrist: u64,
+    /// Plies transcurridos desde el ultimo null move (make_null_move lo pone
+    /// a 0, make_move lo incrementa). NO forma parte del zobrist ni del FEN:
+    /// es solo para acotar la ventana de deteccion de repeticion.
+    ///
+    /// POR QUE: el null move es un "paso" que no existe en la partida real y
+    /// no toca halfmove_clock, asi que una ventana acotada SOLO por
+    /// halfmove_clock puede mirar hacia atras CRUZANDO uno o mas null moves
+    /// y encontrar un ancestro que ya no es alcanzable con jugadas reales.
+    /// Eso fabrica un puntaje de tablas dentro del sondeo nulo y puede
+    /// producir un corte por beta indebido. La ventana correcta es
+    /// min(halfmove_clock, plies_from_null) (mismo criterio que Stockfish).
+    ///
+    /// Arranca en u32::MAX (= "no hay ningun null move detras"), de modo que
+    /// en la raiz y en toda la partida real el min() nunca recorta y el
+    /// comportamiento es identico al anterior; solo se activa dentro de los
+    /// subarboles de null move.
+    pub plies_from_null: u32,
 }
 
 /// Derechos de enroque que SOBREVIVEN cuando la casilla es origen o destino
@@ -52,6 +69,7 @@ impl Board {
             halfmove_clock: 0,
             fullmove_number: 1,
             zobrist: 0,
+            plies_from_null: u32::MAX,
         }
     }
 
@@ -587,6 +605,9 @@ impl Board {
         } else {
             b.halfmove_clock += 1;
         }
+        // Una jugada REAL aleja un ply del ultimo null move (saturating: el
+        // valor inicial es u32::MAX y ahi se queda).
+        b.plies_from_null = b.plies_from_null.saturating_add(1);
 
         // Enroque: mover también la torre
         if mv.flag == MoveFlag::CastleKing {
@@ -657,6 +678,9 @@ impl Board {
         b.ep_square = None;
         b.turn = b.turn.opposite();
         b.zobrist ^= k.side_to_move;
+        // Corta la ventana de repeticion: ningun ancestro anterior a este
+        // "paso" es alcanzable con jugadas reales desde aqui.
+        b.plies_from_null = 0;
         b
     }
 }

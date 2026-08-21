@@ -1841,7 +1841,14 @@ impl Searcher {
         // descuido". No hace falta esperar la 3ra ocurrencia real: ver la
         // 2da dentro del arbol ya significa que la repeticion esta
         // disponible como opcion, que es lo que le interesa a la busqueda.
-        let hc = b.halfmove_clock as usize;
+        //
+        // La ventana se acota con min(halfmove_clock, plies_from_null): el
+        // null move es un "paso" que no existe en la partida real y no toca
+        // halfmove_clock, asi que sin el min() la ventana puede CRUZAR uno o
+        // mas null moves y emparejar con un ancestro que ya no es alcanzable
+        // por jugadas reales (tablas fabricadas dentro del sondeo nulo, y con
+        // ellas un corte por beta indebido). Ver `plies_from_null` en board.rs.
+        let hc = (b.halfmove_clock as usize).min(b.plies_from_null as usize);
         if hc > 0 {
             let start = self.path_len.saturating_sub(hc);
             if self.path[start..self.path_len].contains(&b.zobrist) {
@@ -3029,7 +3036,11 @@ impl Searcher {
         if b.halfmove_clock >= 100 {
             return true;
         }
-        let hc = b.halfmove_clock as usize;
+        // Mismo acotamiento que en negamax (min con plies_from_null) para que
+        // los dos sitios usen exactamente el mismo criterio. En la raiz
+        // plies_from_null vale u32::MAX salvo que se haya llegado por un null
+        // move (imposible aqui), asi que en la practica no recorta nada.
+        let hc = (b.halfmove_clock as usize).min(b.plies_from_null as usize);
         if hc > 0 {
             let start = self.path_len.saturating_sub(hc);
             return self.path[start..self.path_len].contains(&b.zobrist);
