@@ -595,8 +595,17 @@ impl NnueAccumulator {
     /// True si esta red debe evaluar SOLA, sin sumarle la evaluacion
     /// clasica. Solo aplica a la arquitectura bullet, que a diferencia de la
     /// de amenazas ya evalua la posicion COMPLETA por si misma; sumarle
-    /// encima la clasica puede estar contando dos veces lo mismo.
-    /// Se activa con MITTENS_BULLET_PURA=1.
+    /// encima la clasica estaria contando dos veces lo mismo.
+    ///
+    /// OJO: para la bullet el modo puro esta ACTIVO POR DEFECTO (desde
+    /// 2026-08-13, ver `bullet_pura`); se APAGA con MITTENS_BULLET_PURA=0.
+    /// O sea que con la configuracion de produccion la eval clasica NO
+    /// participa del puntaje de ningun nodo: `evaluate_with_state` toma la
+    /// rama `red + TEMPO` y ni siquiera llama a `state.clasica(b)`. Todo
+    /// eval.rs salvo `material_insuficiente()` (que se consulta antes del
+    /// match) y el consumo de `draw_score` es codigo inactivo hoy, asi que
+    /// cualquier experimento que ajuste terminos clasicos va a medir 0 Elo
+    /// por construccion, no porque la idea sea mala.
     pub fn pura(&self) -> bool {
         match self {
             // Las bullet (estandar y 5376) evaluan la posicion COMPLETA por

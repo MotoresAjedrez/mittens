@@ -1772,6 +1772,34 @@ impl Searcher {
         Ok(best)
     }
 
+    // Empuja el zobrist de un nodo al path de repeticion. Devuelve si el
+    // empuje ocurrio de verdad: si el path esta lleno (MAX_PATH) se descarta
+    // en silencio, y en ese caso el pop correspondiente NO debe decrementar.
+    // Antes el push estaba guardado pero el pop era incondicional, asi que al
+    // tocar el techo path_len quedaba permanentemente una unidad por debajo
+    // del numero real de ancestros y la ventana path[start..path_len] dejaba
+    // de corresponder a la linea real (deteccion de repeticion corrupta en
+    // partidas muy largas).
+    #[inline]
+    fn path_push(&mut self, z: u64) -> bool {
+        if self.path_len < MAX_PATH {
+            self.path[self.path_len] = z;
+            self.path_len += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    // Contraparte simetrica de path_push: solo decrementa si el push que le
+    // corresponde llego a entrar.
+    #[inline]
+    fn path_pop(&mut self, empujado: bool) {
+        if empujado {
+            self.path_len = self.path_len.saturating_sub(1);
+        }
+    }
+
     // `en_sondeo_se`: true si este nodo ya es descendiente de una busqueda
     // de VERIFICACION de singular extensions. Critico: sin este freno, cada
     // nodo dentro de esa verificacion podria a su vez lanzar su PROPIA
@@ -1993,11 +2021,9 @@ impl Searcher {
         // bloques, asi que esos subarboles podian devolver un puntaje de
         // "ganado" en lo que en realidad eran tablas por repeticion y producir
         // un corte beta falso. El pop correspondiente se hace en todas las
-        // salidas posteriores de la funcion.
-        if self.path_len < MAX_PATH {
-            self.path[self.path_len] = b.zobrist;
-            self.path_len += 1;
-        }
+        // salidas posteriores de la funcion, y solo decrementa si el push
+        // llego a entrar (ver path_push/path_pop).
+        let path_empujado = self.path_push(b.zobrist);
 
         // Null-move pruning: si "pasar el turno" y aun asi el rival no supera
         // beta, la posicion ya es tan buena que se poda sin generar jugadas
@@ -2074,7 +2100,7 @@ impl Searcher {
                 self.salir_hijo(&next_eval, b, &next);
                 let sc_null = -res_null?;
                 if sc_null >= beta {
-                    self.path_len = self.path_len.saturating_sub(1);
+                    self.path_pop(path_empujado);
                     return Ok(if sc_null >= MATE - 1000 { beta } else { sc_null });
                 }
             }
@@ -2179,7 +2205,7 @@ impl Searcher {
                     TTFlag::Beta,
                     probcut_move,
                 );
-                self.path_len = self.path_len.saturating_sub(1);
+                self.path_pop(path_empujado);
                 return Ok(probcut_score);
             }
         }
@@ -2217,7 +2243,7 @@ impl Searcher {
             moves = MoveList::new();
             generate_legal_into(b, &mut moves);
             if moves.is_empty() {
-                self.path_len = self.path_len.saturating_sub(1);
+                self.path_pop(path_empujado);
                 return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
             }
             // ORDEN DE JUGADAS BAJO DEMANDA (seleccion perezosa): claves
@@ -2375,7 +2401,7 @@ impl Searcher {
                         // nodo corta, asi que se devuelve sin explorar mas.
                         // No se guarda en la TT: el score viene de una ventana
                         // ajena a beta y contaminaria la tabla.
-                        self.path_len = self.path_len.saturating_sub(1);
+                        self.path_pop(path_empujado);
                         return Ok(mejor_otra);
                     } else if entry.score >= beta {
                         // EXTENSION NEGATIVA: la jugada de la TT NO resulto
@@ -2954,7 +2980,7 @@ impl Searcher {
                 break;
             }
         }
-        self.path_len = self.path_len.saturating_sub(1);
+        self.path_pop(path_empujado);
 
         let flag = if best_score <= alpha_orig {
             TTFlag::Alpha
@@ -3078,7 +3104,7 @@ impl Searcher {
                 let mut alpha = vent_alpha;
                 actual_mv = moves[0];
                 actual_sc = -INFINITO;
-                if self.path_len < MAX_PATH { self.path[self.path_len] = b.zobrist; self.path_len += 1; }
+                let path_empujado = self.path_push(b.zobrist);
                 let mut interrumpido = false;
                 for (idx, mv) in moves.iter().enumerate() {
                     let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
@@ -3144,7 +3170,7 @@ impl Searcher {
                         break;
                     }
                 }
-                self.path_len = self.path_len.saturating_sub(1);
+                self.path_pop(path_empujado);
                 if interrumpido {
                     let sc = if raiz_tablas { sc_tablas } else { mejor_sc };
                     return (mejor_mv.or(Some(actual_mv)), sc, self.nodes);
@@ -3369,7 +3395,7 @@ impl Searcher {
                 // ganando, la eleccion es "obvia" y se puede cortar antes.
                 nodos_mejor = 0;
                 nodos_iter = 0;
-                if self.path_len < MAX_PATH { self.path[self.path_len] = b.zobrist; self.path_len += 1; }
+                let path_empujado = self.path_push(b.zobrist);
                 for (idx, mv) in moves.iter().enumerate() {
                     let nodos_antes = self.nodes;
                     let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
@@ -3437,7 +3463,7 @@ impl Searcher {
                         break; // fail-high contra la ventana: cortar y reintentar mas ancho
                     }
                 }
-                self.path_len = self.path_len.saturating_sub(1);
+                self.path_pop(path_empujado);
                 if timed_out {
                     break;
                 }
