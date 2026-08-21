@@ -1,6 +1,7 @@
 mod bitboard;
 mod board;
 mod datagen;
+mod etiquetar_pgn;
 mod bullet_net;
 mod bullet_net_amenazas;
 mod eval;
@@ -2143,6 +2144,10 @@ pub fn run_cli() {
         match args[1].as_str() {
             "datagen" => {
                 datagen::run_datagen(&args[2..]);
+                return;
+            }
+            "etiquetar_pgn" => {
+                etiquetar_pgn::run_etiquetar_pgn(&args[2..]);
                 return;
             }
             "perft" => {

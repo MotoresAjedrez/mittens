@@ -89,7 +89,7 @@ struct Muestra {
 ///
 /// `resultado_stm` es 0.0 / 0.5 / 1.0 YA convertido a la perspectiva del que
 /// mueve (ver la nota de arriba sobre la convencion).
-fn empaquetar(b: &Board, score: i32, resultado_stm: f32, salida: &mut Vec<u8>) {
+pub(crate) fn empaquetar(b: &Board, score: i32, resultado_stm: f32, salida: &mut Vec<u8>) {
     let negras = b.turn == Color::Black;
     // (casilla, color, tipo) con la casilla y el color ya volteados si mueven
     // negras, para que la posicion quede siempre "como si moviera blanco".
