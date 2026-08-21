@@ -1718,8 +1718,14 @@ impl Searcher {
             let next = b.make_move(&mv);
             let da_jaque = next.in_check(next.turn);
 
-            // Nunca podar promociones ni jaques por SEE/delta: una captura
+            // Nunca podar promociones ni jaques por SEE: una captura
             // materialmente mala puede ser mate o forzar una secuencia tactica.
+            // La poda delta de mas abajo SI cubre promociones, y no por
+            // descuido: las trata con su cota optimista (`promo_gain`), que es
+            // una estimacion correcta de cuanto pueden llegar a ganar.
+            // Exceptuarlas del todo saldria caro sin ganancia tactica porque el
+            // generador emite las 4 piezas de promocion, subpromociones a alfil
+            // y torre incluidas.
             if !da_jaque && mv.promotion.is_none() && see.unwrap_or(0) < -50 {
                 continue;
             }
@@ -1731,7 +1737,25 @@ impl Searcher {
                     .unwrap_or(0)
             };
             let promo_gain = mv.promotion.map(|pt| valor_pieza(pt) - 100).unwrap_or(0);
-            if !da_jaque && stand_pat + victim + promo_gain + 250 <= alpha {
+            // MEZCLA DE ESCALAS: `valor_pieza()` devuelve centipeones REALES
+            // (peon = 100), pero `stand_pat` y `alpha` viven en la escala
+            // INTERNA del motor, que va ~1.6x inflada (en modo "red pura", el
+            // default, la eval es `1.6 * salida_de_la_red`; ver `peso_bullet()`
+            // en neural.rs y el comentario de `rfp_margen_por_ply` arriba).
+            // Sumar material crudo a una eval inflada hacia que el margen
+            // EFECTIVO no fuese el 250 nominal sino `250 - 0.6*victima`:
+            //   peon (100)  -> +190     torre (500) ->  -50
+            //   caballo(320)->  +58     dama  (900) -> -290
+            // O sea que la poda se volvia mas agresiva cuanto MAS valiosa la
+            // pieza capturada -- exactamente al reves de lo que uno quiere, y
+            // con margen negativo para torre/dama descartaba capturas cuyo
+            // techo optimista SI superaba alfa. Se lleva el material a
+            // unidades internas antes de sumarlo. El 250 se deja intacto a
+            // proposito, para aislar el efecto de arreglar la mezcla.
+            const ESCALA_EVAL_NUM: i32 = 8; // 8/5 = 1.6 = peso_bullet() default
+            const ESCALA_EVAL_DEN: i32 = 5;
+            let ganancia = ((victim + promo_gain) * ESCALA_EVAL_NUM) / ESCALA_EVAL_DEN;
+            if !da_jaque && stand_pat + ganancia + 250 <= alpha {
                 continue;
             }
 
