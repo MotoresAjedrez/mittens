@@ -655,16 +655,34 @@ impl AcumBullet {
             let mut acc3 = vdupq_n_s64(0);
             // Cierre que procesa 8 neuronas: clamp -> ensanchar a i32 ->
             // v*v -> por el peso -> acumular ensanchando a i64.
+            // REORDENAMIENTO EXACTO del producto: v*v*w se calcula como
+            // (v*w)*v en vez de (v*v)*w. Aritmetica entera: la
+            // multiplicacion es asociativa y conmutativa, asi que el i32
+            // resultante es BIT A BIT el mismo. La ventaja es que `v*w`
+            // ensanchando de i16 a i32 son las instrucciones SMULL/SMULL2
+            // (`vmull_s16` / `vmull_high_s16`): UNA operacion que hace el
+            // ensanchado y el producto de una, en vez de ensanchar `v` y `w`
+            // por separado (dos SXTL) y multiplicar despues. Quedan 10
+            // operaciones aritmeticas por cada 8 neuronas en vez de 12
+            // (-17%), y esta es la capa que se ejecuta COMPLETA (2*h = 2048
+            // terminos) en cada evaluacion: el 22% del tiempo de busqueda.
+            //
+            // Rangos (peor caso teorico, no de los pesos reales):
+            //   v = clamp(acumulador, 0, 255)  ->  0..255
+            //   v*w  con |w| <= 32768          ->  |.| <= 8_355_840  (cabe en i32)
+            //   (v*w)*v                        ->  |.| <= 2.13e9     (cabe en i32)
+            // Los mismos limites que el orden anterior; ninguno de los dos
+            // desborda nunca, sea cual sea la red.
             macro_rules! bloque {
                 ($src:expr, $peso:expr, $a:expr, $b:expr) => {{
                     let v16 = vminq_s16(vmaxq_s16(vld1q_s16($src), cero), tope);
                     let w16 = vld1q_s16($peso);
+                    let vw_lo = vmull_s16(vget_low_s16(v16), vget_low_s16(w16));
+                    let vw_hi = vmull_high_s16(v16, w16);
                     let v_lo = vmovl_s16(vget_low_s16(v16));
-                    let v_hi = vmovl_s16(vget_high_s16(v16));
-                    let w_lo = vmovl_s16(vget_low_s16(w16));
-                    let w_hi = vmovl_s16(vget_high_s16(w16));
-                    let p_lo = vmulq_s32(vmulq_s32(v_lo, v_lo), w_lo);
-                    let p_hi = vmulq_s32(vmulq_s32(v_hi, v_hi), w_hi);
+                    let v_hi = vmovl_high_s16(v16);
+                    let p_lo = vmulq_s32(vw_lo, v_lo);
+                    let p_hi = vmulq_s32(vw_hi, v_hi);
                     $a = vpadalq_s32($a, p_lo);
                     $b = vpadalq_s32($b, p_hi);
                 }};
