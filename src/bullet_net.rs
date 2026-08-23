@@ -106,6 +106,45 @@ pub struct RedBullet {
     l1w: Vec<i16>,
     /// Un sesgo de salida por bucket.
     l1b: [i16; B_MAX],
+    /// ¿Los pesos de salida de ESTA red permiten el camino rapido de
+    /// `producto_punto` (productos intermedios en i16 en vez de i32)?
+    /// Se decide UNA vez al cargar, con los pesos reales en la mano; ver
+    /// `salida_i16_segura`. Si es false se usa el camino ancho de siempre,
+    /// que no puede desbordar con ninguna red.
+    salida_i16: bool,
+}
+
+/// ¿Se puede calcular la capa de salida con productos intermedios de 16
+/// bits sin perder un solo bit de precision?
+///
+/// El camino rapido de `producto_punto` calcula, por neurona,
+/// `v * (v*w)` donde el producto interno `v*w` se guarda en un i16 (una
+/// sola instruccion MUL de 16 bits, en vez de SMULL/SMULL2 que ensanchan a
+/// 32) y la suma se acumula en i32 (en vez de ensanchar a i64 en cada
+/// bloque con SADALP). Eso es EXACTAMENTE el mismo entero que el camino
+/// ancho -- la multiplicacion entera es asociativa -- siempre y cuando
+/// ninguno de los dos pasos se salga de su tipo:
+///
+///  1. `v*w` en i16: `v` esta en 0..QA y `|w| <= max_w`, asi que hace falta
+///     `QA * max_w <= i16::MAX`. Con QA=255 eso admite `|w| <= 128`.
+///  2. la suma en i32: cada carril acumula `h/16` terminos (el bucle
+///     procesa 16 neuronas por vuelta con 4 acumuladores por perspectiva),
+///     cada uno de magnitud `<= QA * (QA*max_w)`.
+///
+/// Las redes de bullet con QB=64 recortan los pesos de salida a +-127 por
+/// construccion (1.98 * 64), asi que en la practica esto siempre da true;
+/// la comprobacion existe para que una red futura con otra cuantizacion
+/// caiga sola al camino ancho en vez de dar evaluaciones corruptas.
+fn salida_i16_segura(l1w: &[i16], h: usize) -> bool {
+    let max_w = l1w.iter().map(|&w| (w as i32).abs()).max().unwrap_or(0);
+    let producto = QA as i64 * max_w as i64;
+    if producto > i16::MAX as i64 {
+        return false;
+    }
+    // Carriles del bucle de 16: cada acumulador i32 recibe h/16 terminos
+    // (se redondea hacia arriba para cubrir tambien la cola de 8).
+    let terminos = h.div_ceil(16) as i64;
+    terminos * QA as i64 * producto <= i32::MAX as i64
 }
 
 /// Deduce (oculta, buckets) a partir del tamano del archivo, o None si no
@@ -175,6 +214,12 @@ impl RedBullet {
         eprintln!(
             "info string NNUE bullet: capa oculta de {h} neuronas, {buckets} output bucket(s)"
         );
+        let salida_i16 = salida_i16_segura(&l1w, h);
+        if !salida_i16 {
+            eprintln!(
+                "info string NNUE bullet: pesos de salida fuera del rango del camino rapido -- se usa el camino ancho"
+            );
+        }
         Some(RedBullet {
             h,
             buckets,
@@ -182,6 +227,7 @@ impl RedBullet {
             l0b,
             l1w,
             l1b,
+            salida_i16,
         })
     }
 
@@ -527,6 +573,36 @@ impl AcumBullet {
         &self.pila[self.nivel].persp
     }
 
+    /// Escribe a mano las dos perspectivas del nivel vigente. SOLO para
+    /// tests: sirve para exigirle a la capa de salida valores de acumulador
+    /// que una partida real no produce (todos saturados al tope, todos muy
+    /// negativos, mezclas al azar), que es donde un desbordamiento del
+    /// camino rapido se manifestaria.
+    #[cfg(test)]
+    pub fn forzar_persp(&mut self, yo: [i16; H_MAX], rival: [i16; H_MAX]) {
+        let n = &mut self.pila[self.nivel];
+        n.negras_mueven = false;
+        n.persp[0] = yo;
+        n.persp[1] = rival;
+    }
+
+    /// La capa de salida por el camino vigente (el rapido si los pesos lo
+    /// permiten) y por el escalar de referencia. SOLO para tests.
+    #[cfg(test)]
+    pub fn productos_punto_para_test(&self, bucket: usize) -> (i64, i64) {
+        let n = self.actual();
+        (
+            self.producto_punto(&n.persp[0], &n.persp[1], bucket),
+            self.producto_punto_escalar(&n.persp[0], &n.persp[1], bucket),
+        )
+    }
+
+    /// True si la red cargada habilito el camino rapido de la salida.
+    #[cfg(test)]
+    pub fn usa_salida_rapida(&self) -> bool {
+        self.red.salida_i16
+    }
+
     /// Actualizacion incremental: con features 768 puras basta con mirar,
     /// bitboard por bitboard, que casillas se ocuparon y cuales se
     /// liberaron. Cubre jugada normal, captura, enroque, al paso y
@@ -686,6 +762,16 @@ impl AcumBullet {
     /// se ejecuta COMPLETA (h*2 = 1024 terminos) en cada evaluacion.
     #[inline(always)]
     fn producto_punto(&self, yo: &[i16; H_MAX], rival: &[i16; H_MAX], bucket: usize) -> i64 {
+        // CAMINO RAPIDO (ver `salida_i16_segura`): con los pesos de salida
+        // que producen las redes de bullet (|w| <= 127 por la cuantizacion
+        // QB=64) todo el producto SCReLU entra en 16 bits intermedios y la
+        // suma parcial en 32, asi que el bloque de 8 neuronas baja de 12
+        // operaciones a 7. Es bit a bit el mismo entero; si los pesos no lo
+        // permiten, `salida_i16` es false y se cae al camino ancho de abajo.
+        #[cfg(target_arch = "aarch64")]
+        if self.red.salida_i16 {
+            return unsafe { self.producto_punto_i16(yo, rival, bucket) };
+        }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             use std::arch::aarch64::*;
@@ -776,6 +862,119 @@ impl AcumBullet {
         #[cfg(not(target_arch = "aarch64"))]
         {
             self.producto_punto_escalar(yo, rival, bucket)
+        }
+    }
+
+    /// Camino RAPIDO de la capa de salida (solo aarch64, solo si
+    /// `salida_i16_segura` dio true para los pesos cargados).
+    ///
+    /// Idea: el camino ancho calcula cada termino `v*v*w` ensanchando a 32
+    /// bits (SMULL/SMULL2 para `v*w`, SXTL para `v`, MUL de 32 bits para el
+    /// tercer factor) y despues ensancha OTRA vez a 64 al acumular (SADALP).
+    /// Ese ensanchado existe para tolerar cualquier peso i16 imaginable,
+    /// pero las redes reales de bullet recortan los pesos de salida a
+    /// +-127, y con `v <= 255` el producto `v*w` cabe de sobra en un i16
+    /// (255*127 = 32385 <= 32767). Entonces:
+    ///
+    ///   vw = v*w                 -> UNA instruccion MUL de 16 bits (8 carriles)
+    ///   acc32 += v * vw          -> SMLAL/SMLAL2: multiplica ensanchando a
+    ///                               i32 Y acumula, todo en una instruccion
+    ///
+    /// Por cada 8 neuronas quedan 7 operaciones (2 cargas, 2 del clamp, 1
+    /// MUL, 2 SMLAL) en vez de las 12 del camino ancho: **-42%**. La capa de
+    /// salida corre COMPLETA (2*h = 2048 terminos con la red de 1024) en
+    /// cada evaluacion y el perfilado (`sample`, 18 s de busqueda real) la
+    /// pone en el 22% del tiempo del hilo de busqueda, asi que el bloque es
+    /// el item mas caro del motor despues del acumulador.
+    ///
+    /// EXACTITUD: `v*(v*w)` y `(v*w)*v` son el mismo entero (la
+    /// multiplicacion es asociativa) y ningun paso desborda su tipo -- eso
+    /// es justo lo que verifica `salida_i16_segura` contra los pesos reales
+    /// antes de habilitar este camino. La suma final tampoco cambia: la
+    /// suma entera es asociativa, asi que agrupar en 8 acumuladores i32 y
+    /// ensancharlos al final da el mismo i64 que agrupar en 4 de i64.
+    ///
+    /// Se procesan 16 neuronas por perspectiva y por vuelta con 4
+    /// acumuladores por perspectiva (8 en total, contra los 4 del camino
+    /// ancho): las cadenas de dependencia de SMLAL son mas largas que las
+    /// de MUL+SADALP, y con 8 cadenas independientes el bucle vuelve a
+    /// quedar limitado por emision y no por latencia.
+    ///
+    /// # Safety
+    /// Requiere `salida_i16` (verificado por el llamador) y `h <= H_MAX`
+    /// (invariante de `arquitectura_para_tamano`). Los accesos van dentro
+    /// de `yo`/`rival` (H_MAX elementos) y del bloque del bucket en `l1w`
+    /// (2*H_MAX elementos, reservados en `cargar_de_bytes`).
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn producto_punto_i16(
+        &self,
+        yo: &[i16; H_MAX],
+        rival: &[i16; H_MAX],
+        bucket: usize,
+    ) -> i64 {
+        unsafe {
+            use std::arch::aarch64::*;
+            let cero = vdupq_n_s16(0);
+            let tope = vdupq_n_s16(QA as i16);
+            let w = self.red.l1w.as_ptr().add(bucket * 2 * H_MAX);
+            let h = self.red.h;
+
+            let mut a0 = vdupq_n_s32(0);
+            let mut a1 = vdupq_n_s32(0);
+            let mut a2 = vdupq_n_s32(0);
+            let mut a3 = vdupq_n_s32(0);
+            let mut b0 = vdupq_n_s32(0);
+            let mut b1 = vdupq_n_s32(0);
+            let mut b2 = vdupq_n_s32(0);
+            let mut b3 = vdupq_n_s32(0);
+
+            // Un registro de 8 neuronas: clamp, v*w en 16 bits, y dos
+            // SMLAL que ensanchan a i32 acumulando.
+            macro_rules! reg {
+                ($src:expr, $peso:expr, $lo:expr, $hi:expr) => {{
+                    let v = vminq_s16(vmaxq_s16(vld1q_s16($src), cero), tope);
+                    let vw = vmulq_s16(v, vld1q_s16($peso));
+                    $lo = vmlal_s16($lo, vget_low_s16(v), vget_low_s16(vw));
+                    $hi = vmlal_high_s16($hi, v, vw);
+                }};
+            }
+
+            let mut j = 0;
+            while j + 16 <= h {
+                reg!(yo.as_ptr().add(j), w.add(j), a0, a1);
+                reg!(yo.as_ptr().add(j + 8), w.add(j + 8), a2, a3);
+                reg!(rival.as_ptr().add(j), w.add(H_MAX + j), b0, b1);
+                reg!(rival.as_ptr().add(j + 8), w.add(H_MAX + j + 8), b2, b3);
+                j += 16;
+            }
+            // Cola de 8 (hoy no se ejecuta: 256, 512 y 1024 son todos
+            // multiplos de 16, pero una red futura podria no serlo).
+            while j + 8 <= h {
+                reg!(yo.as_ptr().add(j), w.add(j), a0, a1);
+                reg!(rival.as_ptr().add(j), w.add(H_MAX + j), b0, b1);
+                j += 8;
+            }
+
+            // Cada acumulador se ensancha por separado (SADDLV): sumarlos
+            // entre si en i32 antes de ensanchar SI podria desbordar.
+            let mut suma = vaddlvq_s32(a0)
+                + vaddlvq_s32(a1)
+                + vaddlvq_s32(a2)
+                + vaddlvq_s32(a3)
+                + vaddlvq_s32(b0)
+                + vaddlvq_s32(b1)
+                + vaddlvq_s32(b2)
+                + vaddlvq_s32(b3);
+
+            let base = bucket * 2 * H_MAX;
+            for k in j..h {
+                let v = yo[k].clamp(0, QA as i16) as i64;
+                suma += v * v * self.red.l1w[base + k] as i64;
+                let u = rival[k].clamp(0, QA as i16) as i64;
+                suma += u * u * self.red.l1w[base + H_MAX + k] as i64;
+            }
+            suma
         }
     }
 
@@ -905,6 +1104,98 @@ mod tests {
         }
         assert_eq!(*acumulador.persp(), original);
         assert_eq!(acumulador.negras_mueven(), original_turno);
+    }
+
+    /// El camino RAPIDO de la capa de salida (`producto_punto_i16`) contra
+    /// el escalar de referencia, con acumuladores EXTREMOS que una partida
+    /// real no produce: todo saturado al tope, todo muy negativo, alternado
+    /// y al azar en todo el rango de i16. Ese es el unico sitio donde el
+    /// camino rapido podria despegarse del ancho, porque lo que lo habilita
+    /// es un argumento de rangos (`salida_i16_segura`): si el argumento
+    /// estuviera mal, el caso peor -- todas las neuronas clavadas en QA
+    /// contra los pesos mas grandes de la red -- lo delata. Se prueban
+    /// TODOS los output buckets, porque cada uno tiene su propio bloque de
+    /// pesos y el maximo podria estar en cualquiera.
+    #[test]
+    fn salida_rapida_igual_que_escalar_en_extremos() {
+        let Some(red) = red() else {
+            eprintln!("sin red bullet: test omitido");
+            return;
+        };
+        let b = crate::board::Board::from_fen(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        )
+        .unwrap();
+        let mut acc = AcumBullet::desde_tablero(red, &b);
+        assert!(
+            acc.usa_salida_rapida(),
+            "la red de produccion deberia habilitar el camino rapido; si no, \
+             salida_i16_segura cambio de criterio y este test ya no prueba nada"
+        );
+
+        let mut semilla = 0x1234_5678_9ABC_DEF0u64;
+        let mut siguiente = || {
+            semilla ^= semilla << 13;
+            semilla ^= semilla >> 7;
+            semilla ^= semilla << 17;
+            semilla
+        };
+
+        // Casos fijos: el peor caso teorico esta entre ellos (todo en QA,
+        // que es donde v*v es maximo y la suma acumula mas magnitud).
+        let mut casos: Vec<([i16; H_MAX], [i16; H_MAX])> = vec![
+            ([QA as i16; H_MAX], [QA as i16; H_MAX]),
+            ([i16::MAX; H_MAX], [i16::MAX; H_MAX]),
+            ([i16::MIN; H_MAX], [i16::MIN; H_MAX]),
+            ([0; H_MAX], [0; H_MAX]),
+            ([QA as i16; H_MAX], [i16::MIN; H_MAX]),
+        ];
+        // Alternado saturado/cero: mezcla de carriles activos e inactivos.
+        let mut alterna = [0i16; H_MAX];
+        for (i, v) in alterna.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { i16::MAX } else { i16::MIN };
+        }
+        casos.push((alterna, alterna));
+        // Y ruido en TODO el rango de i16.
+        for _ in 0..24 {
+            let mut yo = [0i16; H_MAX];
+            let mut rival = [0i16; H_MAX];
+            for k in 0..H_MAX {
+                yo[k] = siguiente() as i16;
+                rival[k] = siguiente() as i16;
+            }
+            casos.push((yo, rival));
+        }
+
+        let buckets = red.buckets;
+        for (n, (yo, rival)) in casos.into_iter().enumerate() {
+            acc.forzar_persp(yo, rival);
+            for bk in 0..buckets {
+                let (rapido, escalar) = acc.productos_punto_para_test(bk);
+                assert_eq!(
+                    rapido, escalar,
+                    "caso {n}, bucket {bk}: la capa de salida rapida no coincide con la escalar"
+                );
+            }
+        }
+    }
+
+    /// `salida_i16_segura` es lo unico que separa al camino rapido de una
+    /// evaluacion corrupta, asi que se prueba su frontera con pesos
+    /// sinteticos en vez de confiar en que la red real siempre cumpla.
+    #[test]
+    fn frontera_de_salida_i16_segura() {
+        // QA * 128 = 32640 <= i16::MAX: el ultimo peso que entra.
+        assert!(salida_i16_segura(&[128, -128, 5], 1024));
+        // QA * 129 = 32895 > i16::MAX: se rechaza.
+        assert!(!salida_i16_segura(&[129], 1024));
+        assert!(!salida_i16_segura(&[-129], 1024));
+        assert!(!salida_i16_segura(&[i16::MIN], 1024));
+        // Con pesos chicos entra hasta una capa oculta enorme.
+        assert!(salida_i16_segura(&[127; 16], H_MAX));
+        // Y una `h` disparatada con el peso maximo saldria del i32 de los
+        // acumuladores parciales: tambien se rechaza.
+        assert!(!salida_i16_segura(&[128], 1 << 20));
     }
 
     /// EQUIVALENCIA NUMERICA de la capa de salida vectorizada con NEON
