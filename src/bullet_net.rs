@@ -243,33 +243,100 @@ impl RedBullet {
                 use std::arch::aarch64::*;
                 let w0 = self.l0w.as_ptr();
                 let h = self.h;
-                let mut t = 0;
-                while t < h {
-                    let ps = src.as_ptr().add(t);
-                    let pd = dst.as_mut_ptr().add(t);
-                    let mut r0 = vld1q_s16(ps);
-                    let mut r1 = vld1q_s16(ps.add(8));
-                    let mut r2 = vld1q_s16(ps.add(16));
-                    let mut r3 = vld1q_s16(ps.add(24));
-                    for &f in add {
-                        let w = w0.add(f as usize * h + t);
-                        r0 = vaddq_s16(r0, vld1q_s16(w));
-                        r1 = vaddq_s16(r1, vld1q_s16(w.add(8)));
-                        r2 = vaddq_s16(r2, vld1q_s16(w.add(16)));
-                        r3 = vaddq_s16(r3, vld1q_s16(w.add(24)));
+
+                // Cuerpo del bucle por bloques de 32 valores (4 registros
+                // NEON). `$col` son expresiones que dan el puntero BASE de
+                // cada columna de pesos, ya calculado FUERA del bucle; dentro
+                // solo se les suma el desplazamiento del bloque.
+                //
+                // Antes el cuerpo tenia dos bucles internos (`for &f in add`
+                // / `for &f in sub`) de longitud dinamica: 32 vueltas del
+                // bucle externo x 2 bucles internos que el compilador no
+                // puede desenrollar ni entrelazar, mas un `f * h + t` por
+                // vuelta. Especializando por la FORMA del cambio esos bucles
+                // desaparecen: el cuerpo queda plano y el planificador puede
+                // solapar las cargas de las dos/tres columnas.
+                macro_rules! pasada {
+                    ($($signo:tt $col:expr),+ $(,)?) => {{
+                        let mut t = 0;
+                        while t < h {
+                            let ps = src.as_ptr().add(t);
+                            let pd = dst.as_mut_ptr().add(t);
+                            let mut r0 = vld1q_s16(ps);
+                            let mut r1 = vld1q_s16(ps.add(8));
+                            let mut r2 = vld1q_s16(ps.add(16));
+                            let mut r3 = vld1q_s16(ps.add(24));
+                            $(
+                                {
+                                    let w = $col.add(t);
+                                    let x0 = vld1q_s16(w);
+                                    let x1 = vld1q_s16(w.add(8));
+                                    let x2 = vld1q_s16(w.add(16));
+                                    let x3 = vld1q_s16(w.add(24));
+                                    r0 = combinar!($signo r0, x0);
+                                    r1 = combinar!($signo r1, x1);
+                                    r2 = combinar!($signo r2, x2);
+                                    r3 = combinar!($signo r3, x3);
+                                }
+                            )+
+                            vst1q_s16(pd, r0);
+                            vst1q_s16(pd.add(8), r1);
+                            vst1q_s16(pd.add(16), r2);
+                            vst1q_s16(pd.add(24), r3);
+                            t += 32;
+                        }
+                    }};
+                }
+                macro_rules! combinar {
+                    (+ $a:expr, $b:expr) => { vaddq_s16($a, $b) };
+                    (- $a:expr, $b:expr) => { vsubq_s16($a, $b) };
+                }
+                macro_rules! col {
+                    ($f:expr) => { w0.add($f as usize * h) };
+                }
+
+                // Formas frecuentes: una jugada silenciosa mueve UNA pieza
+                // (1 feature nueva, 1 vieja) y una captura ademas quita la
+                // victima (1 nueva, 2 viejas). Entre las dos cubren casi
+                // todas las jugadas; el enroque y las promociones con captura
+                // caen al camino generico, identico al de antes.
+                match (add.len(), sub.len()) {
+                    (1, 1) => pasada!(+ col!(add[0]), - col!(sub[0])),
+                    (1, 2) => pasada!(+ col!(add[0]), - col!(sub[0]), - col!(sub[1])),
+                    (2, 2) => pasada!(
+                        + col!(add[0]), + col!(add[1]),
+                        - col!(sub[0]), - col!(sub[1]),
+                    ),
+                    _ => {
+                        let mut t = 0;
+                        while t < h {
+                            let ps = src.as_ptr().add(t);
+                            let pd = dst.as_mut_ptr().add(t);
+                            let mut r0 = vld1q_s16(ps);
+                            let mut r1 = vld1q_s16(ps.add(8));
+                            let mut r2 = vld1q_s16(ps.add(16));
+                            let mut r3 = vld1q_s16(ps.add(24));
+                            for &f in add {
+                                let w = w0.add(f as usize * h + t);
+                                r0 = vaddq_s16(r0, vld1q_s16(w));
+                                r1 = vaddq_s16(r1, vld1q_s16(w.add(8)));
+                                r2 = vaddq_s16(r2, vld1q_s16(w.add(16)));
+                                r3 = vaddq_s16(r3, vld1q_s16(w.add(24)));
+                            }
+                            for &f in sub {
+                                let w = w0.add(f as usize * h + t);
+                                r0 = vsubq_s16(r0, vld1q_s16(w));
+                                r1 = vsubq_s16(r1, vld1q_s16(w.add(8)));
+                                r2 = vsubq_s16(r2, vld1q_s16(w.add(16)));
+                                r3 = vsubq_s16(r3, vld1q_s16(w.add(24)));
+                            }
+                            vst1q_s16(pd, r0);
+                            vst1q_s16(pd.add(8), r1);
+                            vst1q_s16(pd.add(16), r2);
+                            vst1q_s16(pd.add(24), r3);
+                            t += 32;
+                        }
                     }
-                    for &f in sub {
-                        let w = w0.add(f as usize * h + t);
-                        r0 = vsubq_s16(r0, vld1q_s16(w));
-                        r1 = vsubq_s16(r1, vld1q_s16(w.add(8)));
-                        r2 = vsubq_s16(r2, vld1q_s16(w.add(16)));
-                        r3 = vsubq_s16(r3, vld1q_s16(w.add(24)));
-                    }
-                    vst1q_s16(pd, r0);
-                    vst1q_s16(pd.add(8), r1);
-                    vst1q_s16(pd.add(16), r2);
-                    vst1q_s16(pd.add(24), r3);
-                    t += 32;
                 }
             }
             return;
@@ -655,16 +722,34 @@ impl AcumBullet {
             let mut acc3 = vdupq_n_s64(0);
             // Cierre que procesa 8 neuronas: clamp -> ensanchar a i32 ->
             // v*v -> por el peso -> acumular ensanchando a i64.
+            // REORDENAMIENTO EXACTO del producto: v*v*w se calcula como
+            // (v*w)*v en vez de (v*v)*w. Aritmetica entera: la
+            // multiplicacion es asociativa y conmutativa, asi que el i32
+            // resultante es BIT A BIT el mismo. La ventaja es que `v*w`
+            // ensanchando de i16 a i32 son las instrucciones SMULL/SMULL2
+            // (`vmull_s16` / `vmull_high_s16`): UNA operacion que hace el
+            // ensanchado y el producto de una, en vez de ensanchar `v` y `w`
+            // por separado (dos SXTL) y multiplicar despues. Quedan 10
+            // operaciones aritmeticas por cada 8 neuronas en vez de 12
+            // (-17%), y esta es la capa que se ejecuta COMPLETA (2*h = 2048
+            // terminos) en cada evaluacion: el 22% del tiempo de busqueda.
+            //
+            // Rangos (peor caso teorico, no de los pesos reales):
+            //   v = clamp(acumulador, 0, 255)  ->  0..255
+            //   v*w  con |w| <= 32768          ->  |.| <= 8_355_840  (cabe en i32)
+            //   (v*w)*v                        ->  |.| <= 2.13e9     (cabe en i32)
+            // Los mismos limites que el orden anterior; ninguno de los dos
+            // desborda nunca, sea cual sea la red.
             macro_rules! bloque {
                 ($src:expr, $peso:expr, $a:expr, $b:expr) => {{
                     let v16 = vminq_s16(vmaxq_s16(vld1q_s16($src), cero), tope);
                     let w16 = vld1q_s16($peso);
+                    let vw_lo = vmull_s16(vget_low_s16(v16), vget_low_s16(w16));
+                    let vw_hi = vmull_high_s16(v16, w16);
                     let v_lo = vmovl_s16(vget_low_s16(v16));
-                    let v_hi = vmovl_s16(vget_high_s16(v16));
-                    let w_lo = vmovl_s16(vget_low_s16(w16));
-                    let w_hi = vmovl_s16(vget_high_s16(w16));
-                    let p_lo = vmulq_s32(vmulq_s32(v_lo, v_lo), w_lo);
-                    let p_hi = vmulq_s32(vmulq_s32(v_hi, v_hi), w_hi);
+                    let v_hi = vmovl_high_s16(v16);
+                    let p_lo = vmulq_s32(vw_lo, v_lo);
+                    let p_hi = vmulq_s32(vw_hi, v_hi);
                     $a = vpadalq_s32($a, p_lo);
                     $b = vpadalq_s32($b, p_hi);
                 }};

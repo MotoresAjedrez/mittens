@@ -24,6 +24,51 @@ pub struct Board {
     pub halfmove_clock: u32,
     pub fullmove_number: u32,
     pub zobrist: u64,
+    /// Tres hashes Zobrist PARCIALES que usa el correction history de la
+    /// busqueda, EMPAQUETADOS en un solo u64 de 16 bits cada uno:
+    ///   bits  0..16 = solo peones (de los dos colores) -> estructura de peones
+    ///   bits 16..32 = piezas que NO son peon de BLANCAS
+    ///   bits 32..48 = piezas que NO son peon de NEGRAS
+    ///
+    /// Antes la busqueda los recalculaba desde cero en cada consulta
+    /// (`hash_peones` / `hash_no_peones` en search.rs): un recorrido con
+    /// pop_lsb sobre hasta ~30 piezas mas otras tantas lecturas aleatorias de
+    /// la tabla Zobrist, y `eval_corregida` se llama una a tres veces POR
+    /// NODO (RFP, razoring, null-move, futility en el bucle). Perfilando era
+    /// el 3,6% del tiempo de busqueda.
+    ///
+    /// Mantenerlo aca es EXACTO, no una aproximacion:
+    ///  - son XOR de las mismas claves `piece_square` que ya se aplican en
+    ///    `remove_piece`/`add_piece`, y XOR es asociativo y conmutativo, asi
+    ///    que el valor incremental es bit a bit el mismo que el recalculado;
+    ///  - el empaquetado no pierde nada util: XOR es bit a bit, asi que los
+    ///    16 bits bajos del hash empaquetado son exactamente los 16 bits
+    ///    bajos del hash completo, y el consumidor solo usa los 14 de abajo
+    ///    (`& CORR_MASK`, con CORR_SIZE = 16384). search.rs deja constancia
+    ///    de esa precondicion con un assert de compilacion.
+    ///
+    /// Un solo campo u64 en vez de `[u64; 3]` a proposito: `Board` es `Copy`
+    /// y se copia entero en CADA `make_move`, y un arreglo indexado con un
+    /// indice variable obliga al compilador a materializarlo en memoria en
+    /// vez de mantenerlo en registro.
+    ///
+    /// `recompute_zobrist` lo vuelve a derivar desde cero (from_fen y las
+    /// pruebas de consistencia pasan por ahi), y `make_move` lo comprueba con
+    /// debug_assert en cada jugada.
+    pub corr_hash: u64,
+}
+
+/// Cuanto hay que XOR-ear en `Board::corr_hash` cuando aparece o desaparece
+/// una pieza cuya clave Zobrist es `key`. Los peones de los dos colores van
+/// juntos a la ranura 0; el resto, separado por color.
+#[inline(always)]
+pub const fn corr_hash_delta(color: Color, pt: PieceType, key: u64) -> u64 {
+    let ranura = if pt as usize == PieceType::Pawn as usize {
+        0
+    } else {
+        1 + color as usize
+    };
+    (key & 0xFFFF) << (16 * ranura)
 }
 
 /// Derechos de enroque que SOBREVIVEN cuando la casilla es origen o destino
@@ -52,6 +97,7 @@ impl Board {
             halfmove_clock: 0,
             fullmove_number: 1,
             zobrist: 0,
+            corr_hash: 0,
         }
     }
 
@@ -121,15 +167,24 @@ impl Board {
     pub(crate) fn recompute_zobrist(&mut self) {
         let k = keys();
         let mut z = 0u64;
+        // Los parciales del correction history salen del MISMO recorrido: es
+        // la definicion desde cero contra la que se compara la version
+        // incremental de remove_piece/add_piece.
+        let mut corr = 0u64;
         for c in 0..2 {
             for p in 0..6 {
                 let mut bb = self.pieces[c][p];
+                let color = if c == 0 { Color::White } else { Color::Black };
+                let pt = ALL_PIECE_TYPES[p];
                 while bb != 0 {
                     let sq = pop_lsb(&mut bb);
-                    z ^= k.piece_square[c][p][sq as usize];
+                    let key = k.piece_square[c][p][sq as usize];
+                    z ^= key;
+                    corr ^= corr_hash_delta(color, pt, key);
                 }
             }
         }
+        self.corr_hash = corr;
         z ^= k.castling[(self.castling_rights & 0xF) as usize];
         if let Some(file) = self.ep_hash_file() {
             z ^= k.en_passant_file[file];
@@ -513,7 +568,9 @@ impl Board {
         self.pieces[color as usize][pt as usize] &= !b;
         self.occupied_co[color as usize] &= !b;
         self.occupied &= !b;
-        self.zobrist ^= keys().piece_square[color as usize][pt as usize][sq as usize];
+        let k = keys().piece_square[color as usize][pt as usize][sq as usize];
+        self.zobrist ^= k;
+        self.corr_hash ^= corr_hash_delta(color, pt, k);
     }
 
     #[inline(always)]
@@ -522,7 +579,9 @@ impl Board {
         self.pieces[color as usize][pt as usize] |= b;
         self.occupied_co[color as usize] |= b;
         self.occupied |= b;
-        self.zobrist ^= keys().piece_square[color as usize][pt as usize][sq as usize];
+        let k = keys().piece_square[color as usize][pt as usize][sq as usize];
+        self.zobrist ^= k;
+        self.corr_hash ^= corr_hash_delta(color, pt, k);
     }
 
     /// Aplica una jugada (ya asumida pseudo-legal) y devuelve un NUEVO tablero.
@@ -642,6 +701,11 @@ impl Board {
         debug_assert_eq!(b.occupied_co[0], b.pieces[0].iter().fold(0, |a, &x| a | x));
         debug_assert_eq!(b.occupied_co[1], b.pieces[1].iter().fold(0, |a, &x| a | x));
         debug_assert_eq!(b.occupied, b.occupied_co[0] | b.occupied_co[1]);
+        debug_assert_eq!(b.corr_hash, {
+            let mut copia = b;
+            copia.recompute_zobrist();
+            copia.corr_hash
+        });
         if let Some(file) = b.ep_hash_file() {
             b.zobrist ^= k.en_passant_file[file];
         }

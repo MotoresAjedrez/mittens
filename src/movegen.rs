@@ -35,6 +35,14 @@ pub fn generate_pseudo_legal(b: &Board) -> MoveList {
 }
 
 pub fn generate_pseudo_legal_into(b: &Board, moves: &mut MoveList) {
+    generate_pseudo_legal_into_con_jaque(b, moves, b.in_check(b.turn));
+}
+
+/// Igual que `generate_pseudo_legal_into` pero recibiendo YA CALCULADO si el
+/// bando al turno esta en jaque. `in_check` es una funcion pura del tablero,
+/// asi que pasar el valor que el llamador ya calculo da exactamente el mismo
+/// resultado que recalcularlo aqui -- solo se ahorra el barrido de ataques.
+pub fn generate_pseudo_legal_into_con_jaque(b: &Board, moves: &mut MoveList, en_jaque: bool) {
     let us = b.turn;
     let them = us.opposite();
     let own = b.occupied_co[us as usize];
@@ -51,7 +59,7 @@ pub fn generate_pseudo_legal_into(b: &Board, moves: &mut MoveList) {
     gen_piece_moves(b, us, PieceType::King, own, occ, moves, |sq, _| {
         king_attacks(sq)
     });
-    gen_castling(b, us, moves);
+    gen_castling(b, us, moves, en_jaque);
 }
 
 fn gen_piece_moves<F>(
@@ -142,7 +150,7 @@ fn push_pawn_move(moves: &mut MoveList, from: Square, to: Square, is_promo: bool
     }
 }
 
-fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
+fn gen_castling(b: &Board, us: Color, moves: &mut MoveList, en_jaque: bool) {
     // Primero lo mas barato: si el bando ya perdio los dos derechos de
     // enroque no hay NADA que generar. Antes se llamaba a in_check() -- un
     // barrido completo de ataques al rey -- en cada nodo aunque los derechos
@@ -159,17 +167,29 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
     // rey esta en jaque, todos los chequeos de casillas atacadas de abajo son
     // trabajo desperdiciado -- las jugadas generadas se descartarian igual en
     // el filtro de legalidad. Saltar la generacion completa.
-    if b.in_check(us) {
+    //
+    // `en_jaque` lo pasa el llamador YA CALCULADO (todos los generadores lo
+    // necesitan igual para legalizar, asi que antes se calculaba dos veces
+    // por nodo: una en generate_legal_into y otra aca).
+    debug_assert_eq!(en_jaque, b.in_check(us));
+    if en_jaque {
         return;
     }
     let occ = b.occupied;
+    // NOTA: las condiciones `!is_square_attacked_by(<casilla del rey>, ellos)`
+    // que habia aca son REDUNDANTES y se quitaron. Cada una estaba detras de
+    // `pieces[rey] & bit(<esa misma casilla>) != 0` (con && cortocircuitado),
+    // o sea que solo se evaluaban con el rey EXACTAMENTE en esa casilla; y en
+    // ese caso `is_square_attacked_by(casilla, ellos)` es literalmente
+    // `in_check(us)`, que ya se comprobo false dos lineas mas arriba. Se
+    // repetia por enroque corto y por largo: hasta dos barridos completos de
+    // ataques tirados por nodo en cuanto quedaba algun derecho de enroque.
     match us {
         Color::White => {
             if b.castling_rights & CASTLE_WK != 0
                 && b.pieces[Color::White as usize][PieceType::King as usize] & bit(4) != 0
                 && b.pieces[Color::White as usize][PieceType::Rook as usize] & bit(7) != 0
                 && occ & (bit(5) | bit(6)) == EMPTY
-                && !b.is_square_attacked_by(4, Color::Black)
                 && !b.is_square_attacked_by(5, Color::Black)
                 && !b.is_square_attacked_by(6, Color::Black)
             {
@@ -179,7 +199,6 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
                 && b.pieces[Color::White as usize][PieceType::King as usize] & bit(4) != 0
                 && b.pieces[Color::White as usize][PieceType::Rook as usize] & bit(0) != 0
                 && occ & (bit(1) | bit(2) | bit(3)) == EMPTY
-                && !b.is_square_attacked_by(4, Color::Black)
                 && !b.is_square_attacked_by(3, Color::Black)
                 && !b.is_square_attacked_by(2, Color::Black)
             {
@@ -191,7 +210,6 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
                 && b.pieces[Color::Black as usize][PieceType::King as usize] & bit(60) != 0
                 && b.pieces[Color::Black as usize][PieceType::Rook as usize] & bit(63) != 0
                 && occ & (bit(61) | bit(62)) == EMPTY
-                && !b.is_square_attacked_by(60, Color::White)
                 && !b.is_square_attacked_by(61, Color::White)
                 && !b.is_square_attacked_by(62, Color::White)
             {
@@ -201,7 +219,6 @@ fn gen_castling(b: &Board, us: Color, moves: &mut MoveList) {
                 && b.pieces[Color::Black as usize][PieceType::King as usize] & bit(60) != 0
                 && b.pieces[Color::Black as usize][PieceType::Rook as usize] & bit(56) != 0
                 && occ & (bit(57) | bit(58) | bit(59)) == EMPTY
-                && !b.is_square_attacked_by(60, Color::White)
                 && !b.is_square_attacked_by(59, Color::White)
                 && !b.is_square_attacked_by(58, Color::White)
             {
@@ -309,18 +326,25 @@ pub fn generate_captures_legal(b: &Board) -> MoveList {
 }
 
 pub fn generate_captures_legal_into(b: &Board, moves: &mut MoveList) {
+    generate_captures_legal_into_con_jaque(b, moves, b.in_check(b.turn));
+}
+
+/// Igual que `generate_captures_legal_into` pero con el `in_check` del bando
+/// al turno YA CALCULADO (misma equivalencia que en `generate_legal_into`).
+pub fn generate_captures_legal_into_con_jaque(b: &Board, moves: &mut MoveList, en_jaque: bool) {
     use crate::bitboard::pinned_pieces;
 
     let us = b.turn;
     let them = us.opposite();
     let king_sq = b.king_square(us);
+    debug_assert_eq!(en_jaque, b.in_check(us));
 
     let camino_lento = |mv: &Move| {
         let after = b.make_move(mv);
         !after.in_check(us)
     };
 
-    if b.in_check(us) {
+    if en_jaque {
         // No deberia llamarse en jaque (quiescence usa generate_legal para
         // evasiones, que incluyen bloqueos silenciosos), pero se deja
         // correcto por si se reutiliza en otro contexto.
@@ -418,18 +442,29 @@ pub fn generate_legal(b: &Board) -> MoveList {
 }
 
 pub fn generate_legal_into(b: &Board, moves: &mut MoveList) {
+    generate_legal_into_con_jaque(b, moves, b.in_check(b.turn));
+}
+
+/// Igual que `generate_legal_into` pero con el `in_check` del bando al turno
+/// YA CALCULADO por el llamador. La busqueda lo necesita de todos modos (para
+/// la extension de jaque, para decidir stand-pat, etc.), asi que antes se
+/// pagaba el mismo barrido de ataques dos o tres veces por nodo: una en
+/// negamax/quiescence, otra aca y otra dentro de `gen_castling`. Resultado
+/// identico: `in_check` es una funcion pura del tablero.
+pub fn generate_legal_into_con_jaque(b: &Board, moves: &mut MoveList, en_jaque: bool) {
     use crate::bitboard::pinned_pieces;
 
     let us = b.turn;
     let them = us.opposite();
     let king_sq = b.king_square(us);
+    debug_assert_eq!(en_jaque, b.in_check(us));
 
     let camino_lento = |mv: &Move| {
         let after = b.make_move(mv);
         !after.in_check(us)
     };
 
-    if b.in_check(us) {
+    if en_jaque {
         // Evasion de jaque (posibles jaques dobles, bloqueos, etc.). Las
         // jugadas del REY -- que son la mayoria de las evasiones y las mas
         // caras de legalizar por el camino lento -- se resuelven con el test
@@ -437,7 +472,7 @@ pub fn generate_legal_into(b: &Board, moves: &mut MoveList) {
         // atacante) sigue por el camino lento, siempre correcto.
         // gen_castling no produce nada estando en jaque, asi que aqui no hay
         // enroques que considerar.
-        generate_pseudo_legal_into(b, moves);
+        generate_pseudo_legal_into_con_jaque(b, moves, true);
         moves.retain(|mv| {
             if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
                 casilla_segura_para_rey(b, king_sq, mv.to, us)
@@ -455,7 +490,7 @@ pub fn generate_legal_into(b: &Board, moves: &mut MoveList) {
         | b.pieces[them as usize][PieceType::Queen as usize];
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
 
-    generate_pseudo_legal_into(b, moves);
+    generate_pseudo_legal_into_con_jaque(b, moves, false);
     moves.retain(|mv| {
         if bit(mv.from) & pinned == 0
             && mv.from != king_sq
@@ -496,11 +531,18 @@ pub fn generate_legal_into(b: &Board, moves: &mut MoveList) {
 /// mirar si la lista quedaba vacía. Se prueban primero las jugadas de rey,
 /// que son las más baratas de verificar y casi siempre resuelven el caso.
 pub fn existe_jugada_legal(b: &Board) -> bool {
+    existe_jugada_legal_con_jaque(b, b.in_check(b.turn))
+}
+
+/// Igual que `existe_jugada_legal` pero con el `in_check` del bando al turno
+/// YA CALCULADO (misma equivalencia que en `generate_legal_into`).
+pub fn existe_jugada_legal_con_jaque(b: &Board, en_jaque: bool) -> bool {
     use crate::bitboard::pinned_pieces;
 
     let us = b.turn;
     let them = us.opposite();
     let king_sq = b.king_square(us);
+    debug_assert_eq!(en_jaque, b.in_check(us));
 
     let mut objetivos = king_attacks(king_sq) & !b.occupied_co[us as usize];
     while objetivos != 0 {
@@ -510,7 +552,6 @@ pub fn existe_jugada_legal(b: &Board) -> bool {
         }
     }
 
-    let en_jaque = b.in_check(us);
     let pinned = if en_jaque {
         EMPTY
     } else {
@@ -527,7 +568,7 @@ pub fn existe_jugada_legal(b: &Board) -> bool {
     };
 
     let mut pseudo = MoveList::new();
-    generate_pseudo_legal_into(b, &mut pseudo);
+    generate_pseudo_legal_into_con_jaque(b, &mut pseudo, en_jaque);
     for mv in &pseudo {
         let mv = *mv;
         if mv.from == king_sq {

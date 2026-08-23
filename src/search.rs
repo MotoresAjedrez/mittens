@@ -8,8 +8,8 @@ use crate::eval::{
     EvalState, crear_eval_state, evaluate_classical_with_state, evaluate_with_state,
 };
 use crate::movegen::{
-    MAX_MOVES, MoveList, generate_captures_legal, generate_captures_legal_into, generate_legal,
-    generate_legal_into,
+    MAX_MOVES, MoveList, generate_captures_legal, generate_captures_legal_into_con_jaque,
+    generate_legal, generate_legal_into, generate_legal_into_con_jaque,
 };
 use crate::types::{Move, MoveFlag, PieceType};
 use arrayvec::ArrayVec;
@@ -214,32 +214,32 @@ const CORR_SIZE: usize = 16384;
 const CORR_MASK: usize = CORR_SIZE - 1;
 const CORR_MAX: i32 = 128;
 
+// `Board::corr_hash` guarda los tres hashes parciales con 16 bits cada uno.
+// Eso alcanza para indexar las tablas de correction history mientras el
+// enmascarado use como mucho 16 bits. Si algun dia se agranda CORR_SIZE por
+// encima de 65536, esto falla EN COMPILACION en vez de silenciosamente
+// indexar con bits que no existen.
+const _: () = assert!(
+    CORR_SIZE <= 1 << 16,
+    "CORR_SIZE no entra en los 16 bits por ranura de Board::corr_hash"
+);
+
 /// Hash Zobrist solo de los peones (estructura de peones).
+///
+/// Ya no se recorre el tablero: `Board` lo mantiene incrementalmente, con el
+/// mismo XOR de claves `piece_square` que este bucle hacia (ver
+/// `Board::corr_hash`). Mismos bits bajos exactos, coste cero.
+#[inline(always)]
 fn hash_peones(b: &Board) -> u64 {
-    let k = crate::zobrist::keys();
-    let mut h = 0u64;
-    for color in 0..2usize {
-        let mut bb = b.pieces[color][PieceType::Pawn as usize];
-        while bb != 0 {
-            let sq = crate::bitboard::pop_lsb(&mut bb);
-            h ^= k.piece_square[color][PieceType::Pawn as usize][sq as usize];
-        }
-    }
-    h
+    b.corr_hash & 0xFFFF
 }
 
 /// Hash Zobrist de las piezas que NO son peones de un color dado.
+/// Mantenido incrementalmente en la ranura `1 + color` de `Board::corr_hash`.
+#[inline(always)]
 fn hash_no_peones(b: &Board, color: usize) -> u64 {
-    let k = crate::zobrist::keys();
-    let mut h = 0u64;
-    for pt in 1..6usize {
-        let mut bb = b.pieces[color][pt];
-        while bb != 0 {
-            let sq = crate::bitboard::pop_lsb(&mut bb);
-            h ^= k.piece_square[color][pt][sq as usize];
-        }
-    }
-    h
+    debug_assert!(color < 2);
+    (b.corr_hash >> (16 * (1 + color))) & 0xFFFF
 }
 
 /// Actualizacion con "gravedad" (Stockfish): el bonus crece con la
@@ -444,6 +444,27 @@ fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
 // de "peligroso" que cualquier TT normal ante colisiones de indice, motivo
 // por el cual toda esta info se usa solo para PODAR/orientar la busqueda,
 // nunca como fuente de verdad de las reglas del juego.
+/// Sugerencia de prefetch de LECTURA a la cache L1.
+///
+/// En ARM64 es la instruccion `prfm pldl1keep`, un HINT puro: no lee ni
+/// escribe memoria, no puede fallar (una direccion invalida simplemente se
+/// ignora), no toca registros ni banderas. Se emite con `asm!` porque el
+/// intrinseco `core::arch::aarch64::_prefetch` todavia es inestable en Rust
+/// 1.97. En cualquier otra arquitectura es un no-op.
+#[inline(always)]
+fn prefetch_lectura(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) p,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = p;
+}
+
 type SharedTT = Vec<AtomicU64>;
 type LocalTT = Vec<Option<TTEntry>>;
 
@@ -726,13 +747,6 @@ pub struct Searcher {
     // largas + profundidad de busqueda; path_push nunca desborda (guarda).
     path: [u64; MAX_PATH],
     path_len: usize,
-    // Buffer FIJO (en pila dentro del Searcher) de claves de ordenamiento de
-    // jugadas, reutilizable entre nodos. Reemplaza el Vec<(clave, indice)>
-    // temporal que sort_by_cached_key asignaba en el heap por cada nodo de
-    // negamax (millones de veces por segundo con Lazy SMP). Cada Searcher
-    // pertenece a un solo hilo y order_moves_ply no es reentrante, asi que
-    // no hay contencion. Las claves se precomputan una sola vez por llamada.
-    claves_orden_movimiento: [i32; MAX_MOVES],
     // Buffer de claves de orden POR PLY para el bucle principal de negamax.
     // Tiene que ser por ply (no uno solo compartido) porque el nodo padre
     // sigue usando sus claves mientras los hijos buscan. Va en el heap del
@@ -851,7 +865,6 @@ impl Searcher {
             game_history: Vec::new(),
             path: [0u64; MAX_PATH],
             path_len: 0,
-            claves_orden_movimiento: [0; MAX_MOVES],
             claves_negamax: vec![[0i32; MAX_MOVES]; MAX_PLY as usize + 2],
             see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
             lmr_intentos: 0,
@@ -948,7 +961,6 @@ impl Searcher {
             game_history: Vec::new(),
             path: [0u64; MAX_PATH],
             path_len: 0,
-            claves_orden_movimiento: [0; MAX_MOVES],
             claves_negamax: vec![[0i32; MAX_MOVES]; MAX_PLY as usize + 2],
             see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
             lmr_intentos: 0,
@@ -1335,6 +1347,29 @@ impl Searcher {
         (key as usize) & self.tt_mask
     }
 
+    /// Pide al procesador que traiga a cache la linea de la TT donde caeria
+    /// `key`, SIN leerla. Se llama justo despues de `make_move`, o sea unos
+    /// cientos de ciclos antes de que el hijo haga su `tt_probe`: en ese
+    /// hueco (que se llena con la actualizacion NNUE del acumulador, lo mas
+    /// caro del nodo) la linea llega sola y el probe deja de esperar a
+    /// memoria. `tt_probe` fue el 4% del tiempo en el perfilado y es casi
+    /// todo latencia de fallo de cache: la TT es de decenas/cientos de MB y
+    /// el indice es un hash, o sea acceso aleatorio puro.
+    ///
+    /// `prfm` es una instruccion HINT del ARM: no lee, no escribe, no falla
+    /// nunca (ni con una direccion invalida) y no cambia ningun registro ni
+    /// bandera. Por construccion no puede alterar el resultado de la
+    /// busqueda: el arbol, el conteo de nodos y el puntaje son identicos.
+    #[inline(always)]
+    fn tt_prefetch(&self, key: u64) {
+        let idx = self.tt_index(key);
+        let p: *const u8 = match &self.tt {
+            TablaTransposicion::Local(tt) => tt.as_ptr().wrapping_add(idx) as *const u8,
+            TablaTransposicion::Compartida(tt) => tt.as_ptr().wrapping_add(idx) as *const u8,
+        };
+        prefetch_lectura(p);
+    }
+
     fn tt_probe(&self, key: u64) -> Option<TTEntry> {
         let idx = self.tt_index(key);
         match &self.tt {
@@ -1577,13 +1612,20 @@ impl Searcher {
         // relativo original).
         let n = moves.len();
         debug_assert!(n <= MAX_MOVES);
-        // Copia el buffer a la pila del frame para no tener un prestamo
-        // mutable de `self` vivo mientras se llama a `clave_orden_movimiento`
-        // (que toma `&self`); 1KB es despreciable frente al coste del orden.
-        let mut claves = self.claves_orden_movimiento;
+        // El buffer de claves es local y SIN inicializar: solo se escriben las
+        // `n` entradas que se usan. Antes era un campo del Searcher que se
+        // COPIABA entero a la pila al entrar (`let mut claves =
+        // self.claves_orden_movimiento`) y se copiaba de vuelta al salir --
+        // 2 x 1 KB de memmove por llamada, aunque la lista tuviera 3 jugadas.
+        // (La copia existia solo para no tener un prestamo mutable de `self`
+        // vivo mientras se llama a `clave_orden_movimiento`, que toma `&self`;
+        // con el buffer local ese conflicto no existe.)
+        let mut claves: ArrayVec<i32, MAX_MOVES> = ArrayVec::new();
         let mut amenazas: Option<u64> = None;
-        for (mv, k) in moves.iter().zip(claves.iter_mut()) {
-            *k = self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, None, &mut amenazas);
+        for mv in moves.iter() {
+            claves.push(
+                self.clave_orden_movimiento(b, mv, tt_move, ply, prev, prev2, None, &mut amenazas),
+            );
         }
         // Insertion sort estable sobre (moves, claves) en paralelo.
         for i in 1..n {
@@ -1598,7 +1640,6 @@ impl Searcher {
             moves[j] = mv;
             claves[j] = k;
         }
-        self.claves_orden_movimiento = claves;
     }
 
     fn quiescence(
@@ -1652,7 +1693,7 @@ impl Searcher {
         // buscar TODAS las evasiones legales, incluidas jugadas silenciosas.
         if en_jaque {
             let mut evasiones = MoveList::new();
-            generate_legal_into(b, &mut evasiones);
+            generate_legal_into_con_jaque(b, &mut evasiones, true);
             if evasiones.is_empty() {
                 return Ok(-MATE + ply as i32);
             }
@@ -1665,8 +1706,9 @@ impl Searcher {
             }
             let mut best = -INFINITO;
             let mut best_mv: Option<Move> = None;
-            for mv in evasiones {
+            for &mv in evasiones.iter() {
                 let next = b.make_move(&mv);
+                self.tt_prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
                 // Ligar el resultado ANTES de deshacer, y recien despues
                 // aplicar el `?`: asi ningun retorno temprano se salta el
@@ -1724,28 +1766,56 @@ impl Searcher {
         // (antes se generaba y legalizaba la lista COMPLETA solo para mirar
         // si quedaba vacia -- en cada hoja tranquila de quiescence).
         let mut capturas = MoveList::new();
-        generate_captures_legal_into(b, &mut capturas);
-        if capturas.is_empty() && !crate::movegen::existe_jugada_legal(b) {
+        generate_captures_legal_into_con_jaque(b, &mut capturas, false);
+        if capturas.is_empty()
+            && !crate::movegen::existe_jugada_legal_con_jaque(b, false)
+        {
             return Ok(0); // ahogado
         }
         // Igual que la lista principal: quiescence vive en las hojas y no
         // debe asignar un Vec por nodo solo para conservar el SEE calculado.
         let mut moves: ArrayVec<(Move, Option<i32>), MAX_MOVES> = ArrayVec::new();
-        for mv in capturas {
+        for mv in capturas.iter().copied() {
             let see = mv.is_capture().then(|| crate::see::see(b, &mv));
             moves.push((mv, see));
         }
         // En quiescence la poda SEE se aplica despues del ordenamiento. Llevar
         // el resultado junto a la jugada evita calcular el mismo SEE dos veces.
+        //
+        // ORDEN: antes esto era `moves.sort_by_key(|..| clave_orden_movimiento(..))`.
+        // `sort_by_key` vuelve a llamar a la funcion de clave en CADA
+        // comparacion (O(n log n) llamadas), no una vez por elemento; y
+        // `clave_orden_movimiento` no es barata (piece_at, capture history,
+        // mapa de amenazas). Aca la clave se calcula UNA vez por jugada y el
+        // orden se hace con el mismo insertion sort ESTABLE que usa negamax.
+        // El orden final es identico: `sort_by_key` tambien es estable y la
+        // funcion de clave es determinista (el memo `amenazas_q` devuelve
+        // siempre el mismo mapa).
         let mut amenazas_q: Option<u64> = None;
-        moves.sort_by_key(|(mv, see)| {
-            self.clave_orden_movimiento(b, mv, tt_mv, ply, None, None, *see, &mut amenazas_q)
-        });
+        let mut claves_q: ArrayVec<i32, MAX_MOVES> = ArrayVec::new();
+        for (mv, see) in moves.iter() {
+            claves_q.push(self.clave_orden_movimiento(
+                b, mv, tt_mv, ply, None, None, *see, &mut amenazas_q,
+            ));
+        }
+        for i in 1..moves.len() {
+            let par = moves[i];
+            let k = claves_q[i];
+            let mut j = i;
+            while j > 0 && claves_q[j - 1] > k {
+                moves[j] = moves[j - 1];
+                claves_q[j] = claves_q[j - 1];
+                j -= 1;
+            }
+            moves[j] = par;
+            claves_q[j] = k;
+        }
 
         let mut best = stand_pat;
         let mut best_mv: Option<Move> = None;
-        for (mv, see) in moves {
+        for &(mv, see) in moves.iter() {
             let next = b.make_move(&mv);
+            self.tt_prefetch(next.zobrist);
             let da_jaque = next.in_check(next.turn);
 
             // Nunca podar promociones ni jaques por SEE/delta: una captura
@@ -1788,7 +1858,7 @@ impl Searcher {
         if qdepth == 0 && alpha < beta && stand_pat + 150 > alpha {
             let mut jaques_probados = 0usize;
             let mut jaques_lista = MoveList::new();
-            generate_legal_into(b, &mut jaques_lista);
+            generate_legal_into_con_jaque(b, &mut jaques_lista, false);
             for mv in jaques_lista.iter().copied() {
                 if jaques_probados >= 5 {
                     break;
@@ -1809,6 +1879,7 @@ impl Searcher {
                 jaques_probados += 1;
 
                 let next = b.make_move(&mv);
+                self.tt_prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
                 let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
                 self.salir_hijo(&next_eval, b, &next);
@@ -2129,6 +2200,7 @@ impl Searcher {
                 let r = (r_adaptativo + self.null_move_r_extra).clamp(2, (depth - 1).max(2));
                 let r = r.min(depth - 1).max(1);
                 let next = b.make_null_move();
+                self.tt_prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, depth - 1 - r);
                 // El hijo NO llega por LMR: limpiar el estado hindsight del
                 // ply hijo para que no lea la reduccion de otro subarbol.
@@ -2177,7 +2249,7 @@ impl Searcher {
                 .as_ref()
                 .is_some_and(|e| e.depth >= sdepth_guarda && e.score < probcut_beta);
             let mut capturas = MoveList::new();
-            generate_captures_legal_into(b, &mut capturas);
+            generate_captures_legal_into_con_jaque(b, &mut capturas, false);
             if saltar_probcut {
                 capturas.clear();
             }
@@ -2198,6 +2270,7 @@ impl Searcher {
                     continue;
                 }
                 let next = b.make_move(mv);
+                self.tt_prefetch(next.zobrist);
                 if next.in_check(next.turn) {
                     continue;
                 }
@@ -2292,7 +2365,7 @@ impl Searcher {
         let mut lista_ordenada;
         {
             moves = MoveList::new();
-            generate_legal_into(b, &mut moves);
+            generate_legal_into_con_jaque(b, &mut moves, en_jaque);
             if moves.is_empty() {
                 self.path_len = self.path_len.saturating_sub(1);
                 return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
@@ -2772,6 +2845,7 @@ impl Searcher {
 
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
+            self.tt_prefetch(next.zobrist);
             let child_prev = Some((pt_mv, mv.to as usize));
             let child_prev2 = prev;
             // ext puede valer -2, 0, +1 o +2 (ver ext_singular arriba). El
