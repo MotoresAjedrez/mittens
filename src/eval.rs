@@ -1347,6 +1347,129 @@ pub fn material_insuficiente(b: &Board) -> bool {
     }
 }
 
+/// Distancia Manhattan de una casilla al centro del tablero (d4/e4/d5/e5).
+/// 0 en el centro, 6 en las esquinas. Sirve para medir que tan arrinconado
+/// esta un rey.
+#[inline(always)]
+fn dist_manhattan_centro(sq: usize) -> i32 {
+    let f = (sq & 7) as i32;
+    let r = (sq >> 3) as i32;
+    let df = if f <= 3 { 3 - f } else { f - 4 };
+    let dr = if r <= 3 { 3 - r } else { r - 4 };
+    df + dr
+}
+
+/// Distancia Manhattan entre dos casillas (0..14).
+#[inline(always)]
+fn dist_manhattan(a: usize, b: usize) -> i32 {
+    let df = ((a & 7) as i32 - (b & 7) as i32).abs();
+    let dr = ((a >> 3) as i32 - (b >> 3) as i32).abs();
+    df + dr
+}
+
+/// Piso del puntaje de un final aplastante. Queda muy por encima de
+/// cualquier evaluacion estatica normal (para que la busqueda prefiera
+/// SIMPLIFICAR hacia estos finales cuando puede) y muy por debajo de
+/// `search::MATE - 2000` (TB_WIN), asi que no se confunde ni con mates
+/// reales ni con aciertos de tablas Syzygy.
+const APLASTANTE_BASE: i32 = 500;
+
+/// Evaluacion "de acorralamiento" para finales aplastantes: un bando tiene
+/// SOLO su rey y el otro conserva material de mate. Devuelve el puntaje
+/// desde la perspectiva del que mueve, o None si la posicion no es de este
+/// tipo (la abrumadora mayoria de los nodos: sale en dos comparaciones).
+///
+/// POR QUE existe (bug medido 2026-08-22): en `8/8/8/2k5/8/8/8/K6Q w - - 0 1`
+/// (rey+dama contra rey solo, mate elemental) el binario de produccion llego
+/// a profundidad 15, 48 millones de nodos y 13 segundos SIN reportar mate:
+/// solo "score cp 851". La NNUE por defecto es "red pura" y su dataset casi
+/// no contiene finales tan desbalanceados, asi que devuelve un numero grande
+/// pero PLANO: da lo mismo tener al rey rival en el centro que en la
+/// esquina, y la busqueda deambula sin rumbo (la PV medida movia la dama y
+/// el rey en circulos). El mate en K+D vs K esta a 10+ jugadas de
+/// profundidad si no se lo empuja, fuera del horizonte practico.
+///
+/// EL ARREGLO es el clasico "mop-up evaluation" (Stockfish clasico y motores
+/// didacticos): en esta configuracion de material se reemplaza la NNUE por
+/// un puntaje sintetico que crece cuando (a) el rey debil esta mas cerca del
+/// borde/esquina y (b) los dos reyes estan mas cerca entre si. Eso le da a
+/// la busqueda el gradiente que necesita para acorralar al rey hasta que el
+/// mate real entra en el horizonte y la cuenta exacta toma el control.
+///
+/// SOLO se activa con rey debil totalmente pelado y material de mate claro
+/// enfrente (dama/torre, o dos menores). Con un rey pelado contra solo
+/// peones -- o un unico menor mas peones -- se devuelve None y decide la
+/// evaluacion normal, que entiende de coronaciones y del alfil equivocado.
+/// Asi el termino no puede distorsionar aperturas ni medios juegos: con que
+/// ambos bandos tengan algo mas que el rey, sale de inmediato.
+#[inline(always)]
+pub fn final_aplastante(b: &Board) -> Option<i32> {
+    const REY: usize = PieceType::King as usize;
+    const PEON: usize = PieceType::Pawn as usize;
+    const CABALLO: usize = PieceType::Knight as usize;
+    const ALFIL: usize = PieceType::Bishop as usize;
+    const TORRE: usize = PieceType::Rook as usize;
+    const DAMA: usize = PieceType::Queen as usize;
+    const W: usize = Color::White as usize;
+    const N: usize = Color::Black as usize;
+
+    let pelado_w = b.occupied_co[W] == b.pieces[W][REY];
+    let pelado_n = b.occupied_co[N] == b.pieces[N][REY];
+    // Camino comun (ambos false): un solo salto. K vs K (ambos true) nunca
+    // llega aca porque `material_insuficiente` ya devolvio 0 antes.
+    if pelado_w == pelado_n {
+        return None;
+    }
+    let (fuerte, debil) = if pelado_n { (W, N) } else { (N, W) };
+
+    let torres = b.pieces[fuerte][TORRE];
+    let damas = b.pieces[fuerte][DAMA];
+    let alfiles = b.pieces[fuerte][ALFIL];
+    let caballos = b.pieces[fuerte][CABALLO];
+    let peones = b.pieces[fuerte][PEON];
+    let menores = alfiles | caballos;
+    if (torres | damas) == 0 && menores.count_ones() < 2 {
+        // Solo peones (o un unico menor mas peones): material de mate no
+        // garantizado; que decida la evaluacion normal.
+        return None;
+    }
+
+    let rey_debil = b.pieces[debil][REY].trailing_zeros() as usize;
+    let rey_fuerte = b.pieces[fuerte][REY].trailing_zeros() as usize;
+
+    let material = VALOR[PEON] * popcount(peones) as i32
+        + VALOR[CABALLO] * popcount(caballos) as i32
+        + VALOR[ALFIL] * popcount(alfiles) as i32
+        + VALOR[TORRE] * popcount(torres) as i32
+        + VALOR[DAMA] * popcount(damas) as i32;
+
+    // Empuje del rey debil hacia donde esta su mate. Caso especial K+A+C vs
+    // K: el mate solo existe en las esquinas del color del alfil, asi que se
+    // lo empuja hacia la esquina CORRECTA mas cercana, no al borde generico.
+    let empuje = if (torres | damas | peones) == 0
+        && popcount(alfiles) == 1
+        && popcount(caballos) == 1
+    {
+        let alfil_claro = (alfiles & CASILLAS_CLARAS) != 0;
+        // Esquinas claras: a8 (56) y h1 (7). Oscuras: a1 (0) y h8 (63).
+        let (e1, e2) = if alfil_claro { (56, 7) } else { (0, 63) };
+        let d = dist_manhattan(rey_debil, e1).min(dist_manhattan(rey_debil, e2));
+        8 * (14 - d) // 0..112
+    } else {
+        16 * dist_manhattan_centro(rey_debil) // 0..96
+    };
+
+    // Acercar el rey propio: sin su ayuda no hay mate de K+D ni de K+T.
+    let acercamiento = 8 * (14 - dist_manhattan(rey_fuerte, rey_debil)); // 0..96
+
+    let puntaje = APLASTANTE_BASE + material + empuje + acercamiento;
+    Some(if b.turn as usize == fuerte {
+        puntaje
+    } else {
+        -puntaje
+    })
+}
+
 // Subido de 0.5 a 1.5 tras h2h: PESO_RED=1.0 y 1.5 dieron ambos 63.3% (30
 // partidas) contra el 0.5 original; NNUE 100% pura (clasica anulada) dio
 // solo 55.0%, peor que subir el peso manteniendo la clasica completa. La
@@ -1362,6 +1485,11 @@ pub fn evaluate_with_nnue(b: &Board, nnue: Option<&crate::neural::NnueAccumulato
     // Material insuficiente: tablas muertas, ni la clasica ni la red opinan.
     if material_insuficiente(b) {
         return 0;
+    }
+    // Final aplastante (rey solo contra material de mate): puntaje sintetico
+    // de acorralamiento; la red no tiene gradiente util aca.
+    if let Some(punt) = final_aplastante(b) {
+        return punt;
     }
     let clasica = evaluar_clasica(b, None);
     match nnue {
@@ -1388,6 +1516,12 @@ pub fn evaluate_with_state(
     // confiable. Ver `material_insuficiente` para el bug que motivo esto.
     if material_insuficiente(b) {
         return 0;
+    }
+    // Final aplastante: mismo criterio que material_insuficiente, va ANTES
+    // de consultar la red porque la red no distingue entre arrinconar al rey
+    // rival y pasearlo por el centro (ver `final_aplastante`).
+    if let Some(punt) = final_aplastante(b) {
+        return punt;
     }
     // RENDIMIENTO: la clasica se calcula SOLO si su valor se va a usar. En
     // modo "red pura" (el default desde 2026-08-13) el resultado era
@@ -1420,6 +1554,12 @@ pub fn evaluate_classical_with_state(b: &Board, state: &EvalState) -> i32 {
     // ruta, y deben ver 0 en un final muerto igual que la ruta principal.
     if material_insuficiente(b) {
         return 0;
+    }
+    // Y el mismo puntaje de acorralamiento en finales aplastantes: si la
+    // quiescence viera otro numero que la ruta principal, el stand-pat y la
+    // busqueda tirarian para lados distintos.
+    if let Some(punt) = final_aplastante(b) {
+        return punt;
     }
     state.clasica(b)
 }
@@ -1685,5 +1825,131 @@ mod incremental_tests {
                 estado = estado_siguiente;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod final_aplastante_tests {
+    use super::*;
+
+    fn tablero(fen: &str) -> Board {
+        Board::from_fen(fen).unwrap_or_else(|_| panic!("FEN invalida: {fen}"))
+    }
+
+    /// Evalua por las TRES rutas publicas (mismo criterio que los tests de
+    /// material_insuficiente): busqueda, quiescence/contempt y referencia
+    /// externa deben ver el MISMO numero en un final aplastante.
+    fn evaluaciones(fen: &str) -> (i32, i32, i32) {
+        let b = tablero(fen);
+        let estado = crear_eval_state(&b);
+        (
+            evaluate_with_state(&b, &estado, None),
+            evaluate_classical_with_state(&b, &estado),
+            evaluate_with_nnue(&b, None),
+        )
+    }
+
+    /// La posicion EXACTA del bug medido: K+D vs K, profundidad 15 y 48M de
+    /// nodos sin ver el mate porque la eval era plana.
+    #[test]
+    fn kq_vs_k_activa_en_las_tres_rutas_y_es_claramente_ganador() {
+        let fen = "8/8/8/2k5/8/8/8/K6Q w - - 0 1";
+        let b = tablero(fen);
+        let punt = final_aplastante(&b).expect("K+D vs K debe activar el termino");
+        assert!(punt > 1000, "debe ser claramente ganador, dio {punt}");
+        let (busqueda, clasica, referencia) = evaluaciones(fen);
+        assert_eq!(busqueda, punt);
+        assert_eq!(clasica, punt);
+        assert_eq!(referencia, punt);
+    }
+
+    #[test]
+    fn con_el_debil_al_mover_el_signo_se_invierte() {
+        let w = final_aplastante(&tablero("8/8/8/2k5/8/8/8/K6Q w - - 0 1")).unwrap();
+        let n = final_aplastante(&tablero("8/8/8/2k5/8/8/8/K6Q b - - 0 1")).unwrap();
+        assert_eq!(w, -n, "misma posicion, perspectiva opuesta");
+        assert!(w > 0 && n < 0);
+    }
+
+    /// El gradiente que faltaba, parte (a): rey debil MAS arrinconado debe
+    /// valer MAS. Mismos rey fuerte y dama; solo cambia el rey debil.
+    #[test]
+    fn arrinconar_al_rey_debil_sube_el_puntaje() {
+        let centro = final_aplastante(&tablero("8/8/8/8/3k4/8/7Q/K7 w - - 0 1")).unwrap();
+        let esquina = final_aplastante(&tablero("k7/8/8/8/8/8/7Q/K7 w - - 0 1")).unwrap();
+        assert!(
+            esquina > centro,
+            "esquina {esquina} debe superar centro {centro}"
+        );
+    }
+
+    /// El gradiente que faltaba, parte (b): acercar el rey propio debe valer
+    /// MAS. Rey debil fijo en a8, dama fija en h2; solo cambia el rey fuerte.
+    #[test]
+    fn acercar_el_rey_fuerte_sube_el_puntaje() {
+        let lejos = final_aplastante(&tablero("k7/8/8/8/8/8/7Q/K7 w - - 0 1")).unwrap();
+        let cerca = final_aplastante(&tablero("k7/8/1K6/8/8/8/7Q/8 w - - 0 1")).unwrap();
+        assert!(cerca > lejos, "cerca {cerca} debe superar lejos {lejos}");
+    }
+
+    #[test]
+    fn kr_vs_k_tambien_activa() {
+        let punt = final_aplastante(&tablero("8/8/8/2k5/8/8/8/K6R w - - 0 1")).unwrap();
+        assert!(punt > 700, "K+T vs K es ganador, dio {punt}");
+    }
+
+    #[test]
+    fn funciona_igual_con_negras_como_bando_fuerte() {
+        // Espejo del caso K+D vs K: ahora el rey pelado es el blanco y
+        // mueven las negras, asi que el puntaje debe ser positivo.
+        let punt = final_aplastante(&tablero("k6q/8/8/2K5/8/8/8/8 b - - 0 1")).unwrap();
+        assert!(punt > 1000, "dio {punt}");
+    }
+
+    /// K+A+C vs K: el empuje debe apuntar a la esquina del COLOR del alfil.
+    /// Alfil de casillas oscuras (c1): rey debil en h8 (esquina oscura) vale
+    /// mas que en a8 (esquina clara, donde no hay mate).
+    #[test]
+    fn kbn_empuja_a_la_esquina_del_color_del_alfil() {
+        let esquina_buena =
+            final_aplastante(&tablero("7k/8/8/3K4/8/8/8/2B1N3 w - - 0 1")).unwrap();
+        let esquina_mala = final_aplastante(&tablero("k7/8/8/3K4/8/8/8/2B1N3 w - - 0 1")).unwrap();
+        assert!(
+            esquina_buena > esquina_mala,
+            "esquina del color del alfil {esquina_buena} debe superar la contraria {esquina_mala}"
+        );
+    }
+
+    /// Donde NO debe activarse: posiciones normales y finales donde el plan
+    /// es coronar (no arrinconar), que quedan para la evaluacion de siempre.
+    #[test]
+    fn no_activa_donde_no_corresponde() {
+        // Posicion inicial: ambos bandos con material completo.
+        let inicial = tablero("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        assert!(final_aplastante(&inicial).is_none());
+        // Medio juego cualquiera con piezas de ambos lados.
+        let medio = tablero("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+        assert!(final_aplastante(&medio).is_none());
+        // K+P vs K: carrera de coronacion, decide la evaluacion normal.
+        let kp = tablero("8/8/8/2k5/8/8/6P1/K7 w - - 0 1");
+        assert!(final_aplastante(&kp).is_none());
+        // K+A+P vs K: un solo menor mas peon (alfil equivocado posible).
+        let kbp = tablero("8/8/8/2k5/8/8/6P1/KB6 w - - 0 1");
+        assert!(final_aplastante(&kbp).is_none());
+        // K+A vs K y K vs K son material insuficiente: la ruta publica debe
+        // devolver 0 (el chequeo de insuficiente va antes que este termino).
+        let b = tablero("8/5k2/7B/1K6/8/8/8/8 b - - 0 64");
+        let estado = crear_eval_state(&b);
+        assert_eq!(evaluate_with_state(&b, &estado, None), 0);
+    }
+
+    /// El puntaje sintetico nunca debe rozar la zona de mates ni la de
+    /// tablas Syzygy, incluso con material absurdo del generador de datos.
+    #[test]
+    fn queda_lejos_de_la_zona_de_mate() {
+        // Tres damas y dos torres contra rey solo.
+        let b = tablero("8/6k1/8/8/8/8/8/KQQQRR2 w - - 0 1");
+        let punt = final_aplastante(&b).unwrap();
+        assert!(punt > 0 && punt < crate::search::MATE - 2000 - 1000);
     }
 }

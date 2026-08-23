@@ -4140,7 +4140,7 @@ mod regression_tests {
             ] {
                 clave = clave.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
                 s.clear_hash();
-                s.tt_store(clave, 5, score, ply, TTFlag::Exact, None);
+                s.tt_store(clave, 5, score, ply, TTFlag::Exact, None, false);
                 let e = s
                     .tt_probe(clave)
                     .unwrap_or_else(|| panic!("no se recupero la entrada (ply={ply}, score={score})"));
@@ -4209,17 +4209,17 @@ mod regression_tests {
         // Misma posicion en la tabla, bits de verificacion (49..64) distintos.
         let k1 = (0x1234u64 & mask as u64) | (0x1111u64 << 49);
         let k2 = (0x1234u64 & mask as u64) | (0xABCDu64 << 49);
-        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None, false);
         // Menos profunda (tipica escritura de quiescence, depth=0): NO debe
         // desalojar la entrada profunda de negamax.
-        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(
             s.tt_probe(k1).map(|e| e.depth),
             Some(12),
             "una colision menos profunda desalojo la entrada profunda"
         );
         // Al menos tan profunda: SI debe pisar.
-        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
         assert!(s.tt_probe(k1).is_none());
     }
@@ -4233,13 +4233,13 @@ mod regression_tests {
         let mut s = Searcher::new(1);
         let k1 = 0x10u64;
         let k2 = k1.wrapping_add((s.tt_mask as u64) + 1);
-        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None, false);
         // Menos profunda: NO debe pisar.
-        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
         assert!(s.tt_probe(k2).is_none());
         // Al menos tan profunda: SI debe pisar.
-        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
         assert!(s.tt_probe(k1).is_none());
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
@@ -4255,7 +4255,7 @@ mod regression_tests {
 
         // Roundtrip con jugada simple, sin promocion.
         let mv1 = Move { from: 8, to: 16, promotion: None, flag: MoveFlag::Quiet };
-        s.tt_store(0xABCD, 10, 55, 0, TTFlag::Exact, Some(mv1));
+        s.tt_store(0xABCD, 10, 55, 0, TTFlag::Exact, Some(mv1), false);
         let e1 = s.tt_probe(0xABCD).expect("deberia encontrarse (misma clave)");
         assert_eq!(e1.depth, 10);
         assert_eq!(e1.score, 55);
@@ -4265,7 +4265,7 @@ mod regression_tests {
         // Roundtrip con score negativo y jugada CON promocion (probando los
         // 3 bits de promocion del empaquetado, no solo el caso None).
         let mv2 = Move { from: 48, to: 56, promotion: Some(PieceType::Queen), flag: MoveFlag::Capture };
-        s.tt_store(0x9999, 3, -1200, 0, TTFlag::Beta, Some(mv2));
+        s.tt_store(0x9999, 3, -1200, 0, TTFlag::Beta, Some(mv2), false);
         let e2 = s.tt_probe(0x9999).expect("deberia encontrarse (misma clave)");
         assert_eq!(e2.score, -1200);
         assert_eq!(e2.flag, TTFlag::Beta);
@@ -4281,13 +4281,13 @@ mod regression_tests {
         // todos sus bits, este caso degenerado no ocurre.
         let k1 = 0x1234u64;
         let k2 = (k1 & mask as u64) | (0xABCDu64 << 49);
-        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None);
+        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None, false);
         // Igual que en la TT Local: una colision MENOS profunda no desaloja
         // (antes si lo hacia, ver tt_ocupante); una al menos tan profunda si.
-        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
         assert!(s.tt_probe(k2).is_none());
-        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None);
+        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
         assert!(s.tt_probe(k1).is_none());
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
