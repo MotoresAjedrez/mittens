@@ -1341,6 +1341,10 @@ fn cargar_de_datos(datos: Vec<u8>) -> Result<u64, String> {
         RedCargada::Amenazas(Box::leak(Box::new(red)))
     };
     *almacenamiento().write().expect("candado NNUE envenenado") = Some(cargada);
+    // La cache de eval por zobrist guarda valores calculados con la red
+    // ANTERIOR: con una red nueva describen otra funcion y hay que tirarlos.
+    // (Al primer arranque la cache esta vacia y esto no cuesta nada.)
+    crate::eval_cache::flush();
     ACTIVA.store(SOLICITADA.load(Ordering::Relaxed), Ordering::Relaxed);
     Ok(checksum)
 }

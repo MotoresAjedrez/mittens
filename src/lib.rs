@@ -4,6 +4,7 @@ mod datagen;
 mod bullet_net;
 mod bullet_net_amenazas;
 mod eval;
+mod eval_cache;
 mod movegen;
 mod neural;
 mod perft;

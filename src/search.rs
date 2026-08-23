@@ -1051,7 +1051,30 @@ impl Searcher {
 
     #[inline]
     fn evaluar_completo(&self, b: &Board, eval_state: &EvalState) -> i32 {
-        evaluate_with_state(b, eval_state, self.nnue_de(eval_state))
+        let nnue = self.nnue_de(eval_state);
+        // Cache de eval por zobrist: SOLO en el camino "red bullet pura"
+        // (el default de produccion), donde la eval es funcion pura de la
+        // posicion -- ver src/eval_cache.rs. En cualquier otro camino
+        // (clasica, hibrido, red de amenazas) se evalua directo, como antes.
+        if let Some(acum) = nnue {
+            if acum.pura() {
+                if let Some(v) = crate::eval_cache::probe(b.zobrist) {
+                    // En builds de debug, cada acierto se verifica contra la
+                    // eval recomputada: si esto falla, la cache esta
+                    // devolviendo un valor que NO es el de la posicion.
+                    debug_assert_eq!(
+                        v,
+                        evaluate_with_state(b, eval_state, nnue),
+                        "eval_cache devolvio un valor distinto del recomputado"
+                    );
+                    return v;
+                }
+                let v = evaluate_with_state(b, eval_state, nnue);
+                crate::eval_cache::store(b.zobrist, v);
+                return v;
+            }
+        }
+        evaluate_with_state(b, eval_state, nnue)
     }
 
     #[inline]
@@ -1670,6 +1693,10 @@ impl Searcher {
         // mismas reglas de cota que en negamax. Ahorra la eval NNUE completa
         // y toda la generacion/orden de capturas en posiciones ya resueltas.
         let key = b.zobrist;
+        // Igual que en negamax: el prefetch viaja en paralelo con el probe
+        // de la TT para que el stand-pat (si no hay corte) encuentre la
+        // linea de la cache de eval ya caliente.
+        crate::eval_cache::prefetch(key);
         let alpha_orig = alpha;
         let mut tt_mv: Option<Move> = None;
         if let Some(mut entry) = self.tt_probe(key) {
@@ -1997,6 +2024,10 @@ impl Searcher {
 
         let alpha_orig = alpha;
         let key = b.zobrist;
+        // Prefetch del casillero de la cache de eval: para cuando la eval
+        // estatica se pida (RFP/razoring/eval_stack, mas abajo), la linea ya
+        // viajo en paralelo con el probe de la TT de aca al lado.
+        crate::eval_cache::prefetch(key);
         let mut tt_move = None;
         let mut tt_entry_full: Option<TTEntry> = None;
         if let Some(mut entry) = self.tt_probe(key) {
