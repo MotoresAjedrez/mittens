@@ -5,3 +5,7 @@
 
 # Respaldos manuales de archivos fuente (no deben ir al repo)
 *.bak_pre_*
+
+# Resultados de SPRT: PGNs de cientos de MB, son datos locales de cada
+# maquina, no fuente. Se auditan con tools/auditar_sprt.py donde se generan.
+/results_sprt/
