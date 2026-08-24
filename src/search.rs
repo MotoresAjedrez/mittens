@@ -2591,6 +2591,16 @@ impl Searcher {
         // generada de una, con ordenamiento diferido (seleccion perezosa).
         // Buffer de claves de ESTE ply (ver comentario del campo).
         let pl_claves = ply as usize;
+        // Mapa de casillas atacadas por el rival, del NODO: lo construye
+        // perezosamente la primera jugada silenciosa que lo necesita para su
+        // clave de orden, y a partir de ahi lo comparten tanto el resto de
+        // las claves como el registro de quiets buscados (mas abajo). Antes
+        // ese registro llamaba a `casilla_amenazada` -- o sea
+        // `is_square_attacked_by`, cinco consultas de ataque -- por CADA
+        // jugada silenciosa efectivamente buscada, teniendo el mapa completo
+        // del nodo ya calculado al lado. La equivalencia es exacta: es la
+        // misma que ya usa `clave_orden_movimiento` (ver Board::attack_map).
+        let mut amenazas_nodo: Option<u64> = None;
         let mut moves;
         let n_moves;
         let mut lista_ordenada;
@@ -2606,7 +2616,7 @@ impl Searcher {
             // primera jugada no corta.
             n_moves = moves.len();
             {
-                let mut amenazas: Option<u64> = None;
+                let amenazas = &mut amenazas_nodo;
                 for j in 0..n_moves {
                     let mv_j = &moves[j];
                     // SEE calculado UNA sola vez aca (paso 2 del SEE
@@ -2616,7 +2626,7 @@ impl Searcher {
                     // que no son capturas.
                     let see_j = mv_j.is_capture().then(|| crate::see::see(b, mv_j));
                     let k = self.clave_orden_movimiento(
-                        b, mv_j, tt_move, ply, prev, prev2, see_j, &mut amenazas,
+                        b, mv_j, tt_move, ply, prev, prev2, see_j, amenazas,
                     );
                     self.claves_negamax[pl_claves][j] = k;
                     self.see_negamax[pl_claves][j] = see_j.unwrap_or(i32::MIN);
@@ -3091,8 +3101,14 @@ impl Searcher {
             // Registrar esta quiet como "buscada" ANTES de buscarla, para
             // poder penalizarla si otra jugada posterior causa el corte.
             if !mv.is_capture() && mv.promotion.is_none() && n_quiets_buscados < 64 {
-                quiets_buscados[n_quiets_buscados] =
-                    (mv.from, mv.to, casilla_amenazada(b, mv.to));
+                let mapa = *amenazas_nodo.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
+                let amenazada = crate::bitboard::bit(mv.to) & mapa != 0;
+                debug_assert_eq!(
+                    amenazada,
+                    casilla_amenazada(b, mv.to),
+                    "el mapa de amenazas del nodo no coincide con is_square_attacked_by"
+                );
+                quiets_buscados[n_quiets_buscados] = (mv.from, mv.to, amenazada);
                 n_quiets_buscados += 1;
             }
             if mv.is_capture() && n_capts_buscadas < 32 {
