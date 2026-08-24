@@ -185,6 +185,36 @@ fn rfp_margen_por_ply() -> i32 {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Interruptores de las 4 propuestas de Kimi K3 (verificadas contra el codigo
+// real antes de implementarlas). Todos se leen UNA vez por proceso y quedan
+// cacheados en un OnceLock, asi que en el arbol son una lectura de un bool ya
+// resuelto, no una consulta al entorno.
+//
+// Existen para poder medirlos por separado con SPRT: el harness sprt_real.py
+// lanza los dos binarios como procesos hijos que heredan el entorno, asi que
+// cada variante se arma con un script envoltorio que exporta solo su variable.
+// Sin ninguna variable puesta, el binario se comporta EXACTAMENTE como main
+// para los puntos 4 y 5 (razoring y LMR desde la jugada 2 siguen encendidos)
+// y con las tres mejoras nuevas encendidas.
+// ---------------------------------------------------------------------------
+
+/// Lee una variable de entorno booleana ("0" = apagado) una sola vez.
+fn bandera_env(cache: &'static OnceLock<bool>, nombre: &'static str, default: bool) -> bool {
+    *cache.get_or_init(|| match std::env::var(nombre).as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => default,
+    })
+}
+
+/// Punto 1 (Kimi K3): stand-pat de quiescence fail-SOFT.
+#[inline]
+fn q_fail_soft() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    bandera_env(&CACHE, "MITTENS_QFAILSOFT", true)
+}
+
 // Tabla LMR precalculada: reduccion base en plies para cada par
 // (profundidad, numero de jugada en el orden). Formula logaritmica clasica
 // (Ethereal/Stockfish): crece suave con ambas -- las jugadas muy tardias a
@@ -1777,9 +1807,22 @@ impl Searcher {
         if ply >= MAX_PLY {
             return Ok(stand_pat);
         }
+        // FAIL-SOFT (punto 1 de Kimi K3): se DEVUELVE `stand_pat`, no `beta`.
+        //
+        // Antes esta rama guardaba `stand_pat` en la TT pero devolvia `beta`:
+        // incoherente consigo misma (la TT se quedaba con el valor real y el
+        // que llamaba recibia la cota) y ademas incoherente con la rama de
+        // evasiones de mas arriba, que ya es fail-soft (`return Ok(best)`).
+        //
+        // Devolver el valor real le da informacion util al nodo padre: con
+        // fail-hard todos los cortes de quiescence valen exactamente beta, asi
+        // que el padre no puede distinguir "corta por poco" de "corta por una
+        // dama"; con fail-soft ese margen sobrevive y alimenta `best_score`,
+        // la ventana de aspiration y el correction history. Es lo que hacen
+        // Stockfish, Ethereal y Berserk.
         if stand_pat >= beta {
             self.tt_store(key, 0, stand_pat, ply, TTFlag::Beta, None, false);
-            return Ok(beta);
+            return Ok(if q_fail_soft() { stand_pat } else { beta });
         }
         alpha = alpha.max(stand_pat);
 
