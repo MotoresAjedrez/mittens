@@ -342,6 +342,17 @@ fn victima_de(b: &Board, mv: &Move) -> usize {
 /// Stockfish, pero ya permite que "esta captura concreta funciono muchas
 /// veces" gane a "esta otra come una pieza levemente mas cara".
 /// Ajustable con MITTENS_CAPTHIST_TOPE.
+///
+/// >>> RECHAZADO POR SPRT REAL (2026-08-23). El defecto volvio a 400. <<<
+/// El paquete "tope 1600 + hist_modo 4 + malus de continuation" se midio
+/// contra main con sprt_real.py a 50.000 nodos fijos: 55W 91D 98L en 244
+/// partidas = 41.2% de score = -62 Elo, LLR -1.08 y 7.0 sigma en contra
+/// sobre las 153 decisivas. El sub-paquete "tope 1600 + hist_modo 4" solo
+/// midio 6W 16D 13L en 35 partidas (40.0%, 3.2 sigma en contra).
+/// El bench decia -17% de nodos y +0.7 puntos de calidad de orden: el bench
+/// se equivoco de signo. Ver `decaer_history` para POR QUE se equivoca
+/// (el bench corre con tablas frias y sin envejecimiento, un regimen que no
+/// existe en una partida real). No repetir sin una hipotesis nueva.
 fn tope_capthist_orden() -> i32 {
     static CACHE: OnceLock<i32> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -349,7 +360,7 @@ fn tope_capthist_orden() -> i32 {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|v| (0..=MAX_HIST).contains(v))
-            .unwrap_or(1600)
+            .unwrap_or(400)
     })
 }
 
@@ -370,7 +381,8 @@ fn tope_capthist_orden() -> i32 {
 ///   1600 en las dos ramas ... 3.271.918 / 83.522%
 /// O sea que dejar entrar una captura perdedora con buen historial al carril
 /// de los quiets no es el problema que parecia: es informacion util.
-/// Ajustable con MITTENS_CAPTHIST_TOPE_MALA.
+/// Ajustable con MITTENS_CAPTHIST_TOPE_MALA. RECHAZADO POR SPRT junto con el
+/// resto del paquete (ver `tope_capthist_orden`): el defecto volvio a 400.
 fn tope_capthist_mala() -> i32 {
     static CACHE: OnceLock<i32> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -378,23 +390,34 @@ fn tope_capthist_mala() -> i32 {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|v| (0..=MAX_HIST).contains(v))
-            .unwrap_or(1600)
+            .unwrap_or(400)
     })
 }
 
 /// Interruptor del MALUS de continuation history (ver el bloque de malus en
-/// negamax). Encendido por defecto; `MITTENS_MALUS_CONT=0` reproduce el
-/// comportamiento historico exacto.
+/// negamax).
+///
+/// APAGADO por defecto: formaba parte del paquete que el SPRT real rechazo
+/// (ver `tope_capthist_orden` para los numeros). El codigo queda porque el
+/// DEFECTO que describe es real -- las dos continuation histories solo
+/// reciben bonus, o sea que son estructuralmente no negativas -- pero
+/// corregirlo tal cual, sin recalibrar el umbral de la poda por historia que
+/// las consume (`stat_score < -4000*depth`), sale caro: al darle rango
+/// negativo a `ch + ch2` la poda empieza a disparar mucho mas y el arbol se
+/// achica PODANDO MAL (-17% de nodos en bench, -62 Elo en partidas).
+/// `MITTENS_MALUS_CONT=1` lo enciende.
 fn malus_cont_activo() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        !matches!(
+        matches!(
             std::env::var("MITTENS_MALUS_CONT").as_deref(),
-            Ok("0") | Ok("false")
+            Ok("1") | Ok("true")
         )
     })
 }
 
+/// Modo de lectura de la historia mariposa. Defecto 0 = historico: el modo 4
+/// entro al paquete rechazado por SPRT (ver `tope_capthist_orden`).
 fn hist_modo() -> u8 {
     static CACHE: OnceLock<u8> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -402,8 +425,66 @@ fn hist_modo() -> u8 {
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .filter(|v| *v <= 4)
-            .unwrap_or(4)
+            .unwrap_or(0)
     })
+}
+
+/// Envejecimiento de UNA entrada de tabla persistente entre jugadas.
+///
+/// `k` es un exponente: la entrada se multiplica por `1 - 2^-k`.
+///   k = 0 -> no se toca (lo que hacen Stockfish y practicamente todos los
+///            motores modernos: las tablas viven toda la partida).
+///   k = 1 -> `v / 2`, EXACTAMENTE el comportamiento historico de Mittens
+///            (se escribe como division y no como `v - (v >> 1)` porque para
+///            v positivo impar no son lo mismo: 5/2 = 2, 5 - (5>>1) = 3).
+///   k = 2 -> x3/4,  k = 3 -> x7/8,  k = 4 -> x15/16 ...
+#[inline]
+fn decaer_valor(v: &mut i32, k: u32) {
+    match k {
+        0 => {}
+        1 => *v /= 2,
+        _ => *v -= *v / (1 << k),
+    }
+}
+
+/// Lee un exponente de envejecimiento de una variable de entorno.
+fn decay_k(var: &str, defecto: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|k| *k <= 16)
+        .unwrap_or(defecto)
+}
+
+/// Exponente de envejecimiento de las tablas de ORDENAMIENTO
+/// (history, history_amenaza, cont_history, cont_history_2, capture_history).
+/// Ver `decaer_history` para el analisis y la medicion.
+fn decay_orden() -> u32 {
+    static CACHE: OnceLock<u32> = OnceLock::new();
+    *CACHE.get_or_init(|| decay_k("MITTENS_DECAY_ORDEN", 1))
+}
+
+/// Divisor de la amortiguacion de la eval por la regla de 50 jugadas
+/// (ver `Searcher::amortiguar_r50`): la eval se multiplica por `1 - hc/D`.
+/// 0 = apagado (defecto historico, no existia). Stockfish usa 212.
+fn r50_div() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_R50_DIV")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|d| *d == 0 || (100..=4096).contains(d))
+            .unwrap_or(0)
+    })
+}
+
+/// Exponente de envejecimiento de las tablas de CORRECTION HISTORY
+/// (corr_pawn, corr_nonpawn, corr_cont). Separado del de ordenamiento porque
+/// no alimentan al mismo consumidor: el corrhist corrige la EVAL (RFP,
+/// razoring, futility, corrplexity), no el orden de jugadas.
+fn decay_corr() -> u32 {
+    static CACHE: OnceLock<u32> = OnceLock::new();
+    *CACHE.get_or_init(|| decay_k("MITTENS_DECAY_CORR", 1))
 }
 
 /// Si el rival ya ataca `sq` ANTES de jugar el movimiento (tablero en la
@@ -875,6 +956,15 @@ pub struct Searcher {
     // de clave_orden_movimiento seria un atomic load por JUGADA.
     capthist_tope: i32,
     capthist_tope_mala: i32,
+    // Exponentes de envejecimiento entre jugadas (ver decaer_history). Se
+    // leen una vez al construir; decaer_history corre una vez por "go", asi
+    // que aqui el atomic load no importaria, pero se guardan por coherencia
+    // con el resto de las perillas y para que un test pueda fijarlos.
+    decay_orden: u32,
+    decay_corr: u32,
+    // Copia local de `r50_div()`: amortiguar_r50 corre en CADA nodo evaluado,
+    // ahi un atomic load del OnceLock si se nota.
+    r50_div: i32,
     // Cuantas jugadas silenciosas BUSCADAS tenian su casilla destino
     // atacada por el rival: mide que fraccion del arbol usaba la tabla
     // `history_amenaza` para escribir pero leia `history` en LMR/poda.
@@ -990,6 +1080,9 @@ impl Searcher {
             malus_cont: malus_cont_activo(),
             capthist_tope: tope_capthist_orden(),
             capthist_tope_mala: tope_capthist_mala(),
+            decay_orden: decay_orden(),
+            decay_corr: decay_corr(),
+            r50_div: r50_div(),
             quiets_destino_amenazado: 0,
             quiets_buscadas_total: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -1094,6 +1187,9 @@ impl Searcher {
             malus_cont: malus_cont_activo(),
             capthist_tope: tope_capthist_orden(),
             capthist_tope_mala: tope_capthist_mala(),
+            decay_orden: decay_orden(),
+            decay_corr: decay_corr(),
+            r50_div: r50_div(),
             quiets_destino_amenazado: 0,
             quiets_buscadas_total: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -1180,8 +1276,45 @@ impl Searcher {
         }
     }
 
+    /// Amortigua la eval segun el contador de la regla de 50 jugadas:
+    /// `v * (1 - hc/D)`. Con D = 212 (el valor de Stockfish) una posicion con
+    /// 100 medias jugadas sin captura ni peon vale ~53% de lo que dice la red.
+    ///
+    /// POR QUE HACE FALTA. `halfmove_clock` NO es una entrada de la NNUE: sus
+    /// rasgos son pieza-casilla mas el bucket de material, nada mas. O sea que
+    /// la red evalua exactamente igual una posicion con hc = 0 y con hc = 98,
+    /// y el motor solo se enteraba del empate al ver el `hc >= 100` dentro del
+    /// arbol -- a 50.000 nodos eso son unos 15-20 plies de vista, asi que
+    /// desde hc = 80 hacia abajo la regla de 50 era invisible. Resultado: el
+    /// motor se pasea con +2 de ventaja quemando el contador y despues cae de
+    /// golpe a tablas. Con la amortiguacion la presion se siente antes y las
+    /// jugadas que REINICIAN el contador (captura o avance de peon) ganan
+    /// valor relativo solas, sin ningun termino nuevo.
+    ///
+    /// Se aplica DESPUES de la cache de eval (`eval_cache`), no dentro:
+    /// la cache esta indexada por zobrist, que no incluye `halfmove_clock`,
+    /// asi que meter la amortiguacion adentro devolveria el valor de otro
+    /// contador. Fuera de la cache el valor cacheado sigue siendo funcion
+    /// pura de la posicion y la amortiguacion se recalcula por nodo (un
+    /// multiplicar y un dividir).
+    #[inline]
+    fn amortiguar_r50(&self, b: &Board, v: i32) -> i32 {
+        let d = self.r50_div;
+        if d == 0 {
+            return v;
+        }
+        // i64 en el medio: v puede ser del orden de +-30.000 y hc <= 100, el
+        // producto no entra holgado en i32 con margen para futuros rangos.
+        v - ((v as i64 * b.halfmove_clock.min(100) as i64) / d as i64) as i32
+    }
+
     #[inline]
     fn evaluar_completo(&self, b: &Board, eval_state: &EvalState) -> i32 {
+        self.amortiguar_r50(b, self.evaluar_crudo(b, eval_state))
+    }
+
+    #[inline]
+    fn evaluar_crudo(&self, b: &Board, eval_state: &EvalState) -> i32 {
         let nnue = self.nnue_de(eval_state);
         // Cache de eval por zobrist: SOLO en el camino "red bullet pura"
         // (el default de produccion), donde la eval es funcion pura de la
@@ -1213,7 +1346,12 @@ impl Searcher {
         if self.qsearch_nnue {
             self.evaluar_completo(b, eval_state)
         } else {
-            evaluate_classical_with_state(b, eval_state)
+            // Misma amortiguacion por regla de 50 que la ruta principal: si el
+            // stand-pat de quiescence viera un numero sin amortiguar y el
+            // negamax uno amortiguado, las dos mitades de la busqueda
+            // tirarian para lados distintos en las posiciones con el contador
+            // alto.
+            self.amortiguar_r50(b, evaluate_classical_with_state(b, eval_state))
         }
     }
 
@@ -1305,45 +1443,83 @@ impl Searcher {
         }
     }
 
-    /// Decae (no resetea de golpe) las tablas de history/continuation
-    /// history al arrancar cada "go" real de la partida. Sin esto, la
-    /// tabla solo se inicializa una vez (Searcher::new) y ACUMULA sin
-    /// limite durante toda la partida -- estadisticas de la apertura
-    /// (jugada 5) pueden seguir sesgando el ordenamiento en el medio
-    /// juego o el final (jugada 40+), donde el tipo de posicion es
-    /// completamente distinto. Dividir a la mitad (no resetear a cero)
-    /// preserva la señal relativa de jugadas que siguen funcionando bien
-    /// mientras deja que estadisticas viejas pesen cada vez menos.
+    /// Envejece las tablas persistentes al arrancar cada "go" real de la
+    /// partida (solo `search_time`; `search_fixed_depth`, o sea el bench,
+    /// NO pasa por aqui).
+    ///
+    /// HISTORICO: dividia TODO por 2 en cada jugada, con este argumento --
+    /// "sin esto la tabla solo se inicializa una vez y ACUMULA sin limite
+    /// durante toda la partida; estadisticas de la apertura pueden seguir
+    /// sesgando el ordenamiento en el final". El argumento no se sostiene:
+    /// `hist_update` y `corrhist_update` ya acotan cada entrada con GRAVEDAD
+    /// (el bonus se amortigua a medida que la entrada se aleja de cero), asi
+    /// que no hay crecimiento sin limite que contener, y el MALUS del corte
+    /// beta ya empuja hacia abajo las jugadas que dejaron de funcionar. El
+    /// /2 por jugada es envejecimiento ENCIMA de dos mecanismos que ya
+    /// envejecen.
+    ///
+    /// LO QUE CUESTA. Con divisor 2 el estado estacionario de una entrada es
+    /// ~2x lo que aporta la busqueda de UNA jugada: la tabla nunca guarda
+    /// mas que un par de jugadas de memoria. Pero los CONSUMIDORES de esa
+    /// senal estan calibrados a escala Stockfish, donde las tablas viven la
+    /// partida entera y se saturan: la poda por historia exige
+    /// `stat_score = 2*h + ch + ch2 < -4000*depth` (a profundidad 6, -24.000
+    /// sobre un rango teorico de +-65.536) y el ajuste de LMR divide por
+    /// 8000 con tope +-2 plies. Con las tablas permanentemente frias, las
+    /// dos tecnicas trabajan en la parte plana de su curva.
+    ///
+    /// Ningun motor moderno de referencia (Stockfish, Ethereal, Berserk,
+    /// Stormphrax) decae estas tablas entre jugadas: se limpian en
+    /// "ucinewgame" y nada mas. Mittens era el raro.
+    ///
+    /// De paso, esto tambien explica POR QUE EL BENCH ENGAÑA con cualquier
+    /// cambio de ordenamiento (fue lo que hundio el paquete de capture
+    /// history / hist_modo 4 / malus de continuation: -17% de nodos en bench,
+    /// -62 Elo en partidas). El bench crea un `Searcher::new` por posicion y
+    /// llama a `search_fixed_depth`: tablas en CERO y sin envejecimiento. Una
+    /// partida real usa el MISMO Searcher jugada tras jugada pasando por
+    /// aqui. Son dos regimenes distintos de la misma maquinaria, y el bench
+    /// mide el que no se juega.
+    ///
+    /// Los dos exponentes son independientes (ver `decay_orden` /
+    /// `decay_corr`) porque las dos familias de tablas alimentan consumidores
+    /// distintos: unas el ORDEN de jugadas, las otras la EVAL.
     fn decaer_history(&mut self) {
-        for fila in self.history.iter_mut() {
-            for v in fila.iter_mut() {
-                *v /= 2;
+        let k_orden = self.decay_orden;
+        if k_orden != 0 {
+            for fila in self.history.iter_mut() {
+                for v in fila.iter_mut() {
+                    decaer_valor(v, k_orden);
+                }
+            }
+            for fila in self.history_amenaza.iter_mut() {
+                for v in fila.iter_mut() {
+                    decaer_valor(v, k_orden);
+                }
+            }
+            for v in self.cont_history.iter_mut() {
+                decaer_valor(v, k_orden);
+            }
+            for v in self.cont_history_2.iter_mut() {
+                decaer_valor(v, k_orden);
+            }
+            for v in self.capture_history.iter_mut() {
+                decaer_valor(v, k_orden);
             }
         }
-        for fila in self.history_amenaza.iter_mut() {
-            for v in fila.iter_mut() {
-                *v /= 2;
+        let k_corr = self.decay_corr;
+        if k_corr != 0 {
+            for v in self.corr_pawn.iter_mut() {
+                decaer_valor(v, k_corr);
             }
-        }
-        for v in self.cont_history.iter_mut() {
-            *v /= 2;
-        }
-        for v in self.cont_history_2.iter_mut() {
-            *v /= 2;
-        }
-        for v in self.capture_history.iter_mut() {
-            *v /= 2;
-        }
-        for v in self.corr_pawn.iter_mut() {
-            *v /= 2;
-        }
-        for tabla in self.corr_nonpawn.iter_mut() {
-            for v in tabla.iter_mut() {
-                *v /= 2;
+            for tabla in self.corr_nonpawn.iter_mut() {
+                for v in tabla.iter_mut() {
+                    decaer_valor(v, k_corr);
+                }
             }
-        }
-        for v in self.corr_cont.iter_mut() {
-            *v /= 2;
+            for v in self.corr_cont.iter_mut() {
+                decaer_valor(v, k_corr);
+            }
         }
     }
 
