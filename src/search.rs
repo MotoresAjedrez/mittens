@@ -229,6 +229,22 @@ fn corr_menores_on() -> bool {
     bandera_env(&CACHE, "MITTENS_CORR_MENORES", true)
 }
 
+/// Punto 4a (Kimi K3): razoring. Default ENCENDIDO = comportamiento de main.
+/// `MITTENS_RAZORING=0` produce la variante sin razoring para medirla.
+#[inline]
+fn razoring_on() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    bandera_env(&CACHE, "MITTENS_RAZORING", true)
+}
+
+/// Punto 4b (Kimi K3): LMR desde la jugada 2. Default ENCENDIDO = main
+/// (umbral 2). `MITTENS_LMR_MOVE2=0` vuelve al umbral historico de 5.
+#[inline]
+fn lmr_move2_on() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    bandera_env(&CACHE, "MITTENS_LMR_MOVE2", true)
+}
+
 /// Divisor del termino de piezas menores dentro de `eval_corregida` (punto 3).
 /// 2 = peso 1/4 del total, la mitad del de peones (proporcion de Stockfish).
 /// Ajustable con `MITTENS_CORR_MENORES_DIV` para poder probar pesos mas
@@ -2279,10 +2295,20 @@ impl Searcher {
         // recortar. h2h a 20ms/250 partidas: 53.8% -- AMBIGUO (no llego al
         // umbral de 55% que se usa normalmente), desplegado igual por
         // decision explicita del usuario, no por criterio tecnico.
+        //
+        // PUNTO 4a (Kimi K3): `MITTENS_RAZORING=0` apaga el bloque entero
+        // para poder MEDIR con SPRT si hoy (con corrhist, corrplexity, red
+        // reentrenada y contempt dinamico) sigue aportando algo. Default =
+        // encendido, o sea el comportamiento actual de main sin tocar nada.
         const RAZOR_PROF_MAX: i32 = 2;
         const RAZOR_MARGEN_BASE: i32 = 200;
         const RAZOR_MARGEN_POR_PLY: i32 = 180;
-        if !en_jaque && !es_pv && depth <= RAZOR_PROF_MAX && alpha.abs() < MATE - 1000 {
+        if razoring_on()
+            && !en_jaque
+            && !es_pv
+            && depth <= RAZOR_PROF_MAX
+            && alpha.abs() < MATE - 1000
+        {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let static_eval =
@@ -2732,7 +2758,14 @@ impl Searcher {
         // 1 ply hasta prof 6-8, 2 plies hasta prof ~24 y 3 plies solo mas
         // alla). Siguen aplicandose los ajustes contextuales (-1 en PV, -1
         // con historia positiva, +1 sin improving) y el clamp a [1, depth-2].
-        const LMR_MOVES_SIN_REDUCIR: usize = 2;
+        //
+        // PUNTO 4b (Kimi K3): el 51.0% de aquel h2h no alcanza para afirmar
+        // nada, y desde entonces cambiaron corrhist, corrplexity, la red y el
+        // contempt dinamico -- la interaccion puede haberse dado vuelta. Con
+        // `MITTENS_LMR_MOVE2=0` se vuelve al umbral historico de 5 para poder
+        // medir con SPRT si quitarlo hoy es neutro o positivo. Default = 2,
+        // o sea el comportamiento actual de main sin tocar nada.
+        let lmr_moves_sin_reducir: usize = if lmr_move2_on() { 2 } else { 5 };
         const LMR_PROF_MIN: i32 = 3;
 
         // Futility pruning (frontera): cerca de las hojas, si la evaluacion
@@ -2832,7 +2865,7 @@ impl Searcher {
                     idx >= LMR_CAPTURAS_MOVES_SIN_REDUCIR
                         && self.see_negamax[pl_claves][idx] < 0
                 } else {
-                    idx >= LMR_MOVES_SIN_REDUCIR
+                    idx >= lmr_moves_sin_reducir
                 };
 
             // Cache de "¿la jugada da jaque?" para los 3 guardas de poda de
