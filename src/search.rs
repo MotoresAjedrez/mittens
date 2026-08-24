@@ -382,6 +382,19 @@ fn tope_capthist_mala() -> i32 {
     })
 }
 
+/// Interruptor del MALUS de continuation history (ver el bloque de malus en
+/// negamax). Encendido por defecto; `MITTENS_MALUS_CONT=0` reproduce el
+/// comportamiento historico exacto.
+fn malus_cont_activo() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        !matches!(
+            std::env::var("MITTENS_MALUS_CONT").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
 fn hist_modo() -> u8 {
     static CACHE: OnceLock<u8> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -856,6 +869,7 @@ pub struct Searcher {
     // Copia local de `hist_modo()`: se lee UNA vez al construir el Searcher
     // para no pagar el atomic load del OnceLock dentro del bucle de jugadas.
     hist_modo: u8,
+    malus_cont: bool,
     // Idem para los dos topes del capture history en el orden (ver
     // tope_capthist_orden / tope_capthist_mala): leerlos del OnceLock dentro
     // de clave_orden_movimiento seria un atomic load por JUGADA.
@@ -973,6 +987,7 @@ impl Searcher {
             cortes_beta: 0,
             cortes_primera: 0,
             hist_modo: hist_modo(),
+            malus_cont: malus_cont_activo(),
             capthist_tope: tope_capthist_orden(),
             capthist_tope_mala: tope_capthist_mala(),
             quiets_destino_amenazado: 0,
@@ -1076,6 +1091,7 @@ impl Searcher {
             cortes_beta: 0,
             cortes_primera: 0,
             hist_modo: hist_modo(),
+            malus_cont: malus_cont_activo(),
             capthist_tope: tope_capthist_orden(),
             capthist_tope_mala: tope_capthist_mala(),
             quiets_destino_amenazado: 0,
@@ -2803,7 +2819,10 @@ impl Searcher {
         // por LMP/futilidad). Si una jugada posterior causa un corte beta,
         // estas se probaron y fallaron: reciben un "malus" de history para que
         // el orden aprenda a probarlas mas tarde. Cota fija en la pila.
-        let mut quiets_buscados: [(u8, u8, bool); 64] = [(0, 0, false); 64];
+        // (from, to, tipo_de_pieza, destino_amenazado). El tipo de pieza se
+        // guarda para poder aplicarles tambien el MALUS de continuation
+        // history, que se indexa por (pieza, destino) y no por (from, to).
+        let mut quiets_buscados: [(u8, u8, u8, bool); 64] = [(0, 0, 0, false); 64];
         let mut n_quiets_buscados = 0usize;
         // Lo mismo para las capturas buscadas sin cortar: (pieza, destino,
         // victima), para aplicarles el malus de capture history.
@@ -3071,7 +3090,8 @@ impl Searcher {
                 if amenazada {
                     self.quiets_destino_amenazado += 1;
                 }
-                quiets_buscados[n_quiets_buscados] = (mv.from, mv.to, amenazada);
+                let pt_q = b.piece_at(mv.from).map(|(_, pt)| pt as u8).unwrap_or(0);
+                quiets_buscados[n_quiets_buscados] = (mv.from, mv.to, pt_q, amenazada);
                 n_quiets_buscados += 1;
             }
             if mv.is_capture() && n_capts_buscadas < 32 {
@@ -3364,7 +3384,8 @@ impl Searcher {
                 }
                 if !mv.is_capture() && mv.promotion.is_none() {
                     let malus = hist_bonus(depth);
-                    for &(qf, qt, amenazada) in &quiets_buscados[..n_quiets_buscados] {
+                    let malus_cont = self.malus_cont;
+                    for &(qf, qt, qpt, amenazada) in &quiets_buscados[..n_quiets_buscados] {
                         if (qf, qt) != (mv.from, mv.to) {
                             if amenazada {
                                 hist_update(
@@ -3373,6 +3394,56 @@ impl Searcher {
                                 );
                             } else {
                                 hist_update(&mut self.history[qf as usize][qt as usize], -malus);
+                            }
+                            // MALUS DE CONTINUATION HISTORY.
+                            //
+                            // Antes NO existia: `cont_history` y
+                            // `cont_history_2` recibian unicamente BONUS (en
+                            // registrar_corte) y el envejecimiento /2 por
+                            // "go". Como `hist_bonus` siempre es positivo y
+                            // `hist_update` con bonus positivo solo puede
+                            // subir una entrada, las dos tablas eran
+                            // estructuralmente NO NEGATIVAS: vivian en
+                            // [0, MAX_HIST].
+                            //
+                            // Eso rompia a sus dos consumidores, que estan
+                            // calibrados suponiendo una senal con signo:
+                            //  - la poda por historia exige
+                            //    `stat_score = 2*h + ch + ch2 < -4000*depth`,
+                            //    pero con ch, ch2 >= 0 las continuation
+                            //    histories solo podian ALEJAR del umbral --
+                            //    jamas ayudar a condenar una jugada.
+                            //  - el ajuste de LMR hace
+                            //    `r -= (stat_score/8000).clamp(-2, 2)`, que
+                            //    quedaba sesgado hacia reducir MENOS.
+                            // Y en el orden, una quiet que ya fallo mil veces
+                            // en este contexto no se distinguia de una que
+                            // nunca se probo: las dos valian 0.
+                            //
+                            // Con el malus las tablas pasan a ser simetricas,
+                            // igual que ya lo eran history/history_amenaza
+                            // (que si reciben malus aca) y capture_history.
+                            // Es exactamente lo que hace
+                            // update_continuation_histories de Stockfish.
+                            if malus_cont {
+                                if let Some((prev_pt, prev_to)) = prev {
+                                    let idx = cont_idx(
+                                        prev_pt,
+                                        prev_to,
+                                        qpt as usize,
+                                        qt as usize,
+                                    );
+                                    hist_update(&mut self.cont_history[idx], -malus);
+                                }
+                                if let Some((p2_pt, p2_to)) = prev2 {
+                                    let idx = cont_idx(
+                                        p2_pt,
+                                        p2_to,
+                                        qpt as usize,
+                                        qt as usize,
+                                    );
+                                    hist_update(&mut self.cont_history_2[idx], -malus);
+                                }
                             }
                         }
                     }
