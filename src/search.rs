@@ -330,21 +330,60 @@ fn casilla_amenazada(b: &Board, sq: crate::types::Square) -> bool {
 /// se permuta EXACTAMENTE igual que `claves` para que quede sincronizado con
 /// `moves` despues del ordenamiento.
 fn ordenar_estable(moves: &mut [Move], claves: &mut [i32], sees: &mut [i32], inicio: usize, n: usize) {
-    for i in (inicio + 1)..n {
-        let m = moves[i];
-        let k = claves[i];
-        let s = sees[i];
+    // IMPLEMENTACION: se ordena un arreglo AUXILIAR de u64 con la clave en la
+    // parte alta y el indice original en los 8 bits bajos, y recien al final
+    // se aplica la permutacion resultante a las tres listas.
+    //
+    // Por que: el insertion sort movia TRES arreglos en paralelo dentro del
+    // bucle interno (Move + clave + SEE = 3 lecturas y 3 escrituras por
+    // desplazamiento). Medido con contadores en `bench 14`: 4.664.099
+    // elementos ordenados y 40.026.541 desplazamientos (8,6 por elemento), o
+    // sea ~240 millones de accesos a memoria solo para desplazar. Con la
+    // clave y el indice EMPAQUETADOS en una sola palabra el desplazamiento
+    // cuesta una lectura y una escritura sobre UNA sola corriente contigua, y
+    // reacomodar las tres listas pasa a ser lineal (una pasada) en vez de
+    // cuadratico.
+    //
+    // Sigue siendo el MISMO orden final: comparar los u64 empaquetados
+    // equivale a comparar (clave, indice_original) lexicograficamente, que es
+    // exactamente lo que hace un sort ESTABLE ascendente por clave. El sesgo
+    // de 2^31 solo convierte el i32 con signo en un u64 sin signo conservando
+    // el orden.
+    let m = n.saturating_sub(inicio);
+    if m < 2 {
+        return;
+    }
+    debug_assert!(m <= MAX_MOVES, "rango de orden mas grande que MAX_MOVES");
+    const SESGO: i64 = 1 << 31;
+    let mut emp: ArrayVec<u64, MAX_MOVES> = ArrayVec::new();
+    for i in inicio..n {
+        emp.push(((((claves[i] as i64) + SESGO) as u64) << 8) | (i - inicio) as u64);
+    }
+    for i in 1..m {
+        let k = emp[i];
         let mut j = i;
-        while j > inicio && claves[j - 1] > k {
-            moves[j] = moves[j - 1];
-            claves[j] = claves[j - 1];
-            sees[j] = sees[j - 1];
+        while j > 0 && emp[j - 1] > k {
+            emp[j] = emp[j - 1];
             j -= 1;
         }
-        moves[j] = m;
-        claves[j] = k;
-        sees[j] = s;
+        emp[j] = k;
     }
+    // Permutacion en una pasada. Las tres listas quedan sincronizadas igual
+    // que antes (las claves tambien se reacomodan: hoy nadie las lee despues
+    // de ordenar, pero dejarlas desordenadas seria una trampa para el
+    // proximo que las use).
+    let mut mv_tmp: ArrayVec<Move, MAX_MOVES> = ArrayVec::new();
+    let mut cl_tmp: ArrayVec<i32, MAX_MOVES> = ArrayVec::new();
+    let mut se_tmp: ArrayVec<i32, MAX_MOVES> = ArrayVec::new();
+    for &p in emp.iter() {
+        let o = inicio + (p & 0xFF) as usize;
+        mv_tmp.push(moves[o]);
+        cl_tmp.push(claves[o]);
+        se_tmp.push(sees[o]);
+    }
+    moves[inicio..n].copy_from_slice(&mv_tmp);
+    claves[inicio..n].copy_from_slice(&cl_tmp);
+    sees[inicio..n].copy_from_slice(&se_tmp);
 }
 
 /// ¿La jugada `mv` da jaque al rey rival? Equivalente exacto a
