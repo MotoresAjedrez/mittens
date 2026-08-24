@@ -357,6 +357,112 @@ fn ordenar_estable(moves: &mut [Move], claves: &mut [i32], sees: &mut [i32], ini
 /// hacía su propio `b.make_move(mv)` para consultar eso (hasta 3 copias de
 /// 144 bytes por jugada en los nodos poco profundos, que son la mayoria del
 /// arbol). Maneja capturas, al paso, enroque y promociones.
+/// Mascaras de jaque de UN NODO (no de una jugada). `da_jaque_sin_copiar` es
+/// exacto pero caro (reconstruye la ocupacion virtual y hace hasta cinco
+/// consultas de ataque, dos de ellas magicas) y la busqueda lo llamaba una vez
+/// por jugada: medido con contadores en `bench 14`, 4.742.255 llamadas de las
+/// cuales solo 49.363 -- el 1,0% -- daban TRUE. O sea: el 99% del trabajo mas
+/// caro de los guardas de poda era para contestar "no, no da jaque".
+///
+/// Estas mascaras contestan ese 99% con dos AND de bitboard, y se calculan una
+/// sola vez por nodo (perezosamente: los nodos que nunca preguntan no pagan
+/// nada):
+///
+///  - `por_tipo[pt]` = casillas DESDE LAS QUE una pieza propia de tipo `pt`
+///    ataca al rey rival. Una jugada normal da jaque DIRECTO si y solo si su
+///    casilla destino esta en la mascara de su tipo.
+///  - `descubridores` = piezas propias que son el UNICO bloqueo entre un
+///    deslizante propio y el rey rival: moverlas puede destapar un jaque.
+///
+/// Es una SOBREAPROXIMACION deliberada: si la mascara dice "candidata" se
+/// llama igual a `da_jaque_sin_copiar` para la respuesta exacta (p.ej. una
+/// pieza descubridora que se mueve DENTRO de la misma linea no da jaque).
+/// Nunca puede decir "no" sobre una jugada que si da jaque, asi que el
+/// resultado que ve la busqueda es bit a bit el mismo de antes.
+#[derive(Clone, Copy)]
+struct MascarasJaque {
+    por_tipo: [u64; 6],
+    descubridores: u64,
+}
+
+/// Construye las mascaras del nodo. Coste: dos lookups magicos desde el rey
+/// rival + `pinned_pieces` con los roles invertidos (deslizantes PROPIOS
+/// contra el rey RIVAL, bloqueadores propios) -- el mismo calculo que ya hace
+/// el generador legal, pero mirando al otro rey.
+fn mascaras_jaque(b: &Board) -> MascarasJaque {
+    use crate::bitboard::{bishop_attacks, knight_attacks, pawn_attacks, pinned_pieces, rook_attacks};
+    let us = b.turn;
+    let them = us.opposite();
+    let ksq = b.king_square(them);
+    let occ = b.occupied;
+    let ra = rook_attacks(ksq, occ);
+    let ba = bishop_attacks(ksq, occ);
+    let mut por_tipo = [0u64; 6];
+    // Las casillas desde las que un peon NUESTRO ataca `ksq` son exactamente
+    // las que ataca un peon DE ELLOS parado en `ksq` (mismo truco que usa
+    // `see::atacantes_a`).
+    por_tipo[PieceType::Pawn as usize] = pawn_attacks(them, ksq);
+    por_tipo[PieceType::Knight as usize] = knight_attacks(ksq);
+    por_tipo[PieceType::Bishop as usize] = ba;
+    por_tipo[PieceType::Rook as usize] = ra;
+    por_tipo[PieceType::Queen as usize] = ra | ba;
+    // El rey nunca puede dar jaque directo (los reyes no pueden tocarse: una
+    // jugada que dejara al rey propio adyacente al rival seria ilegal).
+    por_tipo[PieceType::King as usize] = 0;
+    let nuestras_torres = b.pieces[us as usize][PieceType::Rook as usize]
+        | b.pieces[us as usize][PieceType::Queen as usize];
+    let nuestros_alfiles = b.pieces[us as usize][PieceType::Bishop as usize]
+        | b.pieces[us as usize][PieceType::Queen as usize];
+    let descubridores = pinned_pieces(
+        ksq,
+        b.occupied_co[us as usize],
+        nuestras_torres,
+        nuestros_alfiles,
+        occ,
+    );
+    MascarasJaque {
+        por_tipo,
+        descubridores,
+    }
+}
+
+/// Respuesta EXACTA a "¿`mv` da jaque?", igual que `da_jaque_sin_copiar`, pero
+/// descartando primero con las mascaras del nodo las jugadas que no pueden
+/// darlo.
+///
+/// Las jugadas con reglas especiales (al paso, enroque, promocion) pasan
+/// siempre al camino exacto: cada una mueve o quita una pieza EXTRA (el peon
+/// comido al paso, la torre del enroque) o cambia el tipo de la pieza que
+/// llega, y ninguna de esas tres cosas la ven las mascaras. Son una minoria
+/// de las jugadas, asi que mandarlas al camino caro no cuesta casi nada.
+#[inline]
+fn da_jaque_con_mascaras(b: &Board, mv: &Move, m: &MascarasJaque) -> bool {
+    use crate::bitboard::bit;
+    if mv.promotion.is_some()
+        || matches!(
+            mv.flag,
+            MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
+        )
+    {
+        return da_jaque_sin_copiar(b, mv);
+    }
+    if bit(mv.from) & m.descubridores == 0 {
+        // No puede destapar nada: solo queda el jaque DIRECTO, y para eso la
+        // mascara del tipo de la pieza es exacta (si la casilla de origen
+        // tapara el rayo entre el destino y el rey rival, la pieza ya estaria
+        // dando jaque desde el origen -- posicion imposible con el rival al
+        // no estar en jaque).
+        let pt = match b.piece_at(mv.from) {
+            Some((_, pt)) => pt as usize,
+            None => return da_jaque_sin_copiar(b, mv),
+        };
+        if bit(mv.to) & m.por_tipo[pt] == 0 {
+            return false;
+        }
+    }
+    da_jaque_sin_copiar(b, mv)
+}
+
 #[inline]
 fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
     use crate::bitboard::{
@@ -1871,10 +1977,25 @@ impl Searcher {
 
         let mut best = stand_pat;
         let mut best_mv: Option<Move> = None;
+        // Mascaras de jaque del nodo (perezosas): el bucle de abajo necesita
+        // saber si cada captura da jaque ANTES de decidir si la poda.
+        let mut mascaras_cap: Option<MascarasJaque> = None;
         for &(mv, see) in moves.iter() {
-            let next = b.make_move(&mv);
-            self.tt_prefetch(next.zobrist);
-            let da_jaque = next.in_check(next.turn);
+            // ORDEN: primero se decide el jaque y se aplican las podas, y
+            // RECIEN DESPUES se construye el tablero hijo. Antes se hacia
+            // `b.make_move` de entrada para poder preguntar
+            // `next.in_check(next.turn)`, asi que toda captura podada pagaba
+            // igual la copia del tablero: medido con contadores en `bench 14`,
+            // de 258.290 `make_move` de este bucle 155.088 (el 60,0%) eran de
+            // jugadas que se descartaban dos lineas mas abajo.
+            // `da_jaque_con_mascaras` da exactamente la misma respuesta que
+            // `next.in_check(next.turn)` (el rival es el lado que mueve en el
+            // hijo) sin construir nada.
+            let da_jaque = da_jaque_con_mascaras(
+                b,
+                &mv,
+                mascaras_cap.get_or_insert_with(|| mascaras_jaque(b)),
+            );
 
             // Nunca podar promociones ni jaques por SEE/delta: una captura
             // materialmente mala puede ser mate o forzar una secuencia tactica.
@@ -1893,6 +2014,10 @@ impl Searcher {
                 continue;
             }
 
+            // La jugada sobrevivio a las dos podas: recien aca vale la pena
+            // construir el hijo.
+            let next = b.make_move(&mv);
+            self.tt_prefetch(next.zobrist);
             let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
             let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
             self.salir_hijo(&next_eval, b, &next);
@@ -1917,6 +2042,11 @@ impl Searcher {
             let mut jaques_probados = 0usize;
             let mut jaques_lista = MoveList::new();
             generate_legal_into_con_jaque(b, &mut jaques_lista, false);
+            // Este bucle era el mayor consumidor de `da_jaque_sin_copiar`:
+            // recorre la lista legal COMPLETA (34,3 jugadas por entrada,
+            // medido) preguntando una por una si dan jaque, y casi ninguna
+            // lo da. Con las mascaras del nodo el descarte cuesta dos AND.
+            let mascaras_q = mascaras_jaque(b);
             for mv in jaques_lista.iter().copied() {
                 if jaques_probados >= 5 {
                     break;
@@ -1925,7 +2055,7 @@ impl Searcher {
                 if mv.is_capture() || mv.promotion.is_some() {
                     continue;
                 }
-                if !da_jaque_sin_copiar(b, &mv) {
+                if !da_jaque_con_mascaras(b, &mv, &mascaras_q) {
                     continue;
                 }
                 // Filtro barato antes del caro: SEE solo sobre las que ya
@@ -2656,6 +2786,10 @@ impl Searcher {
         // victima), para aplicarles el malus de capture history.
         let mut capts_buscadas: [(u8, u8, u8); 32] = [(0, 0, 0); 32];
         let mut n_capts_buscadas = 0usize;
+        // Mascaras de jaque del NODO (ver MascarasJaque): perezosas, se
+        // calculan la primera vez que un guarda de poda pregunta si una
+        // jugada da jaque y sirven para todas las jugadas del nodo.
+        let mut mascaras_nodo: Option<MascarasJaque> = None;
         let mut idx_siguiente = 0usize;
         'jugadas: loop {
             // Se agotaron las jugadas: fin del bucle.
@@ -2762,7 +2896,13 @@ impl Searcher {
                     FUT_MARGEN_POR_PLY
                 };
                 if ev + FUT_MARGEN_BASE + margen_ply * depth <= alpha {
-                    if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                    if !*da_jaque.get_or_insert_with(|| {
+                        da_jaque_con_mascaras(
+                            b,
+                            mv,
+                            mascaras_nodo.get_or_insert_with(|| mascaras_jaque(b)),
+                        )
+                    }) {
                         continue;
                     }
                 }
@@ -2792,7 +2932,13 @@ impl Searcher {
                 && beta.abs() < MATE - 1000
                 && idx >= lmp_umbral
             {
-                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                if !*da_jaque.get_or_insert_with(|| {
+                        da_jaque_con_mascaras(
+                            b,
+                            mv,
+                            mascaras_nodo.get_or_insert_with(|| mascaras_jaque(b)),
+                        )
+                    }) {
                     continue;
                 }
             }
@@ -2840,7 +2986,13 @@ impl Searcher {
                     let see_malo =
                         || crate::see::see(b, mv) < -23 * lmr_depth * lmr_depth;
                     if (hist_mala || see_malo())
-                        && !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv))
+                        && !*da_jaque.get_or_insert_with(|| {
+                        da_jaque_con_mascaras(
+                            b,
+                            mv,
+                            mascaras_nodo.get_or_insert_with(|| mascaras_jaque(b)),
+                        )
+                    })
                     {
                         continue;
                     }
@@ -2886,7 +3038,13 @@ impl Searcher {
                     see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth
                 }
             {
-                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                if !*da_jaque.get_or_insert_with(|| {
+                        da_jaque_con_mascaras(
+                            b,
+                            mv,
+                            mascaras_nodo.get_or_insert_with(|| mascaras_jaque(b)),
+                        )
+                    }) {
                     continue;
                 }
             }
@@ -4169,6 +4327,7 @@ mod regression_tests {
     /// para TODAS las jugadas legales de un arbol de posiciones elegidas por
     /// cubrir los casos que la funcion reconstruye a mano.
     fn jaque_coincide_con_verdad(b: &Board) {
+        let mascaras = mascaras_jaque(b);
         for mv in generate_legal(b) {
             let rapido = da_jaque_sin_copiar(b, &mv);
             // Verdad de fondo: tras la jugada, el bando que ahora mueve
@@ -4180,6 +4339,21 @@ mod regression_tests {
                 real,
                 "da_jaque_sin_copiar dijo {} para {} en {} (la verdad es {})",
                 rapido,
+                mv.to_uci(),
+                b.to_fen(),
+                real
+            );
+            // El filtro por mascaras del nodo tiene que dar EXACTAMENTE lo
+            // mismo: es una sobreaproximacion que descarta rapido y, cuando
+            // duda, delega en el camino exacto. Un solo falso negativo aca
+            // (una jugada que da jaque y la mascara descarta) cambiaria
+            // decisiones de poda en silencio.
+            let con_mascaras = da_jaque_con_mascaras(b, &mv, &mascaras);
+            assert_eq!(
+                con_mascaras,
+                real,
+                "da_jaque_con_mascaras dijo {} para {} en {} (la verdad es {})",
+                con_mascaras,
                 mv.to_uci(),
                 b.to_fen(),
                 real
