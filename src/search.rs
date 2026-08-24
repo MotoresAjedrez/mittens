@@ -215,6 +215,26 @@ fn q_fail_soft() -> bool {
     bandera_env(&CACHE, "MITTENS_QFAILSOFT", true)
 }
 
+/// Punto 2 (Kimi K3): re-busqueda MAS PROFUNDA tras un fail-high grande de LMR.
+#[inline]
+fn lmr_deeper() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    bandera_env(&CACHE, "MITTENS_LMR_DEEPER", true)
+}
+
+/// Margen base del "deeper re-search" de LMR (punto 2), ajustable con
+/// `MITTENS_LMR_DEEPER_MARGEN` para calibrarlo sin recompilar.
+fn lmr_deeper_margen() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_LMR_DEEPER_MARGEN")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v >= 0 && *v <= 600)
+            .unwrap_or(41)
+    })
+}
+
 // Tabla LMR precalculada: reduccion base en plies para cada par
 // (profundidad, numero de jugada en el orden). Formula logaritmica clasica
 // (Ethereal/Stockfish): crece suave con ambas -- las jugadas muy tardias a
@@ -3066,10 +3086,40 @@ impl Searcher {
                             if child_ply < MAX_KILLER_PLY {
                                 self.hindsight_reduction[child_ply] = 0;
                             }
+                            // "DEEPER RE-SEARCH" (punto 2 de Kimi K3, idea de
+                            // Stockfish: `doDeeperSearch = value > bestValue +
+                            // 41 + 2 * newDepth`).
+                            //
+                            // Antes toda re-busqueda iba a `depth - 1 + ext`,
+                            // sin importar por CUANTO habia fallado alto el
+                            // sondeo reducido. Pero la magnitud del fail-high
+                            // es informacion: si una jugada que reduje varios
+                            // plies igual devuelve un valor MUY por encima de
+                            // alfa, lo mas probable es que la reduccion tapo
+                            // algo tactico y la posicion merece un ply mas,
+                            // no solo el ply que le devuelvo al deshacer la
+                            // reduccion.
+                            //
+                            // Referencia = `alpha` (no `best_score`): alpha
+                            // solo sube, asi que es la cota conservadora --
+                            // con fail-soft `best_score` puede quedar muy por
+                            // debajo y disparar extensiones espurias.
+                            //
+                            // La profundidad se topea a `depth` para que el
+                            // hijo NUNCA quede mas profundo que el padre
+                            // (con `ext > 0` sin el tope daria depth+1).
+                            let prof_normal = depth - 1 + ext;
+                            let prof_re = if lmr_deeper()
+                                && sondeo > alpha + lmr_deeper_margen() + 2 * prof_normal
+                            {
+                                (prof_normal + 1).min(depth)
+                            } else {
+                                prof_normal
+                            };
                             self.negamax(
                                 &next,
                                 &next_eval,
-                                depth - 1 + ext,
+                                prof_re,
                                 -beta,
                                 -alpha,
                                 ply + 1,
