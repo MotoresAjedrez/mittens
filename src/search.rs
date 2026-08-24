@@ -302,6 +302,128 @@ fn capt_idx(pt: usize, to: usize, victima: usize) -> usize {
     (pt * 64 + to) * 6 + victima
 }
 
+// Counter moves: 6 tipos de pieza x 64 destinos de la jugada RIVAL previa.
+const COUNTER_SIZE: usize = 6 * 64;
+
+// ---------------------------------------------------------------------------
+// CARRIL POR COLOR EN LAS TABLAS DE HISTORIA
+//
+// EL DEFECTO. Todas las tablas de orden de Mittens estan indexadas SIN el
+// color del bando que mueve: `history[from][to]`, `cont_history[pieza_rival]
+// [destino_rival][pieza_propia][destino_propio]`, `capture_history[pieza]
+// [destino][victima]` y `counter_moves[pieza_rival][destino_rival]`. Blancas y
+// negras escriben y leen LAS MISMAS entradas. Dos ejemplos concretos de la
+// colision:
+//   - butterfly: "torre d1-d4" de las blancas y "torre d8-d4" de las negras no
+//     colisionan (from distinto), pero "dama e3-e4" de las blancas y "dama
+//     e3-e4" de las negras -- posiciones distintas de la partida, planes
+//     opuestos -- comparten `history[e3][e4]`.
+//   - continuation: `cont_history` se indexa por (jugada rival previa, jugada
+//     propia). En un nodo donde mueven las blancas la "jugada rival previa" es
+//     de las negras, y en el nodo siguiente es al reves. O sea que
+//     "negras Cf6, blancas responden X" y "blancas Cf6, negras responden X"
+//     comparten entrada: dos contextos opuestos promediados en un solo numero.
+//
+// POR QUE IMPORTA. Todos los motores de referencia separan por color:
+// Stockfish usa `ButterflyHistory = Stats<..., COLOR_NB, SQUARE_NB*SQUARE_NB>`
+// y su continuation history se indexa por PIECE (que ya incluye el color);
+// Ethereal, Berserk y Stormphrax hacen lo mismo. Mittens era el raro, igual
+// que lo era con el envejecimiento por jugada (ver `decaer_history`).
+//
+// COSTE. Se duplica el tamano de las cinco tablas (cont_history pasa de 590 KB
+// a 1,2 MB por tabla; el total por hilo sube ~2,4 MB) y el barrido de
+// `decaer_history` recorre el doble de entradas. A cambio, cada entrada
+// describe UN solo contexto.
+//
+// RIESGO CONOCIDO (por eso hay perilla). Separar por color reparte las mismas
+// escrituras entre el doble de entradas: cada entrada se calienta a la mitad
+// de velocidad. Con el envejecimiento historico (÷2 por jugada) eso podria
+// dejar las tablas aun mas frias de lo que ya estaban. Las dos palancas se
+// miden por separado y tambien juntas.
+// ---------------------------------------------------------------------------
+
+/// Valor por defecto de `MITTENS_HIST_COLOR`. 0 = comportamiento historico
+/// (un solo carril compartido por los dos bandos, bit a bit identico a main);
+/// 1 = un carril por color.
+const HIST_COLOR_DEFECTO: usize = 0;
+
+/// Lee la perilla del carril por color. Devuelve 0 o 1 y se usa como
+/// MULTIPLICADOR del color: `carril = hist_color * (turno as usize)`, de modo
+/// que con 0 todos los accesos caen en el carril 0 y la mitad alta de las
+/// tablas simplemente no se usa (mismo comportamiento exacto que antes).
+fn hist_color() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MITTENS_HIST_COLOR").as_deref() {
+        Ok("1") => 1,
+        Ok("0") => 0,
+        _ => HIST_COLOR_DEFECTO,
+    })
+}
+
+#[inline(always)]
+fn cont_idx_c(c: usize, prev_pt: usize, prev_to: usize, pt: usize, to: usize) -> usize {
+    c * CONT_HIST_SIZE + cont_idx(prev_pt, prev_to, pt, to)
+}
+
+#[inline(always)]
+fn capt_idx_c(c: usize, pt: usize, to: usize, victima: usize) -> usize {
+    c * CAPT_HIST_SIZE + capt_idx(pt, to, victima)
+}
+
+#[inline(always)]
+fn counter_idx_c(c: usize, prev_pt: usize, prev_to: usize) -> usize {
+    c * COUNTER_SIZE + prev_pt * 64 + prev_to
+}
+
+// ---------------------------------------------------------------------------
+// CONTINUATION HISTORY DE 4 PLIES
+//
+// Mittens tiene dos niveles de continuation history: 1 ply (la respuesta a la
+// jugada rival inmediata) y 2 plies (el follow-up de la jugada propia
+// anterior). Stockfish usa 1, 2, 3, 4 y 6; Reckless usa 1, 2, 4 y 6. El nivel
+// de 4 plies captura planes de dos jugadas completas ("despues de Ta1-d1 y
+// d4-d5, este avance de peon corta"), que ninguna de las dos tablas actuales
+// distingue del ruido.
+//
+// POR QUE SE VUELVE A PROBAR ALGO QUE YA SE HABIA DESCARTADO. Se probo en una
+// sesion anterior y se descarto porque el BENCH media peor el orden (90.41% ->
+// 89.60% de cortes en la primera jugada a d13), con esta observacion textual:
+// "consistente con que la tabla necesita calentarse (147k entradas, ~2
+// muestras por entrada en un bench)". Esa observacion es justamente el
+// problema del instrumento, no de la tecnica: el bench crea un `Searcher::new`
+// por posicion, o sea que la tabla arranca VACIA y no puede calentarse nunca.
+// En una partida real el mismo Searcher vive toda la partida (ver
+// `decaer_history`), y una tabla de 147k entradas tiene decenas de jugadas
+// para llenarse. El bench es exactamente el regimen donde un cuarto nivel de
+// continuation history se ve peor de lo que es. Aca se mide en el regimen de
+// partida (medir/orden_en_partida.py) y se decide con SPRT.
+//
+// LAS DOS TRAMPAS YA CONOCIDAS DE ESE INTENTO, respetadas aca:
+//  (a) NO entra en el `stat_score` de la poda por historia ni en el ajuste de
+//      LMR. Esos dos umbrales (`-4000*depth` y `/8000`) estan calibrados para
+//      una suma de TRES terminos; meterle un cuarto cambia una calibracion
+//      distinta de la del orden y en su momento disparo los nodos de 1.688.822
+//      a 2.501.397. Aca la tabla nueva se usa SOLO para ordenar.
+//  (b) El divisor de los quiets pasa de /16 a /21 cuando esta encendida. Con
+//      cuatro terminos de +-MAX_HIST la suma llega a +-65.536 y /16 la sacaria
+//      del carril de los quiets (+-4096) invadiendo el de los killers (-3000).
+//      Con /21 el rango vuelve a +-3120, practicamente el historico.
+// ---------------------------------------------------------------------------
+
+/// Valor por defecto de `MITTENS_CONTHIST4`. false = comportamiento historico
+/// (bit a bit identico a main: la tabla no se lee ni se escribe y el divisor
+/// de los quiets sigue siendo /16).
+const CONTHIST4_DEFECTO: bool = false;
+
+fn conthist4() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MITTENS_CONTHIST4").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => CONTHIST4_DEFECTO,
+    })
+}
+
 /// Tipo de pieza capturada por `mv`. En al paso la victima es un peon aunque
 /// no haya nada en la casilla destino -- mismo criterio que usa `see()`.
 #[inline]
@@ -461,7 +583,108 @@ fn decay_k(var: &str, defecto: u32) -> u32 {
 /// Ver `decaer_history` para el analisis y la medicion.
 fn decay_orden() -> u32 {
     static CACHE: OnceLock<u32> = OnceLock::new();
-    *CACHE.get_or_init(|| decay_k("MITTENS_DECAY_ORDEN", 1))
+    *CACHE.get_or_init(|| decay_k("MITTENS_DECAY_ORDEN", DECAY_ORDEN_DEFECTO))
+}
+
+/// Valor por defecto de `MITTENS_DECAY_ORDEN`. 1 = el /2 historico por
+/// jugada; 0 = no envejecer (lo que hacen Stockfish, Ethereal, Berserk y
+/// Stormphrax); k>=2 = envejecimiento mas suave. Ver `decaer_history`.
+const DECAY_ORDEN_DEFECTO: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// ORDEN DE LA RAIZ POR ESFUERZO DE LA ITERACION ANTERIOR
+//
+// EL DEFECTO. En cada iteracion de profundizacion la raiz REGENERA la lista de
+// jugadas y la reordena con `order_moves_ply`, o sea con las heuristicas
+// genericas del arbol (SEE, killers, history). De todo lo aprendido en la
+// iteracion anterior -- que costo casi todos los nodos de la busqueda -- solo
+// sobrevive UN dato: cual fue la mejor jugada (entra como `tt_move` y queda
+// primera). El ranking del resto se tira entero y se vuelve a adivinar.
+//
+// LA SENAL QUE SE ESTABA TIRANDO. En la raiz, con PVS, las jugadas que no son
+// la mejor se buscan con ventana nula. Una que se refuta al instante gasta
+// POCOS nodos; una que estuvo a punto de superar a alfa obliga a abrir medio
+// arbol y gasta MUCHOS. O sea que el conteo de nodos por jugada de raiz es un
+// ranking de "cuan cerca estuvo de ser la mejor", y el motor YA lo calcula
+// (`nodos_mv`, que se usa para el time management) -- solo que lo tiraba.
+//
+// QUE HACE ESTE CAMBIO. La iteracion d+1 ordena las jugadas de raiz por NODOS
+// DESCENDENTES de la iteracion d, dejando siempre primera a la mejor jugada
+// conocida. Si la mejor jugada se cae en la iteracion siguiente, la sustituta
+// mas probable se prueba ANTES en vez de despues: alfa sube antes y las
+// jugadas restantes se podan mas, y sobre todo se evitan las re-busquedas con
+// ventana completa (las mas caras del arbol) de todas las jugadas que estaban
+// delante de ella por casualidad heuristica.
+//
+// Es la version por esfuerzo del `sort` de root moves que hacen Stockfish
+// (por score de la iteracion previa) y Berserk/Weiss (por nodos). Se prefiere
+// el esfuerzo al score porque con PVS el score de una jugada que fallo bajo es
+// solo una COTA (<= alfa), igual para todas, mientras que los nodos
+// discriminan entre ellas.
+//
+// El orden de la raiz no cambia QUE jugada se elige a igualdad de busqueda
+// completa, solo cuanto cuesta encontrarla; pero como el reloj/los nodos son
+// finitos, cambia el arbol y por lo tanto necesita SPRT, no bench.
+// ---------------------------------------------------------------------------
+
+/// Valor por defecto de `MITTENS_ORDEN_RAIZ`. false = comportamiento
+/// historico (bit a bit identico a main).
+const ORDEN_RAIZ_DEFECTO: bool = false;
+
+/// Si la raiz reordena por esfuerzo de la iteracion anterior. Se lee una vez
+/// por proceso; se consulta una vez por iteracion de profundizacion, o sea
+/// que no esta en ningun camino caliente.
+fn orden_raiz_por_nodos() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MITTENS_ORDEN_RAIZ").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => ORDEN_RAIZ_DEFECTO,
+    })
+}
+
+/// Reordena las jugadas de la raiz por el esfuerzo (nodos) que costaron en la
+/// iteracion anterior, de mayor a menor, dejando primera a `mejor`.
+///
+/// Ordenacion ESTABLE por insercion (como `order_moves_ply`): las jugadas sin
+/// dato previo -- no puede haberlas salvo que cambie la lista legal, pero se
+/// contempla -- quedan al final conservando el orden heuristico que traian.
+fn reordenar_raiz_por_esfuerzo(
+    moves: &mut [Move],
+    mejor: Option<Move>,
+    nodos_prev: &[(Move, u64)],
+) {
+    let n = moves.len();
+    if n < 2 || nodos_prev.is_empty() {
+        return;
+    }
+    let mut claves: ArrayVec<u64, MAX_MOVES> = ArrayVec::new();
+    for mv in moves.iter() {
+        if Some(*mv) == mejor {
+            claves.push(0); // la mejor conocida siempre primera
+            continue;
+        }
+        let nodos = nodos_prev
+            .iter()
+            .find(|(m, _)| m == mv)
+            .map(|(_, k)| *k)
+            .unwrap_or(0);
+        // Clave creciente = mas adelante. Mas nodos => clave mas chica.
+        // El 1 de piso evita que la mejor jugada (clave 0) empate con nada.
+        claves.push(u64::MAX - nodos.min(u64::MAX - 1));
+    }
+    for i in 1..n {
+        let mv = moves[i];
+        let k = claves[i];
+        let mut j = i;
+        while j > 0 && claves[j - 1] > k {
+            moves[j] = moves[j - 1];
+            claves[j] = claves[j - 1];
+            j -= 1;
+        }
+        moves[j] = mv;
+        claves[j] = k;
+    }
 }
 
 /// Divisor de la amortiguacion de la eval por la regla de 50 jugadas
@@ -474,9 +697,13 @@ fn r50_div() -> i32 {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|d| *d == 0 || (100..=4096).contains(d))
-            .unwrap_or(0)
+            .unwrap_or(R50_DIV_DEFECTO)
     })
 }
+
+/// Valor por defecto de `MITTENS_R50_DIV`. 0 = apagado (comportamiento
+/// historico); 212 = el divisor de Stockfish. Ver `amortiguar_r50`.
+const R50_DIV_DEFECTO: i32 = 0;
 
 /// Exponente de envejecimiento de las tablas de CORRECTION HISTORY
 /// (corr_pawn, corr_nonpawn, corr_cont). Separado del de ordenamiento porque
@@ -852,7 +1079,11 @@ pub struct Searcher {
     // killers son validos solo dentro de esta busqueda (por ply del arbol
     // actual); history SI persiste entre jugadas de la partida, igual que la TT.
     killers: Vec<[Option<Move>; 2]>,
-    history: Box<[[i32; 64]; 64]>, // [from][to] -- arreglo plano, mas rapido que un HashMap aqui
+    // [carril de color][from][to] -- arreglo plano, mas rapido que un HashMap
+    // aqui. Ver el bloque "CARRIL POR COLOR EN LAS TABLAS DE HISTORIA": con
+    // `hist_color = 0` solo se usa el carril 0 y el comportamiento es el
+    // historico exacto.
+    history: [Box<[[i32; 64]; 64]>; 2],
     // Historial separado para jugadas cuya casilla DESTINO esta amenazada por
     // el rival en el momento de jugarlas (idea tomada de Quanticade Cronus,
     // top-10 CCRL: indexa su historial por amenazas en vez de una sola tabla
@@ -861,7 +1092,7 @@ pub struct Searcher {
     // difumina la señal. Se consulta ANTES de jugar el movimiento (con el
     // tablero todavia en la posicion actual), asi que refleja si la jugada
     // "camina hacia el peligro", no si termino resultando bien o mal.
-    history_amenaza: Box<[[i32; 64]; 64]>,
+    history_amenaza: [Box<[[i32; 64]; 64]>; 2],
     // Continuation history ("counter-move history"): a diferencia de history
     // (que solo sabe "esta jugada [from][to] corto mucho, en general"), esta
     // tabla sabe "esta jugada [pieza][to] corto mucho DESPUES de que el
@@ -876,6 +1107,17 @@ pub struct Searcher {
     // jugada rival inmediata -- captura patrones de plan (p.ej. "despues de
     // avanzar este peon, esta jugada de caballo corta mucho").
     cont_history_2: Vec<i32>,
+    // Continuation history de 4 plies: igual que cont_history_2 pero mirando
+    // la jugada PROPIA de 4 plies atras -- planes de dos jugadas completas.
+    // Ver el bloque "CONTINUATION HISTORY DE 4 PLIES". Solo se toca con
+    // `conthist4` encendido.
+    cont_history_4: Vec<i32>,
+    // Jugada (tipo de pieza, destino) que llevo a cada ply del arbol:
+    // `pila_prev[p]` es la jugada hecha en el ply p-1, o sea el `prev` con el
+    // que se entro a negamax en el ply p. La escribe negamax al entrar y
+    // permite mirar N plies atras sin agregar parametros a ninguna firma
+    // (ver `jugada_hace_n_plies`).
+    pila_prev: Vec<Option<(usize, usize)>>,
     // Capture history: historial analogo al de las quiets pero para capturas,
     // indexado [pieza_que_mueve][destino][victima]. Solo se usa como DESEMPATE
     // dentro del carril que ya define el SEE (ver clave_orden_movimiento).
@@ -950,6 +1192,12 @@ pub struct Searcher {
     // Copia local de `hist_modo()`: se lee UNA vez al construir el Searcher
     // para no pagar el atomic load del OnceLock dentro del bucle de jugadas.
     hist_modo: u8,
+    /// Multiplicador del carril por color de las tablas de historia (0 o 1).
+    /// Ver el bloque "CARRIL POR COLOR EN LAS TABLAS DE HISTORIA".
+    hist_color: usize,
+    /// Si el cuarto nivel de continuation history (4 plies) esta activo.
+    /// Ver el bloque "CONTINUATION HISTORY DE 4 PLIES".
+    conthist4: bool,
     malus_cont: bool,
     // Idem para los dos topes del capture history en el orden (ver
     // tope_capthist_orden / tope_capthist_mala): leerlos del OnceLock dentro
@@ -1051,12 +1299,16 @@ impl Searcher {
             stop: false,
             tt_generation: 0,
             killers: vec![[None, None]; MAX_KILLER_PLY],
-            history: Box::new([[0i32; 64]; 64]),
-            history_amenaza: Box::new([[0i32; 64]; 64]),
-            cont_history: vec![0i32; CONT_HIST_SIZE],
-            cont_history_2: vec![0i32; CONT_HIST_SIZE],
-            capture_history: vec![0i32; CAPT_HIST_SIZE],
-            counter_moves: vec![None; 6 * 64],
+            history: [Box::new([[0i32; 64]; 64]), Box::new([[0i32; 64]; 64])],
+            history_amenaza: [Box::new([[0i32; 64]; 64]), Box::new([[0i32; 64]; 64])],
+            cont_history: vec![0i32; 2 * CONT_HIST_SIZE],
+            cont_history_2: vec![0i32; 2 * CONT_HIST_SIZE],
+            // Solo se reserva si la tecnica esta encendida: son 1,2 MB por
+            // hilo que no tiene sentido pagar en el camino por defecto.
+            cont_history_4: if conthist4() { vec![0i32; 2 * CONT_HIST_SIZE] } else { Vec::new() },
+            pila_prev: vec![None; MAX_KILLER_PLY],
+            capture_history: vec![0i32; 2 * CAPT_HIST_SIZE],
+            counter_moves: vec![None; 2 * COUNTER_SIZE],
             // Activado por defecto: el torneo h2h de esta sesion confirmo
             // +80 ELO (61.3% en 40 partidas) con la reescritura PVS -- ver
             // resultados_lmr_h2h.txt en ~/mi-motor. MITTENS_LMR=0 lo desactiva
@@ -1077,6 +1329,8 @@ impl Searcher {
             cortes_beta: 0,
             cortes_primera: 0,
             hist_modo: hist_modo(),
+            hist_color: hist_color(),
+            conthist4: conthist4(),
             malus_cont: malus_cont_activo(),
             capthist_tope: tope_capthist_orden(),
             capthist_tope_mala: tope_capthist_mala(),
@@ -1108,6 +1362,7 @@ impl Searcher {
             history_amenaza: self.history_amenaza,
             cont_history: self.cont_history,
             cont_history_2: self.cont_history_2,
+            cont_history_4: self.cont_history_4,
             capture_history: self.capture_history,
             counter_moves: self.counter_moves,
             corr_pawn: self.corr_pawn,
@@ -1127,6 +1382,7 @@ impl Searcher {
         };
         let compatible = t.cont_history.len() == self.cont_history.len()
             && t.cont_history_2.len() == self.cont_history_2.len()
+            && t.cont_history_4.len() == self.cont_history_4.len()
             && t.capture_history.len() == self.capture_history.len()
             && t.counter_moves.len() == self.counter_moves.len()
             && t.corr_pawn.len() == self.corr_pawn.len()
@@ -1140,6 +1396,7 @@ impl Searcher {
         self.history_amenaza = t.history_amenaza;
         self.cont_history = t.cont_history;
         self.cont_history_2 = t.cont_history_2;
+        self.cont_history_4 = t.cont_history_4;
         self.capture_history = t.capture_history;
         self.counter_moves = t.counter_moves;
         self.corr_pawn = t.corr_pawn;
@@ -1161,12 +1418,16 @@ impl Searcher {
             nodes_limit: None,
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
-            history: Box::new([[0i32; 64]; 64]),
-            history_amenaza: Box::new([[0i32; 64]; 64]),
-            cont_history: vec![0i32; CONT_HIST_SIZE],
-            cont_history_2: vec![0i32; CONT_HIST_SIZE],
-            capture_history: vec![0i32; CAPT_HIST_SIZE],
-            counter_moves: vec![None; 6 * 64],
+            history: [Box::new([[0i32; 64]; 64]), Box::new([[0i32; 64]; 64])],
+            history_amenaza: [Box::new([[0i32; 64]; 64]), Box::new([[0i32; 64]; 64])],
+            cont_history: vec![0i32; 2 * CONT_HIST_SIZE],
+            cont_history_2: vec![0i32; 2 * CONT_HIST_SIZE],
+            // Solo se reserva si la tecnica esta encendida: son 1,2 MB por
+            // hilo que no tiene sentido pagar en el camino por defecto.
+            cont_history_4: if conthist4() { vec![0i32; 2 * CONT_HIST_SIZE] } else { Vec::new() },
+            pila_prev: vec![None; MAX_KILLER_PLY],
+            capture_history: vec![0i32; 2 * CAPT_HIST_SIZE],
+            counter_moves: vec![None; 2 * COUNTER_SIZE],
             tt_generation: 0,
             modo_lmr,
             modo_aspiration: std::env::var("MITTENS_NO_ASPIRATION").as_deref() != Ok("1"),
@@ -1184,6 +1445,8 @@ impl Searcher {
             cortes_beta: 0,
             cortes_primera: 0,
             hist_modo: hist_modo(),
+            hist_color: hist_color(),
+            conthist4: conthist4(),
             malus_cont: malus_cont_activo(),
             capthist_tope: tope_capthist_orden(),
             capthist_tope_mala: tope_capthist_mala(),
@@ -1487,20 +1750,29 @@ impl Searcher {
     fn decaer_history(&mut self) {
         let k_orden = self.decay_orden;
         if k_orden != 0 {
-            for fila in self.history.iter_mut() {
-                for v in fila.iter_mut() {
-                    decaer_valor(v, k_orden);
+            for carril in self.history.iter_mut() {
+                for fila in carril.iter_mut() {
+                    for v in fila.iter_mut() {
+                        decaer_valor(v, k_orden);
+                    }
                 }
             }
-            for fila in self.history_amenaza.iter_mut() {
-                for v in fila.iter_mut() {
-                    decaer_valor(v, k_orden);
+            for carril in self.history_amenaza.iter_mut() {
+                for fila in carril.iter_mut() {
+                    for v in fila.iter_mut() {
+                        decaer_valor(v, k_orden);
+                    }
                 }
             }
             for v in self.cont_history.iter_mut() {
                 decaer_valor(v, k_orden);
             }
             for v in self.cont_history_2.iter_mut() {
+                decaer_valor(v, k_orden);
+            }
+            // Vacia (largo 0) cuando conthist4 esta apagada: el bucle no
+            // cuesta nada en el camino por defecto.
+            for v in self.cont_history_4.iter_mut() {
                 decaer_valor(v, k_orden);
             }
             for v in self.capture_history.iter_mut() {
@@ -1600,11 +1872,17 @@ impl Searcher {
         prev2: Option<(usize, usize)>,
         pt_mv: usize,
     ) {
+        let c = self.hc(b);
         if mv.is_capture() {
             // Las capturas tienen su propia tabla: el orden grueso lo sigue
             // dando SEE, esto solo afina entre capturas de valor parecido.
             hist_update(
-                &mut self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, &mv))],
+                &mut self.capture_history[capt_idx_c(
+                    c,
+                    pt_mv,
+                    mv.to as usize,
+                    victima_de(b, &mv),
+                )],
                 hist_bonus(depth),
             );
             return; // no tocan killers/history/counter/cont (son para quiets)
@@ -1619,20 +1897,28 @@ impl Searcher {
         }
         if casilla_amenazada(b, mv.to) {
             hist_update(
-                &mut self.history_amenaza[mv.from as usize][mv.to as usize],
+                &mut self.history_amenaza[c][mv.from as usize][mv.to as usize],
                 hist_bonus(depth),
             );
         } else {
-            hist_update(&mut self.history[mv.from as usize][mv.to as usize], hist_bonus(depth));
+            hist_update(&mut self.history[c][mv.from as usize][mv.to as usize], hist_bonus(depth));
         }
         if let Some((prev_pt, prev_to)) = prev {
-            let idx = cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize);
+            let idx = cont_idx_c(c, prev_pt, prev_to, pt_mv, mv.to as usize);
             hist_update(&mut self.cont_history[idx], hist_bonus(depth));
-            self.counter_moves[prev_pt * 64 + prev_to] = Some(mv);
+            self.counter_moves[counter_idx_c(c, prev_pt, prev_to)] = Some(mv);
         }
         if let Some((p2_pt, p2_to)) = prev2 {
-            let idx = cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize);
+            let idx = cont_idx_c(c, p2_pt, p2_to, pt_mv, mv.to as usize);
             hist_update(&mut self.cont_history_2[idx], hist_bonus(depth));
+        }
+        // Cuarto nivel (4 plies). Misma guarda que en la lectura: solo con
+        // `prev` conocido, o sea solo desde nodos de negamax.
+        if self.conthist4 && prev.is_some() {
+            if let Some((p4_pt, p4_to)) = self.jugada_hace_n_plies(ply, 4) {
+                let idx = cont_idx_c(c, p4_pt, p4_to, pt_mv, mv.to as usize);
+                hist_update(&mut self.cont_history_4[idx], hist_bonus(depth));
+            }
         }
     }
 
@@ -1855,12 +2141,41 @@ impl Searcher {
     /// (escritura de bonus, escritura de malus, orden y LMR/poda) lean y
     /// escriban SIEMPRE la misma casilla.
     #[inline]
-    fn hist_quiet(&self, mapa: u64, from: usize, to: usize) -> i32 {
+    fn hist_quiet(&self, c: usize, mapa: u64, from: usize, to: usize) -> i32 {
         if crate::bitboard::bit(to as crate::types::Square) & mapa != 0 {
-            self.history_amenaza[from][to]
+            self.history_amenaza[c][from][to]
         } else {
-            self.history[from][to]
+            self.history[c][from][to]
         }
+    }
+
+    /// Carril de las tablas de historia para el bando que mueve en `b`.
+    /// Con `hist_color = 0` devuelve siempre 0 (comportamiento historico:
+    /// blancas y negras comparten tabla). Ver el bloque "CARRIL POR COLOR EN
+    /// LAS TABLAS DE HISTORIA".
+    #[inline(always)]
+    fn hc(&self, b: &Board) -> usize {
+        self.hist_color * (b.turn as usize)
+    }
+
+    /// Jugada (tipo de pieza, destino) hecha `n` plies antes del ply `ply`.
+    ///
+    /// `pila_prev[p]` guarda la jugada hecha en el ply p-1 (el `prev` con el
+    /// que negamax entro al ply p), asi que la de hace `n` plies esta en
+    /// `pila_prev[ply - n + 1]`: con n=1 da el `prev` del nodo y con n=2 el
+    /// `prev2`, que es como se verifica en el test. Devuelve None si todavia
+    /// no hay tantos plies de camino.
+    ///
+    /// Solo la escribe negamax, asi que solo se debe consultar desde nodos de
+    /// negamax (en quiescence las ranuras por encima del ply de entrada son
+    /// de un camino viejo). Ver su unico uso en `clave_orden_movimiento`,
+    /// guardado por `prev.is_some()`.
+    #[inline]
+    fn jugada_hace_n_plies(&self, ply: u32, n: u32) -> Option<(usize, usize)> {
+        if ply < n {
+            return None;
+        }
+        self.pila_prev.get((ply - n + 1) as usize).copied().flatten()
     }
 
     /// Termino `h` de la historia mariposa tal como lo consumen la poda por
@@ -1879,19 +2194,20 @@ impl Searcher {
     ) -> i32 {
         let from = mv.from as usize;
         let to = mv.to as usize;
+        let c = self.hc(b);
         if self.hist_modo == 4 {
             // Las DOS tablas suman toda la evidencia acumulada sobre esta
             // jugada (la del contexto "destino amenazado" y la del otro),
             // no solo la mitad que caia en `history`. El /2 mantiene el
             // rango de `2*h` en +-32768, exactamente el historico.
             // No necesita el mapa de amenazas: cero costo extra por jugada.
-            return (self.history[from][to] + self.history_amenaza[from][to]) / 2;
+            return (self.history[c][from][to] + self.history_amenaza[c][from][to]) / 2;
         }
         if coherente {
             let mapa = *mapa_amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
-            return self.hist_quiet(mapa, from, to);
+            return self.hist_quiet(c, mapa, from, to);
         }
-        self.history[from][to]
+        self.history[c][from][to]
     }
 
     #[inline]
@@ -1913,6 +2229,7 @@ impl Searcher {
         if Some(*mv) == tt_move {
             return -1_000_000;
         }
+        let c = self.hc(b);
         if mv.is_capture() {
             let see = see_precalculado.unwrap_or_else(|| crate::see::see(b, mv));
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
@@ -1923,7 +2240,7 @@ impl Searcher {
             // solo reordena capturas de valor CASI IGUAL: nunca saca a una
             // captura de su carril.
             let ch_crudo =
-                self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))];
+                self.capture_history[capt_idx_c(c, pt_mv, mv.to as usize, victima_de(b, mv))];
             if see >= 0 {
                 let tope = self.capthist_tope;
                 return -(10_000 + see * 8 + ch_crudo.clamp(-tope, tope));
@@ -1948,34 +2265,52 @@ impl Searcher {
         // jugada rival que llevo a esta posicion -- se prueba justo despues
         // de los killers, antes de caer al history/continuation general.
         if let Some((prev_pt, prev_to)) = prev {
-            if self.counter_moves[prev_pt * 64 + prev_to] == Some(*mv) {
+            if self.counter_moves[counter_idx_c(c, prev_pt, prev_to)] == Some(*mv) {
                 return -2800;
             }
         }
         let mapa = *amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
         // Mismo criterio exacto que antes, ahora factorizado en `hist_quiet`
         // para que LMR y la poda por historia lean lo MISMO (ver su doc).
-        let h = self.hist_quiet(mapa, mv.from as usize, mv.to as usize);
+        let h = self.hist_quiet(c, mapa, mv.from as usize, mv.to as usize);
         let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
         let ch = match prev {
             Some((prev_pt, prev_to)) => {
-                self.cont_history[cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize)]
+                self.cont_history[cont_idx_c(c, prev_pt, prev_to, pt_mv, mv.to as usize)]
             }
             None => 0,
         };
         let ch2 = match prev2 {
             Some((p2_pt, p2_to)) => {
-                self.cont_history_2[cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize)]
+                self.cont_history_2[cont_idx_c(c, p2_pt, p2_to, pt_mv, mv.to as usize)]
             }
             None => 0,
+        };
+        // Cuarto nivel de continuation history (4 plies atras). Solo en
+        // nodos de negamax: `prev.is_some()` descarta la raiz y las
+        // evasiones de quiescence, que son los dos sitios donde la pila por
+        // ply no corresponde al camino actual. Ver el bloque "CONTINUATION
+        // HISTORY DE 4 PLIES".
+        let ch4 = if self.conthist4 && prev.is_some() {
+            match self.jugada_hace_n_plies(ply, 4) {
+                Some((p4_pt, p4_to)) => {
+                    self.cont_history_4[cont_idx_c(c, p4_pt, p4_to, pt_mv, mv.to as usize)]
+                }
+                None => 0,
+            }
+        } else {
+            0
         };
         // Escalado /16: con el fix de escala de hist_bonus las tablas ahora
         // se mueven de verdad en el rango +-16384, y la suma cruda (hasta
         // +-49k) invadiria los carriles de capturas buenas (-10k..-17k) y
         // killers (-3000). Dividida por 16 queda acotada a ~+-3072, ordenando
         // los quiets entre si con buena granularidad sin sacar a ninguno de
-        // su carril salvo casos extremos.
-        -((h + ch + ch2) / 16)
+        // su carril salvo casos extremos. Con un CUARTO termino la suma llega
+        // a +-65.536 y hace falta /21 para que el rango vuelva a ~+-3120
+        // (trampa (b) del bloque "CONTINUATION HISTORY DE 4 PLIES").
+        let div = if self.conthist4 { 21 } else { 16 };
+        -((h + ch + ch2 + ch4) / div)
     }
 
     /// Igual que order_moves pero ademas usa killers/history (por ply) para
@@ -2323,6 +2658,16 @@ impl Searcher {
         en_sondeo_se: bool,
     ) -> Result<i32, TimeUp> {
         self.check_time()?;
+
+        // Pila de jugadas por ply, para poder mirar 4 plies atras sin pasar
+        // un parametro mas por toda la recursion (ver `jugada_hace_n_plies`).
+        // Solo se escribe con conthist4 encendida: en el camino por defecto
+        // este bloque no existe (la rama es una constante del proceso).
+        if self.conthist4 {
+            if let Some(r) = self.pila_prev.get_mut(ply as usize) {
+                *r = prev;
+            }
+        }
 
         if b.halfmove_clock >= 100 {
             return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
@@ -3178,15 +3523,16 @@ impl Searcher {
                         &mut mapa_amenazas,
                         matches!(self.hist_modo, 1 | 2),
                     );
+                    let c = self.hc(b);
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
-                            self.cont_history[cont_idx(p_pt, p_to, pt_q, mv.to as usize)]
+                            self.cont_history[cont_idx_c(c, p_pt, p_to, pt_q, mv.to as usize)]
                         }
                         None => 0,
                     };
                     let ch2 = match prev2 {
                         Some((p2_pt, p2_to)) => {
-                            self.cont_history_2[cont_idx(p2_pt, p2_to, pt_q, mv.to as usize)]
+                            self.cont_history_2[cont_idx_c(c, p2_pt, p2_to, pt_q, mv.to as usize)]
                         }
                         None => 0,
                     };
@@ -3349,15 +3695,16 @@ impl Searcher {
                         &mut mapa_amenazas,
                         matches!(self.hist_modo, 1 | 3),
                     );
+                    let c = self.hc(b);
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
-                            self.cont_history[cont_idx(p_pt, p_to, pt_mv, mv.to as usize)]
+                            self.cont_history[cont_idx_c(c, p_pt, p_to, pt_mv, mv.to as usize)]
                         }
                         None => 0,
                     };
                     let ch2 = match prev2 {
                         Some((p2_pt, p2_to)) => {
-                            self.cont_history_2[cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize)]
+                            self.cont_history_2[cont_idx_c(c, p2_pt, p2_to, pt_mv, mv.to as usize)]
                         }
                         None => 0,
                     };
@@ -3548,11 +3895,12 @@ impl Searcher {
                     } else {
                         None
                     };
+                    let c = self.hc(b);
                     for &(cp, ct, cv) in &capts_buscadas[..n_capts_buscadas] {
                         if Some((cp, ct, cv)) != cortante {
                             hist_update(
                                 &mut self.capture_history
-                                    [capt_idx(cp as usize, ct as usize, cv as usize)],
+                                    [capt_idx_c(c, cp as usize, ct as usize, cv as usize)],
                                 -malus,
                             );
                         }
@@ -3561,15 +3909,23 @@ impl Searcher {
                 if !mv.is_capture() && mv.promotion.is_none() {
                     let malus = hist_bonus(depth);
                     let malus_cont = self.malus_cont;
+                    let c = self.hc(b);
+                    // Se resuelve una vez por nodo (es propiedad del ply, no
+                    // de cada quiet). None con conthist4 apagada o sin `prev`.
+                    let prev4_malus = if self.conthist4 && prev.is_some() {
+                        self.jugada_hace_n_plies(ply, 4)
+                    } else {
+                        None
+                    };
                     for &(qf, qt, qpt, amenazada) in &quiets_buscados[..n_quiets_buscados] {
                         if (qf, qt) != (mv.from, mv.to) {
                             if amenazada {
                                 hist_update(
-                                    &mut self.history_amenaza[qf as usize][qt as usize],
+                                    &mut self.history_amenaza[c][qf as usize][qt as usize],
                                     -malus,
                                 );
                             } else {
-                                hist_update(&mut self.history[qf as usize][qt as usize], -malus);
+                                hist_update(&mut self.history[c][qf as usize][qt as usize], -malus);
                             }
                             // MALUS DE CONTINUATION HISTORY.
                             //
@@ -3603,7 +3959,8 @@ impl Searcher {
                             // update_continuation_histories de Stockfish.
                             if malus_cont {
                                 if let Some((prev_pt, prev_to)) = prev {
-                                    let idx = cont_idx(
+                                    let idx = cont_idx_c(
+                                        c,
                                         prev_pt,
                                         prev_to,
                                         qpt as usize,
@@ -3612,13 +3969,24 @@ impl Searcher {
                                     hist_update(&mut self.cont_history[idx], -malus);
                                 }
                                 if let Some((p2_pt, p2_to)) = prev2 {
-                                    let idx = cont_idx(
+                                    let idx = cont_idx_c(
+                                        c,
                                         p2_pt,
                                         p2_to,
                                         qpt as usize,
                                         qt as usize,
                                     );
                                     hist_update(&mut self.cont_history_2[idx], -malus);
+                                }
+                                if let Some((p4_pt, p4_to)) = prev4_malus {
+                                    let idx = cont_idx_c(
+                                        c,
+                                        p4_pt,
+                                        p4_to,
+                                        qpt as usize,
+                                        qt as usize,
+                                    );
+                                    hist_update(&mut self.cont_history_4[idx], -malus);
                                 }
                             }
                         }
@@ -3983,6 +4351,13 @@ impl Searcher {
         let mut inestabilidad: i32 = 0;
         let mut caida_score: i32 = 0;
         let mut esfuerzo_mejor: i32 = 0;
+        // Nodos que costo cada jugada de raiz en la ULTIMA iteracion
+        // completada, para ordenar la siguiente (ver el bloque "ORDEN DE LA
+        // RAIZ POR ESFUERZO DE LA ITERACION ANTERIOR"). Vacio => todavia no
+        // hay dato (primera iteracion) y manda el orden heuristico de
+        // siempre.
+        let orden_raiz = orden_raiz_por_nodos();
+        let mut nodos_prev: Vec<(Move, u64)> = Vec::new();
 
         for d in 1..=max_depth {
             // Escalonamiento Lazy SMP (ver `salto_smp`): los hilos ayudantes
@@ -4011,6 +4386,9 @@ impl Searcher {
                 break;
             }
             self.order_moves_ply(b, &mut moves, mejor_mv, 0, None, None);
+            if orden_raiz {
+                reordenar_raiz_por_esfuerzo(&mut moves, mejor_mv, &nodos_prev);
+            }
 
             // Aspiration windows: a partir de la 2da profundidad ya hay un
             // puntaje de referencia (el de la iteracion anterior), asi que en
@@ -4039,8 +4417,14 @@ impl Searcher {
             let mut nodos_iter: u64;
             let mut timed_out = false;
             let mut ancho = VENTANA_INICIAL;
+            // Esfuerzo por jugada de ESTA iteracion. Se vacia en cada intento
+            // de la ventana de aspiracion: si el intento falla alto/bajo y se
+            // reintenta mas ancho, los nodos que valen son los del intento
+            // que termino sirviendo, no los del descartado.
+            let mut nodos_actual: Vec<(Move, u64)> = Vec::new();
 
             loop {
+                nodos_actual.clear();
                 let mut alpha = vent_alpha;
                 actual_mv = moves[0];
                 actual_sc = -INFINITO;
@@ -4106,6 +4490,9 @@ impl Searcher {
                     self.salir_hijo(&next_eval, b, &next);
                     let nodos_mv = self.nodes.saturating_sub(nodos_antes);
                     nodos_iter = nodos_iter.saturating_add(nodos_mv);
+                    if orden_raiz {
+                        nodos_actual.push((*mv, nodos_mv));
+                    }
                     if sc > actual_sc {
                         actual_sc = sc;
                         actual_mv = *mv;
@@ -4158,6 +4545,15 @@ impl Searcher {
             }
             if timed_out {
                 break;
+            }
+            // Iteracion completa y confiable: su esfuerzo por jugada pasa a
+            // ser el orden de la siguiente. Si el intento que sirvio corto
+            // por fail-high contra la ventana (`break` del bucle de jugadas),
+            // la lista queda PARCIAL a proposito: las jugadas que no se
+            // llegaron a buscar no tienen dato y caen al final, que es
+            // exactamente donde las dejo el intento anterior.
+            if orden_raiz {
+                nodos_prev = std::mem::take(&mut nodos_actual);
             }
             if mv_al_entrar == Some(actual_mv) {
                 pv_estable += 1;
@@ -4311,10 +4707,11 @@ pub struct ResultadoHilo {
 /// caso el ordenamiento de jugadas arranca con estadisticas de la jugada
 /// anterior, que es exactamente el objetivo.
 pub struct TablasPersistentes {
-    history: Box<[[i32; 64]; 64]>,
-    history_amenaza: Box<[[i32; 64]; 64]>,
+    history: [Box<[[i32; 64]; 64]>; 2],
+    history_amenaza: [Box<[[i32; 64]; 64]>; 2],
     cont_history: Vec<i32>,
     cont_history_2: Vec<i32>,
+    cont_history_4: Vec<i32>,
     capture_history: Vec<i32>,
     counter_moves: Vec<Option<Move>>,
     corr_pawn: Vec<i32>,
@@ -4387,6 +4784,7 @@ impl PoolMemoriaSMP {
             .map(|t| {
                 t.history
                     .iter()
+                    .flat_map(|carril| carril.iter())
                     .flat_map(|f| f.iter())
                     .map(|v| (*v as i64).abs())
                     .sum::<i64>()
@@ -5103,24 +5501,96 @@ mod regression_tests {
     #[test]
     fn memoria_de_hilo_va_y_vuelve_intacta() {
         let mut origen = Searcher::new(1);
-        origen.history[12][34] = 4321;
+        // Los DOS carriles de color viajan (ver "CARRIL POR COLOR EN LAS
+        // TABLAS DE HISTORIA"): si el round-trip perdiera el carril 1, con
+        // `hist_color = 1` las negras arrancarian cada jugada sin memoria.
+        origen.history[0][12][34] = 4321;
+        origen.history[1][12][34] = -4321;
         origen.cont_history[7] = -99;
+        origen.cont_history[CONT_HIST_SIZE + 7] = 55;
         let memoria = origen.extraer_memoria();
 
         let mut destino = Searcher::new(1);
-        assert_eq!(destino.history[12][34], 0, "arranca en cero");
+        assert_eq!(destino.history[0][12][34], 0, "arranca en cero");
+        assert_eq!(destino.history[1][12][34], 0, "arranca en cero");
         destino.instalar_memoria(memoria);
-        assert_eq!(destino.history[12][34], 4321);
+        assert_eq!(destino.history[0][12][34], 4321);
+        assert_eq!(destino.history[1][12][34], -4321);
         assert_eq!(destino.cont_history[7], -99);
+        assert_eq!(destino.cont_history[CONT_HIST_SIZE + 7], 55);
 
         // Una memoria vacia (primera jugada / recien limpiada) no toca nada.
         let mut virgen = Searcher::new(1);
-        virgen.history[12][34] = 7;
+        virgen.history[0][12][34] = 7;
         virgen.instalar_memoria(MemoriaHilo::default());
         assert_eq!(
-            virgen.history[12][34], 7,
+            virgen.history[0][12][34], 7,
             "instalar una memoria vacia no debe borrar lo que ya habia"
         );
+    }
+
+    /// Con `MITTENS_HIST_COLOR=0` (el defecto historico) los dos bandos deben
+    /// caer en el MISMO carril, y con 1 en carriles distintos. Es la
+    /// propiedad de la que depende que el binario por defecto sea bit a bit
+    /// identico a main.
+    #[test]
+    fn carril_de_color_respeta_la_perilla() {
+        use crate::types::Color;
+        let blancas = Board::from_fen(crate::STARTPOS).unwrap();
+        let negras = Board::from_fen(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
+        )
+        .unwrap();
+        assert_eq!(blancas.turn, Color::White);
+        assert_eq!(negras.turn, Color::Black);
+
+        let mut s = Searcher::new(1);
+        s.hist_color = 0;
+        assert_eq!(s.hc(&blancas), 0);
+        assert_eq!(s.hc(&negras), 0, "con la perilla apagada todo va al carril 0");
+        s.hist_color = 1;
+        assert_eq!(s.hc(&blancas), 0);
+        assert_eq!(s.hc(&negras), 1, "con la perilla encendida cada color tiene carril");
+
+        // Y los indices derivados no se pisan entre carriles.
+        assert_eq!(cont_idx_c(0, 1, 2, 3, 4), cont_idx(1, 2, 3, 4));
+        assert_eq!(cont_idx_c(1, 1, 2, 3, 4), CONT_HIST_SIZE + cont_idx(1, 2, 3, 4));
+        assert_eq!(capt_idx_c(1, 1, 2, 3), CAPT_HIST_SIZE + capt_idx(1, 2, 3));
+        assert_eq!(counter_idx_c(1, 1, 2), COUNTER_SIZE + 1 * 64 + 2);
+    }
+
+    /// El reordenamiento de la raiz por esfuerzo debe (a) dejar SIEMPRE
+    /// primera a la mejor jugada conocida, aunque no sea la que mas nodos
+    /// costo, (b) ordenar el resto por nodos DESCENDENTES, (c) mandar al
+    /// final las jugadas sin dato previo conservando su orden relativo, y
+    /// (d) no hacer nada si todavia no hay datos de la iteracion anterior.
+    #[test]
+    fn raiz_se_ordena_por_esfuerzo_previo() {
+        let m = |from: u8, to: u8| Move {
+            from,
+            to,
+            promotion: None,
+            flag: MoveFlag::Quiet,
+        };
+        let (a, b, c, d, e) = (m(0, 1), m(0, 2), m(0, 3), m(0, 4), m(0, 5));
+
+        // (a)(b)(c): `c` es la mejor aunque `b` costo mas nodos; `e` no tiene
+        // dato y queda ultima.
+        let mut moves = vec![a, b, c, d, e];
+        let nodos_prev = [(a, 10u64), (b, 5000), (c, 900), (d, 100)];
+        reordenar_raiz_por_esfuerzo(&mut moves, Some(c), &nodos_prev);
+        assert_eq!(moves, vec![c, b, d, a, e]);
+
+        // (d): sin datos previos la lista no se toca (primera iteracion).
+        let mut intacta = vec![a, b, c, d, e];
+        reordenar_raiz_por_esfuerzo(&mut intacta, Some(c), &[]);
+        assert_eq!(intacta, vec![a, b, c, d, e]);
+
+        // Estabilidad: dos jugadas con el mismo esfuerzo conservan el orden
+        // relativo que traian del ordenamiento heuristico.
+        let mut empate = vec![a, b, d];
+        reordenar_raiz_por_esfuerzo(&mut empate, None, &[(a, 7), (b, 7), (d, 7)]);
+        assert_eq!(empate, vec![a, b, d]);
     }
 }
 

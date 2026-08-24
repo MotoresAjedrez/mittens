@@ -2041,6 +2041,25 @@ pub fn uci_loop() {
                                 );
                                 io::stdout().flush().ok();
                             });
+                        // Calidad del ORDEN de jugadas en el regimen de
+                        // PARTIDA (ver medir/orden_en_partida.py). El bench ya
+                        // imprime "Orden (1ra)", pero arranca un Searcher
+                        // nuevo por posicion y no envejece las tablas, o sea
+                        // que mide un regimen que no se juega (ver
+                        // `decaer_history`). Estos contadores son ACUMULADOS
+                        // del Searcher, que vive toda la partida y se tira en
+                        // "ucinewgame": la ultima linea de cada partida es el
+                        // total de esa partida. Solo se imprime con
+                        // MITTENS_ORDEN_INFO=1, y es un `info string` (los
+                        // GUIs y python-chess lo ignoran), asi que no toca el
+                        // juego ni el arbol.
+                        if std::env::var("MITTENS_ORDEN_INFO").as_deref() == Ok("1") {
+                            println!(
+                                "info string orden primera {} beta {}",
+                                s.cortes_primera, s.cortes_beta
+                            );
+                            io::stdout().flush().ok();
+                        }
                         println!(
                             "bestmove {}",
                             mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
