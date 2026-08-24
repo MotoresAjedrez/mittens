@@ -13,7 +13,6 @@ from __future__ import annotations
 import datetime
 import atexit
 import hashlib
-import io
 import json
 import pathlib
 import signal
@@ -47,31 +46,36 @@ ROOT_WEIGHTS = ROOT / "pesos_amenazas_prueba.bin"
 MAX_PLIES = 300
 EXPECTED_BASE_SHA256 = "205a580cd480eda70c0090e76f10aff36ca79fffcb5d388e546ebf4a7ed349b8"
 
-# Veinte aperturas cortas y equilibradas. Cada una se juega dos veces con
-# colores invertidos, de modo que un H2H de 40 partidas son 20 pares reales,
-# no cuarenta repeticiones deterministas desde startpos.
-OPENINGS = [
-    "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6",
-    "1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6",
-    "1. e4 c5 2. Nf3 d6 3. d4 cxd4",
-    "1. e4 c5 2. Nf3 Nc6 3. d4 cxd4",
-    "1. e4 c5 2. c3 d5 3. exd5 Qxd5",
-    "1. e4 e6 2. d4 d5 3. Nc3 Nf6",
-    "1. e4 c6 2. d4 d5 3. Nc3 dxe4",
-    "1. e4 d5 2. exd5 Qxd5 3. Nc3 Qd8",
-    "1. d4 d5 2. c4 e6 3. Nc3 Nf6",
-    "1. d4 d5 2. c4 c6 3. Nf3 Nf6",
-    "1. d4 Nf6 2. c4 g6 3. Nc3 Bg7",
-    "1. d4 Nf6 2. c4 e6 3. Nf3 b6",
-    "1. d4 Nf6 2. c4 c5 3. d5 e6",
-    "1. c4 e5 2. Nc3 Nf6 3. Nf3 Nc6",
-    "1. c4 c5 2. Nf3 Nf6 3. d4 cxd4",
-    "1. Nf3 d5 2. g3 Nf6 3. Bg2 g6",
-    "1. Nf3 Nf6 2. c4 g6 3. g3 Bg7",
-    "1. g3 d5 2. Bg2 Nf6 3. Nf3 g6",
-    "1. b3 e5 2. Bb2 Nc6 3. e3 Nf6",
-    "1. f4 d5 2. Nf3 Nf6 3. e3 g6",
-]
+# BANCO DE APERTURAS: el mismo `libro_sprt.epd` que usa sprt_real.py
+# (2313 aperturas unicas, ver tools/generar_libro_sprt.py).
+#
+# ANTES habia 20 aperturas cableadas recorridas con
+# `OPENINGS[(index // 2) % 20]`, o sea que un h2h de mas de 40 partidas volvia
+# al principio del libro. Con reloj (movetime) las partidas repetidas no salen
+# identicas -- por eso este script no llego al desastre que si tenia
+# sprt_real.py a nodos fijos, donde las partidas se repetian jugada por
+# jugada -- pero 20 aperturas para 160 o 250 partidas siguen siendo una
+# muestra mucho mas correlacionada de lo que el error estandar supone.
+# Con el libro compartido, cada apertura se juega exactamente dos veces (una
+# por color) y el tope duro es 2 x 2313 = 4626 partidas.
+
+LIBRO_APERTURAS = ROOT / "libro_sprt.epd"
+
+
+def cargar_libro() -> list[str]:
+    if not LIBRO_APERTURAS.exists():
+        raise SystemExit(
+            f"Falta el libro de aperturas {LIBRO_APERTURAS}.\n"
+            "Generalo con: python3 tools/generar_libro_sprt.py"
+        )
+    fens = [
+        linea.strip()
+        for linea in LIBRO_APERTURAS.read_text(encoding="utf-8").splitlines()
+        if linea.strip() and not linea.startswith("#")
+    ]
+    if len(set(fens)) != len(fens):
+        raise SystemExit("El libro tiene lineas repetidas: regeneralo.")
+    return fens
 
 _LIVE_ENGINES: list[chess.engine.SimpleEngine] = []
 
@@ -99,14 +103,9 @@ for _signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
 atexit.register(cleanup_engines)
 
 
-def opening_board(pgn_line: str) -> chess.Board:
-    game = chess.pgn.read_game(io.StringIO(pgn_line))
-    if game is None:
-        raise ValueError(f"No se pudo leer apertura: {pgn_line}")
-    board = game.board()
-    for move in game.mainline_moves():
-        board.push(move)
-    return board
+def opening_board(fen: str) -> chess.Board:
+    """Tablero de arranque de una apertura del libro (una FEN por linea)."""
+    return chess.Board(fen)
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -168,6 +167,14 @@ def main() -> None:
     games = int(sys.argv[3]) if len(sys.argv) > 3 else 40
     movetime_ms = int(sys.argv[4]) if len(sys.argv) > 4 else 600
 
+    aperturas = cargar_libro()
+    if games > 2 * len(aperturas):
+        raise SystemExit(
+            f"ABORTADO: pediste {games} partidas pero el libro solo permite "
+            f"{2 * len(aperturas)} sin repetir apertura+color.\n"
+            "Solucion: python3 tools/generar_libro_sprt.py <mas_aperturas>"
+        )
+
     for path in (candidate_path, BASE, BASE_WEIGHTS, ROOT_WEIGHTS):
         if not path.exists():
             raise SystemExit(f"No existe: {path}")
@@ -190,7 +197,7 @@ def main() -> None:
         "base_weights_sha256": sha256(BASE_WEIGHTS),
         "games": games,
         "movetime_ms": movetime_ms,
-        "openings_sha256": hashlib.sha256("\n".join(OPENINGS).encode()).hexdigest(),
+        "openings_sha256": sha256(LIBRO_APERTURAS),
     }
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -232,7 +239,10 @@ def main() -> None:
         with combined.open(mode, encoding="utf-8") as pgn:
             for index in range(completed, games):
                 candidate_white = index % 2 == 0
-                opening = OPENINGS[(index // 2) % len(OPENINGS)]
+                # Sin `% len(...)`: el libro tiene 2313 aperturas y la
+                # guarda de arriba impide pedir mas partidas de las que
+                # alcanzan para recorrerlo sin volver al principio.
+                opening = aperturas[index // 2]
                 started = time.monotonic()
                 points, game = play_game(
                     cand,
