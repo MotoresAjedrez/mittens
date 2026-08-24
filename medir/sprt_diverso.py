@@ -400,6 +400,20 @@ def main() -> None:
                     flush=True,
                 )
 
+                # TECHO DEL BANCO: con B aperturas y los dos colores hay 2*B
+                # partidas distintas posibles; a partir de ahi se empiezan a
+                # repetir igual que en el harness viejo, solo que mas tarde.
+                # Se avisa UNA vez, al cruzarlo: el detector de abajo tarda
+                # mucho mas en saltar porque mira la fraccion acumulada.
+                if n == 2 * len(banco) + 1:
+                    print(
+                        f"AVISO: se agotaron las {2*len(banco)} partidas "
+                        f"distintas que permite un banco de {len(banco)} "
+                        f"aperturas. De aca en adelante se repiten: relanza con "
+                        f"n_aperturas >= max_partidas/2 si necesitas mas.",
+                        flush=True,
+                    )
+
                 # DETECTOR DE DUPLICADOS: el fallo que invalido los test viejos.
                 if n >= MIN_PARTIDAS_PARA_CHEQUEAR and len(firmas) / n < PISO_DISTINTAS:
                     razon = (

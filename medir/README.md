@@ -39,6 +39,11 @@ equilibradas (generadas con semilla fija y filtradas por el motor baseline) y
 **cuenta las partidas distintas en cada línea de progreso**, abortando si la
 fracción cae por debajo del 60 %.
 
+Con `B` aperturas hay `2*B` partidas distintas posibles (cada apertura con los
+dos colores). Pasado ese techo el harness avisa y las partidas se empiezan a
+repetir, igual que el viejo pero mucho más tarde: pedí `n_aperturas >=
+max_partidas/2`. Con el valor por defecto de 400, el techo son 800 partidas.
+
 Ojo con la prueba nula (mismo binario en los dos lados): ahí las dos partidas
 de una misma apertura son idénticas con los colores cambiados, así que el
 detector marca "20 de 40" y el score es 50,00 % exacto. Es correcto: una
