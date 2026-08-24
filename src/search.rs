@@ -705,6 +705,22 @@ fn r50_div() -> i32 {
 /// historico); 212 = el divisor de Stockfish. Ver `amortiguar_r50`.
 const R50_DIV_DEFECTO: i32 = 0;
 
+/// Zona muerta de la amortiguacion por regla de 50: no se amortigua nada
+/// mientras `halfmove_clock <= R50_UMBRAL`. 0 = formula de Stockfish tal cual.
+/// Ver el analisis de exposicion en `amortiguar_r50`.
+const R50_UMBRAL_DEFECTO: i32 = 0;
+
+fn r50_umbral() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_R50_UMBRAL")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|u| (0..=99).contains(u))
+            .unwrap_or(R50_UMBRAL_DEFECTO)
+    })
+}
+
 /// Exponente de envejecimiento de las tablas de CORRECTION HISTORY
 /// (corr_pawn, corr_nonpawn, corr_cont). Separado del de ordenamiento porque
 /// no alimentan al mismo consumidor: el corrhist corrige la EVAL (RFP,
@@ -1213,6 +1229,8 @@ pub struct Searcher {
     // Copia local de `r50_div()`: amortiguar_r50 corre en CADA nodo evaluado,
     // ahi un atomic load del OnceLock si se nota.
     r50_div: i32,
+    /// Zona muerta de la amortiguacion por regla de 50 (ver `amortiguar_r50`).
+    r50_umbral: i32,
     // Cuantas jugadas silenciosas BUSCADAS tenian su casilla destino
     // atacada por el rival: mide que fraccion del arbol usaba la tabla
     // `history_amenaza` para escribir pero leia `history` en LMR/poda.
@@ -1337,6 +1355,7 @@ impl Searcher {
             decay_orden: decay_orden(),
             decay_corr: decay_corr(),
             r50_div: r50_div(),
+            r50_umbral: r50_umbral(),
             quiets_destino_amenazado: 0,
             quiets_buscadas_total: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -1453,6 +1472,7 @@ impl Searcher {
             decay_orden: decay_orden(),
             decay_corr: decay_corr(),
             r50_div: r50_div(),
+            r50_umbral: r50_umbral(),
             quiets_destino_amenazado: 0,
             quiets_buscadas_total: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
@@ -1560,15 +1580,41 @@ impl Searcher {
     /// contador. Fuera de la cache el valor cacheado sigue siendo funcion
     /// pura de la posicion y la amortiguacion se recalcula por nodo (un
     /// multiplicar y un dividir).
+    ///
+    /// ZONA MUERTA (`MITTENS_R50_UMBRAL`, agregada tras medir la exposicion
+    /// real). La formula de Stockfish amortigua desde `hc = 1`, o sea SIEMPRE.
+    /// Medido sobre 142 partidas reales del harness de SPRT a 50.000 nodos
+    /// (results_sprt/r50_damping/games.pgn):
+    ///
+    ///   terminaciones .... 79 mate, 46 triple repeticion, 10 material
+    ///                      insuficiente, 4 tope de plies, 3 REGLA DE 50
+    ///   contador de 50 jugadas maximo por partida: mediana 13, media 20,1
+    ///   partidas donde el contador pasa de 60 .... 10 de 142 (7%)
+    ///
+    /// O sea: el BENEFICIO de la amortiguacion (empujar a progresar antes de
+    /// que la regla de 50 se coma una posicion ganada) aplica al 2-7% de las
+    /// partidas, pero su COSTO (aplanar la eval, que achica todos los margenes
+    /// de poda y agranda el arbol: +20% de nodos en bench d12, 553.392 contra
+    /// 460.957) aplica al 100% de los nodos, porque con hc mediano 13 el
+    /// factor no es cero casi nunca. Con `umbral = U` la amortiguacion vale
+    /// cero hasta `hc = U` y recien despues crece, asi que la eval se mantiene
+    /// afilada en la enorme mayoria de las posiciones y solo se aplana en las
+    /// lineas de arrastre, que es donde la regla de 50 existe de verdad.
+    /// `umbral = 0` reproduce exactamente la formula de Stockfish.
     #[inline]
     fn amortiguar_r50(&self, b: &Board, v: i32) -> i32 {
         let d = self.r50_div;
         if d == 0 {
             return v;
         }
+        let hc = b.halfmove_clock.min(100) as i32;
+        let efectivo = (hc - self.r50_umbral).max(0);
+        if efectivo == 0 {
+            return v;
+        }
         // i64 en el medio: v puede ser del orden de +-30.000 y hc <= 100, el
         // producto no entra holgado en i32 con margen para futuros rangos.
-        v - ((v as i64 * b.halfmove_clock.min(100) as i64) / d as i64) as i32
+        v - ((v as i64 * efectivo as i64) / d as i64) as i32
     }
 
     #[inline]
