@@ -26,28 +26,35 @@ ROOT = pathlib.Path(__file__).resolve().parent
 BIN = pathlib.Path(os.environ.get("MITTENS_BIN", str(ROOT / "target/release/mittens")))
 MAX_PLIES = 300
 
-OPENINGS = [
-    "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6",
-    "1. e4 e5 2. Nf3 Nc6 3. Bc4 Nf6",
-    "1. e4 c5 2. Nf3 d6 3. d4 cxd4",
-    "1. e4 c5 2. Nf3 Nc6 3. d4 cxd4",
-    "1. e4 c5 2. c3 d5 3. exd5 Qxd5",
-    "1. e4 e6 2. d4 d5 3. Nc3 Nf6",
-    "1. e4 c6 2. d4 d5 3. Nc3 dxe4",
-    "1. e4 d5 2. exd5 Qxd5 3. Nc3 Qd8",
-    "1. d4 d5 2. c4 e6 3. Nc3 Nf6",
-    "1. d4 d5 2. c4 c6 3. Nf3 Nf6",
-    "1. d4 Nf6 2. c4 g6 3. Nc3 Bg7",
-    "1. d4 Nf6 2. c4 e6 3. Nf3 b6",
-    "1. d4 Nf6 2. c4 c5 3. d5 e6",
-    "1. c4 e5 2. Nc3 Nf6 3. Nf3 Nc6",
-    "1. c4 c5 2. Nf3 Nf6 3. d4 cxd4",
-    "1. Nf3 d5 2. g3 Nf6 3. Bg2 g6",
-    "1. Nf3 Nf6 2. c4 g6 3. g3 Bg7",
-    "1. e4 e5 2. Nf3 Nf6 3. Nxe5 d6",
-    "1. d4 e6 2. c4 f5 3. g3 Nf6",
-    "1. e4 g6 2. d4 Bg7 3. Nc3 d6",
-]
+# BANCO DE APERTURAS: el mismo `libro_sprt.epd` que usan sprt_real.py y
+# h2h.py (2313 aperturas unicas, ver tools/generar_libro_sprt.py).
+#
+# ANTES habia 20 aperturas cableadas y el indice se tomaba modulo 20:
+# pasadas las 40 partidas se volvia al principio del libro. Como este script juega por RELOJ las partidas
+# repetidas no salen identicas (a nodos fijos si salian identicas, que es lo
+# que rompia sprt_real.py), pero 20 aperturas para 100-250 partidas dan una
+# muestra bastante mas correlacionada de lo que supone el error estandar
+# sqrt(0.25/n) que este script imprime. Con el libro compartido cada apertura
+# se juega exactamente dos veces, una por color.
+
+LIBRO_APERTURAS = ROOT / "libro_sprt.epd"
+
+
+def cargar_libro() -> list[str]:
+    if not LIBRO_APERTURAS.exists():
+        raise SystemExit(
+            f"Falta el libro de aperturas {LIBRO_APERTURAS}.\n"
+            "Generalo con: python3 tools/generar_libro_sprt.py"
+        )
+    fens = [
+        linea.strip()
+        for linea in LIBRO_APERTURAS.read_text(encoding="utf-8").splitlines()
+        if linea.strip() and not linea.startswith("#")
+    ]
+    if len(set(fens)) != len(fens):
+        raise SystemExit("El libro tiene lineas repetidas: regeneralo.")
+    return fens
+
 
 
 def configure(engine, weights: pathlib.Path) -> None:
@@ -60,13 +67,9 @@ def configure(engine, weights: pathlib.Path) -> None:
     engine.configure({k: v for k, v in requested.items() if k in engine.options})
 
 
-def board_from_opening(line: str) -> chess.Board:
-    b = chess.Board()
-    for tok in line.split():
-        if tok.endswith("."):
-            continue
-        b.push_san(tok)
-    return b
+def board_from_opening(fen: str) -> chess.Board:
+    """Tablero de arranque de una apertura del libro (una FEN por linea)."""
+    return chess.Board(fen)
 
 
 def play(a, b, opening: str, a_is_white: bool, ms: int) -> float:
@@ -95,6 +98,14 @@ def main() -> None:
     partidas = int(sys.argv[3]) if len(sys.argv) > 3 else 100
     ms = int(sys.argv[4]) if len(sys.argv) > 4 else 500
 
+    aperturas = cargar_libro()
+    if partidas > 2 * len(aperturas):
+        raise SystemExit(
+            f"ABORTADO: pediste {partidas} partidas pero el libro solo permite "
+            f"{2 * len(aperturas)} sin repetir apertura+color.\n"
+            "Solucion: python3 tools/generar_libro_sprt.py <mas_aperturas>"
+        )
+
     for p in (BIN, pesos_a, pesos_b):
         if not p.exists():
             print(f"ERROR: no existe {p}")
@@ -113,7 +124,7 @@ def main() -> None:
         puntos = 0.0
         w = d = l = 0
         for i in range(partidas):
-            opening = OPENINGS[(i // 2) % len(OPENINGS)]
+            opening = aperturas[i // 2]
             s = play(a, b, opening, a_is_white=(i % 2 == 0), ms=ms)
             puntos += s
             if s == 1.0:
