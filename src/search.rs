@@ -720,6 +720,47 @@ pub struct Searcher {
     // margen amplio como LMP/history malus, pero cumple el criterio).
     // MITTENS_SINGULAR=0 las desactiva si hiciera falta comparar de nuevo.
     pub modo_singular: bool,
+    // Malus de CONTINUATION history para las quiets buscadas que no cortaron.
+    //
+    // Antes de este cambio `cont_history` y `cont_history_2` recibian SOLO
+    // bonus (en `registrar_corte`) y NUNCA malus: el bucle de castigo posterior
+    // al corte beta tocaba unicamente las tablas planas `history` /
+    // `history_amenaza`. Con `hist_update` (gravedad hacia +-MAX_HIST) una
+    // tabla que solo recibe bonus tiene UN solo punto fijo, +MAX_HIST: cada
+    // entrada que alguna vez corto deriva hacia +16384 y las demas se quedan
+    // clavadas en 0. O sea que las dos continuation histories degeneraban en
+    // un bit "esta pareja (jugada previa, jugada) alguna vez corto", sin poder
+    // expresar NUNCA "esta jugada es mala en este contexto".
+    //
+    // Eso rompia tres consumidores que YA estaban implementados y calibrados a
+    // escala Stockfish (mismo tipo de fallo que el fix de escala de
+    // `hist_bonus`: la tecnica existia pero no podia dispararse):
+    //   * poda por historia: `stat_score = 2*h + ch + ch2 < -4000*depth`.
+    //     Con ch, ch2 >= 0 siempre, los dos terminos solo podian EMPUJAR
+    //     stat_score hacia arriba, es decir hacia NO podar.
+    //   * ajuste proporcional de LMR: `r -= (stat_score/8000).clamp(-2,2)`.
+    //     Sesgado hacia reducir MENOS por el mismo motivo.
+    //   * orden de jugadas: `-((h + ch + ch2)/16)`. Todas las quiets que nunca
+    //     cortaron empataban en ch = ch2 = 0.
+    //
+    // ESTADO: APAGADO POR DEFECTO. Medido con SPRT a 50.000 nodos/jugada,
+    // mismo binario, misma red, unico cambio la bandera, sobre el libro nuevo
+    // de 2313 aperturas (970 partidas unicas, dos trabajadores en tramos
+    // disjuntos): +275 =408 -287, score 49,38% +- 1,61%, o sea -4 Elo con
+    // intervalo de confianza del 95% de -26 a +18. LLR = -0,92 sin cruzar
+    // ningun limite. NO hay ganancia medible, asi que no se enciende.
+    //
+    // Por que la tecnica correcta no rinde aca (medido, no supuesto): la LMP
+    // se lleva el 64% de todas las jugadas vistas en el arbol, mientras que
+    // la poda por historia solo dispara en el 1,3% -- las jugadas cuya
+    // historia mejora con el malus ya estaban podadas por conteo. Y el orden
+    // no mejora: los cortes beta en la primera jugada pasan de 83,31% a
+    // 82,65%. Queda documentado y disponible por si en el futuro cambia el
+    // reparto de podas (p.ej. si se afloja la LMP).
+    //
+    // MITTENS_CONTHIST_MALUS=1 lo enciende. Apagado el bench es bit-identico
+    // a main (43.314 nodos exactos); encendido da 46.053.
+    pub malus_cont_history: bool,
     // La quiescence puede omitir NNUE de forma experimental. El resto del
     // árbol conserva la mezcla completa; esta bandera solo existe para medir
     // si el coste del horizonte a relojes ultracortos devuelve Elo real.
@@ -859,6 +900,7 @@ impl Searcher {
             modo_lmr: std::env::var("MITTENS_LMR").as_deref() != Ok("0"),
             modo_aspiration: std::env::var("MITTENS_NO_ASPIRATION").as_deref() != Ok("1"),
             modo_singular: std::env::var("MITTENS_SINGULAR").as_deref() != Ok("0"),
+            malus_cont_history: std::env::var("MITTENS_CONTHIST_MALUS").as_deref() == Ok("1"),
             qsearch_nnue: true,
             nnue: None,
             nnue_classical_depth: 0,
@@ -955,6 +997,7 @@ impl Searcher {
             modo_lmr,
             modo_aspiration: std::env::var("MITTENS_NO_ASPIRATION").as_deref() != Ok("1"),
             modo_singular: std::env::var("MITTENS_SINGULAR").as_deref() != Ok("0"),
+            malus_cont_history: std::env::var("MITTENS_CONTHIST_MALUS").as_deref() == Ok("1"),
             qsearch_nnue: true,
             nnue: None,
             nnue_classical_depth: 0,
@@ -2619,7 +2662,10 @@ impl Searcher {
         // por LMP/futilidad). Si una jugada posterior causa un corte beta,
         // estas se probaron y fallaron: reciben un "malus" de history para que
         // el orden aprenda a probarlas mas tarde. Cota fija en la pila.
-        let mut quiets_buscados: [(u8, u8, bool); 64] = [(0, 0, false); 64];
+        // El 4to campo es el TIPO DE PIEZA que mueve: hace falta para indexar
+        // las continuation histories (cont_idx) en el malus, que antes no se
+        // aplicaba justamente porque no se guardaba este dato.
+        let mut quiets_buscados: [(u8, u8, bool, u8); 64] = [(0, 0, false, 0); 64];
         let mut n_quiets_buscados = 0usize;
         // Lo mismo para las capturas buscadas sin cortar: (pieza, destino,
         // victima), para aplicarles el malus de capture history.
@@ -2860,21 +2906,20 @@ impl Searcher {
                 }
             }
 
+            let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             // Registrar esta quiet como "buscada" ANTES de buscarla, para
             // poder penalizarla si otra jugada posterior causa el corte.
             if !mv.is_capture() && mv.promotion.is_none() && n_quiets_buscados < 64 {
                 quiets_buscados[n_quiets_buscados] =
-                    (mv.from, mv.to, casilla_amenazada(b, mv.to));
+                    (mv.from, mv.to, casilla_amenazada(b, mv.to), pt_mv as u8);
                 n_quiets_buscados += 1;
             }
             if mv.is_capture() && n_capts_buscadas < 32 {
-                let pt_c = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                 capts_buscadas[n_capts_buscadas] =
-                    (pt_c as u8, mv.to, victima_de(b, mv) as u8);
+                    (pt_mv as u8, mv.to, victima_de(b, mv) as u8);
                 n_capts_buscadas += 1;
             }
 
-            let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
             self.tt_prefetch(next.zobrist);
             let child_prev = Some((pt_mv, mv.to as usize));
@@ -3141,7 +3186,8 @@ impl Searcher {
                 }
                 if !mv.is_capture() && mv.promotion.is_none() {
                     let malus = hist_bonus(depth);
-                    for &(qf, qt, amenazada) in &quiets_buscados[..n_quiets_buscados] {
+                    let con_cont = self.malus_cont_history;
+                    for &(qf, qt, amenazada, qpt) in &quiets_buscados[..n_quiets_buscados] {
                         if (qf, qt) != (mv.from, mv.to) {
                             if amenazada {
                                 hist_update(
@@ -3150,6 +3196,37 @@ impl Searcher {
                                 );
                             } else {
                                 hist_update(&mut self.history[qf as usize][qt as usize], -malus);
+                            }
+                            // MALUS DE CONTINUATION HISTORY (ver el comentario
+                            // del campo malus_cont_history). Simetrico exacto
+                            // del bonus que `registrar_corte` le da a la jugada
+                            // que SI corto: misma magnitud, mismas dos tablas,
+                            // mismos indices. Sin esto las dos continuation
+                            // histories solo podian crecer y quedaban sin
+                            // capacidad de decir "mala jugada en este contexto".
+                            if con_cont {
+                                if let Some((prev_pt, prev_to)) = prev {
+                                    hist_update(
+                                        &mut self.cont_history[cont_idx(
+                                            prev_pt,
+                                            prev_to,
+                                            qpt as usize,
+                                            qt as usize,
+                                        )],
+                                        -malus,
+                                    );
+                                }
+                                if let Some((p2_pt, p2_to)) = prev2 {
+                                    hist_update(
+                                        &mut self.cont_history_2[cont_idx(
+                                            p2_pt,
+                                            p2_to,
+                                            qpt as usize,
+                                            qt as usize,
+                                        )],
+                                        -malus,
+                                    );
+                                }
                             }
                         }
                     }
