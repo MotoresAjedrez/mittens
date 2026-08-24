@@ -222,6 +222,28 @@ fn lmr_deeper() -> bool {
     bandera_env(&CACHE, "MITTENS_LMR_DEEPER", true)
 }
 
+/// Punto 3 (Kimi K3): minor-piece correction history.
+#[inline]
+fn corr_menores_on() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    bandera_env(&CACHE, "MITTENS_CORR_MENORES", true)
+}
+
+/// Divisor del termino de piezas menores dentro de `eval_corregida` (punto 3).
+/// 2 = peso 1/4 del total, la mitad del de peones (proporcion de Stockfish).
+/// Ajustable con `MITTENS_CORR_MENORES_DIV` para poder probar pesos mas
+/// livianos (4 = 1/8) sin recompilar.
+fn corr_menores_div() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_CORR_MENORES_DIV")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v >= 1 && *v <= 16)
+            .unwrap_or(2)
+    })
+}
+
 /// Margen base del "deeper re-search" de LMR (punto 2), ajustable con
 /// `MITTENS_LMR_DEEPER_MARGEN` para calibrarlo sin recompilar.
 fn lmr_deeper_margen() -> i32 {
@@ -264,7 +286,7 @@ const CORR_SIZE: usize = 16384;
 const CORR_MASK: usize = CORR_SIZE - 1;
 const CORR_MAX: i32 = 128;
 
-// `Board::corr_hash` guarda los tres hashes parciales con 16 bits cada uno.
+// `Board::corr_hash` guarda los cuatro hashes parciales con 16 bits cada uno.
 // Eso alcanza para indexar las tablas de correction history mientras el
 // enmascarado use como mucho 16 bits. Si algun dia se agranda CORR_SIZE por
 // encima de 65536, esto falla EN COMPILACION en vez de silenciosamente
@@ -290,6 +312,23 @@ fn hash_peones(b: &Board) -> u64 {
 fn hash_no_peones(b: &Board, color: usize) -> u64 {
     debug_assert!(color < 2);
     (b.corr_hash >> (16 * (1 + color))) & 0xFFFF
+}
+
+/// Hash Zobrist solo de las piezas MENORES (caballos y alfiles) de los dos
+/// colores -- la clave del minor-piece correction history de Stockfish
+/// (agregado alli a finales de 2024). Mantenido incrementalmente en la
+/// ranura 3 de `Board::corr_hash`, que estaba libre: coste cero, igual que
+/// las otras dos.
+///
+/// Por que las menores merecen tabla propia: son las piezas cuyo VALOR
+/// depende mas de donde estan (alfil malo encerrado por sus peones, caballo
+/// en el borde, la pareja de alfiles en posicion abierta). La eval estatica
+/// se equivoca de forma SISTEMATICA en esas configuraciones, y ni el hash de
+/// peones ni el de "todo lo que no es peon" (que mezcla torres y damas, cuyo
+/// valor es mucho mas estable) aislan esa senal.
+#[inline(always)]
+fn hash_menores(b: &Board) -> u64 {
+    (b.corr_hash >> 48) & 0xFFFF
 }
 
 /// Actualizacion con "gravedad" (Stockfish): el bonus crece con la
@@ -829,6 +868,9 @@ pub struct Searcher {
     corr_nonpawn: [Vec<i32>; 2],
     // Continuation corrhist: (pieza_rival, destino_rival, bando) aplanado.
     corr_cont: Vec<i32>,
+    // Minor-piece corrhist (caballos+alfiles de ambos colores): [bando][hash],
+    // exactamente el mismo formato y tamano que corr_pawn.
+    corr_menores: Vec<i32>,
     // Lazy SMP: escalonamiento de profundidad (skip arrays al estilo
     // Stockfish clasico). `Some((size, phase))` hace que este hilo AYUDANTE
     // se saltee bloques de iteraciones de la profundizacion: salta la
@@ -925,6 +967,7 @@ impl Searcher {
             corr_pawn: vec![0; 2 * CORR_SIZE],
             corr_nonpawn: [vec![0; 2 * CORR_SIZE], vec![0; 2 * CORR_SIZE]],
             corr_cont: vec![0; 6 * 64 * 2],
+            corr_menores: vec![0; 2 * CORR_SIZE],
             salto_smp: None,
             root_moves_filtro: None,
             null_move_r_extra: 0,
@@ -947,6 +990,7 @@ impl Searcher {
             corr_pawn: self.corr_pawn,
             corr_nonpawn: self.corr_nonpawn,
             corr_cont: self.corr_cont,
+            corr_menores: self.corr_menores,
         }))
     }
 
@@ -966,7 +1010,8 @@ impl Searcher {
             && t.corr_pawn.len() == self.corr_pawn.len()
             && t.corr_nonpawn[0].len() == self.corr_nonpawn[0].len()
             && t.corr_nonpawn[1].len() == self.corr_nonpawn[1].len()
-            && t.corr_cont.len() == self.corr_cont.len();
+            && t.corr_cont.len() == self.corr_cont.len()
+            && t.corr_menores.len() == self.corr_menores.len();
         if !compatible {
             return;
         }
@@ -979,6 +1024,7 @@ impl Searcher {
         self.corr_pawn = t.corr_pawn;
         self.corr_nonpawn = t.corr_nonpawn;
         self.corr_cont = t.corr_cont;
+        self.corr_menores = t.corr_menores;
     }
 
     /// Crea un Searcher que comparte la TT (Arc clonado, mismo mask) de otro
@@ -1021,6 +1067,7 @@ impl Searcher {
             corr_pawn: vec![0; 2 * CORR_SIZE],
             corr_nonpawn: [vec![0; 2 * CORR_SIZE], vec![0; 2 * CORR_SIZE]],
             corr_cont: vec![0; 6 * 64 * 2],
+            corr_menores: vec![0; 2 * CORR_SIZE],
             salto_smp: None,
             root_moves_filtro: None,
             null_move_r_extra: 0,
@@ -1264,11 +1311,14 @@ impl Searcher {
         for v in self.corr_cont.iter_mut() {
             *v /= 2;
         }
+        for v in self.corr_menores.iter_mut() {
+            *v /= 2;
+        }
     }
 
-    /// Eval estatica corregida por correction history: promedia las tres
-    /// senales (peones, no-peones de ambos colores, jugada previa) y las
-    /// suma a la eval cruda. Se usa SOLO para decisiones de poda/reduccion
+    /// Eval estatica corregida por correction history: promedia las cuatro
+    /// senales (peones, no-peones de ambos colores, jugada previa y piezas
+    /// menores) y las suma a la eval cruda. Se usa SOLO para decisiones de poda/reduccion
     /// (RFP, razoring, futility), nunca se guarda en la TT.
     /// Refina la eval estatica con el score guardado en la TT.
     ///
@@ -1305,7 +1355,23 @@ impl Searcher {
             Some((pt, to)) => self.corr_cont[(pt * 64 + to) * 2 + stm],
             None => 0,
         };
-        static_eval + (pawn + (npw + npb) / 2 + cont / 2) / 2
+        // Minor-piece corrhist (punto 3 de Kimi K3). Peso deliberadamente
+        // CONSERVADOR: dentro del parentesis va dividido por 2, o sea 1/4 del
+        // total, la MITAD del peso de la tabla de peones (1/2). Es la misma
+        // proporcion que usa Stockfish entre su termino de menores y el de
+        // peones (3583 vs 6384 sobre 131072, ~0.56x).
+        //
+        // Esto NO es un detalle: la rama anterior `cand_corrhist_menores_2ply`
+        // le puso peso 4/3 dentro del parentesis (2/3 del total, MAS que los
+        // peones, ~2.7x lo que le da Stockfish) y ademas recalculaba el hash
+        // recorriendo bitboards en cada llamada -- midio 36.2% en 362 partidas.
+        let menores = if corr_menores_on() {
+            self.corr_menores[base + (hash_menores(b) as usize & CORR_MASK)]
+                / corr_menores_div()
+        } else {
+            0
+        };
+        static_eval + (pawn + (npw + npb) / 2 + cont / 2 + menores) / 2
     }
 
     /// Registra el error entre el score real de la busqueda y la eval
@@ -1327,6 +1393,12 @@ impl Searcher {
         corrhist_update(&mut self.corr_nonpawn[0][idx_npw], diff, depth);
         let idx_npb = base + (hash_no_peones(b, 1) as usize & CORR_MASK);
         corrhist_update(&mut self.corr_nonpawn[1][idx_npb], diff, depth);
+        // Minor-piece corrhist: misma gravedad, mismo clamp, mismo depth que
+        // las otras tablas (ver corrhist_update).
+        if corr_menores_on() {
+            let idx_men = base + (hash_menores(b) as usize & CORR_MASK);
+            corrhist_update(&mut self.corr_menores[idx_men], diff, depth);
+        }
         if let Some((pt, to)) = prev {
             let idx = (pt * 64 + to) * 2 + stm;
             corrhist_update(&mut self.corr_cont[idx], diff, depth);
@@ -3943,6 +4015,7 @@ pub struct TablasPersistentes {
     corr_pawn: Vec<i32>,
     corr_nonpawn: [Vec<i32>; 2],
     corr_cont: Vec<i32>,
+    corr_menores: Vec<i32>,
 }
 
 /// Memoria persistente de UN hilo de Lazy SMP entre llamadas a "go".
@@ -4183,6 +4256,75 @@ pub fn buscar_lazy_smp(
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    /// La ranura 3 de `Board::corr_hash` (minor-piece corrhist) tiene que ser
+    /// EXACTAMENTE los 16 bits bajos del XOR de las claves Zobrist de
+    /// caballos y alfiles de los dos colores -- ni mas piezas ni menos.
+    ///
+    /// Esto NO lo cubre el debug_assert de `make_move`: ese compara el hash
+    /// incremental contra `recompute_zobrist`, y las dos rutas usan la MISMA
+    /// `corr_hash_delta`, asi que un error de "que piezas cuentan" pasaria
+    /// desapercibido en ambas. Aca se recomputa a mano desde los bitboards.
+    #[test]
+    fn hash_menores_es_solo_caballos_y_alfiles() {
+        let fens = [
+            crate::STARTPOS,
+            "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6",
+            "2rq1rk1/pp1bppbp/2np1np1/8/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 0 11",
+            "8/2p2pk1/1p1p2p1/p2Pp2p/P1P1P2P/1P3PP1/6K1/8 w - - 0 1",
+            "8/8/1p1k4/p1p5/P1P5/1P1K4/8/8 w - - 0 1",
+        ];
+        for fen in fens {
+            let b = Board::from_fen(fen).unwrap();
+            let k = crate::zobrist::keys();
+            let mut esperado = 0u64;
+            for color in 0..2usize {
+                for pt in [PieceType::Knight as usize, PieceType::Bishop as usize] {
+                    let mut bb = b.pieces[color][pt];
+                    while bb != 0 {
+                        let sq = crate::bitboard::pop_lsb(&mut bb);
+                        esperado ^= k.piece_square[color][pt][sq as usize];
+                    }
+                }
+            }
+            assert_eq!(
+                hash_menores(&b),
+                esperado & 0xFFFF,
+                "ranura 3 de corr_hash mal mantenida en {fen}"
+            );
+        }
+    }
+
+    /// Agregar la ranura 3 no debe alterar las otras tres ranuras del
+    /// empaquetado: si se pisaran, cambiarian los indices de pawn/nonpawn
+    /// corrhist y toda la eval corregida se moveria sin que nadie lo pida.
+    #[test]
+    fn ranura_de_menores_no_pisa_peones_ni_no_peones() {
+        let b = Board::from_fen(
+            "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6",
+        )
+        .unwrap();
+        let k = crate::zobrist::keys();
+        let mut peones = 0u64;
+        let mut no_peones = [0u64; 2];
+        for color in 0..2usize {
+            for pt in 0..6usize {
+                let mut bb = b.pieces[color][pt];
+                while bb != 0 {
+                    let sq = crate::bitboard::pop_lsb(&mut bb);
+                    let key = k.piece_square[color][pt][sq as usize];
+                    if pt == PieceType::Pawn as usize {
+                        peones ^= key;
+                    } else {
+                        no_peones[color] ^= key;
+                    }
+                }
+            }
+        }
+        assert_eq!(hash_peones(&b), peones & 0xFFFF);
+        assert_eq!(hash_no_peones(&b, 0), no_peones[0] & 0xFFFF);
+        assert_eq!(hash_no_peones(&b, 1), no_peones[1] & 0xFFFF);
+    }
 
     /// BUG: un "stop" (o cualquier comando que aborte la busqueda) que llega
     /// ANTES de que termine la profundidad 1 dejaba `mejor_mv` en el

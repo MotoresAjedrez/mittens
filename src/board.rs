@@ -29,6 +29,13 @@ pub struct Board {
     ///   bits  0..16 = solo peones (de los dos colores) -> estructura de peones
     ///   bits 16..32 = piezas que NO son peon de BLANCAS
     ///   bits 32..48 = piezas que NO son peon de NEGRAS
+    ///   bits 48..64 = piezas MENORES (caballos+alfiles) de los dos colores
+    ///
+    /// La ranura 3 (bits 48..64) era la unica que quedaba libre del u64 y es
+    /// la que usa el minor-piece correction history. Una pieza menor aporta a
+    /// DOS ranuras a la vez (la suya por color y la de menores); como los
+    /// bits no se solapan, el mismo XOR incremental mantiene las dos sin
+    /// coste extra medible.
     ///
     /// Antes la busqueda los recalculaba desde cero en cada consulta
     /// (`hash_peones` / `hash_no_peones` en search.rs): un recorrido con
@@ -60,15 +67,22 @@ pub struct Board {
 
 /// Cuanto hay que XOR-ear en `Board::corr_hash` cuando aparece o desaparece
 /// una pieza cuya clave Zobrist es `key`. Los peones de los dos colores van
-/// juntos a la ranura 0; el resto, separado por color.
+/// juntos a la ranura 0; el resto, separado por color. Ademas, caballos y
+/// alfiles (de cualquier color) aportan TAMBIEN a la ranura 3, que es la del
+/// minor-piece correction history: son bits disjuntos de los de la ranura
+/// por color, asi que un solo XOR mantiene las dos ranuras a la vez.
 #[inline(always)]
 pub const fn corr_hash_delta(color: Color, pt: PieceType, key: u64) -> u64 {
-    let ranura = if pt as usize == PieceType::Pawn as usize {
+    let pti = pt as usize;
+    let bajos = key & 0xFFFF;
+    let ranura = if pti == PieceType::Pawn as usize {
         0
     } else {
         1 + color as usize
     };
-    (key & 0xFFFF) << (16 * ranura)
+    let menor =
+        pti == PieceType::Knight as usize || pti == PieceType::Bishop as usize;
+    (bajos << (16 * ranura)) | ((menor as u64) * (bajos << 48))
 }
 
 /// Derechos de enroque que SOBREVIVEN cuando la casilla es origen o destino
