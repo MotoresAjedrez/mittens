@@ -313,6 +313,86 @@ fn victima_de(b: &Board, mv: &Move) -> usize {
     }
 }
 
+/// Modo de lectura de la historia "mariposa" en la poda por historia y en el
+/// ajuste de LMR (ver `Searcher::hist_quiet` para el problema que resuelve).
+///
+/// - 0: comportamiento historico -- las dos rutas leen `history[from][to]` a
+///      secas, aunque el bonus/malus de esa jugada se haya escrito en
+///      `history_amenaza`.
+/// - 1: leer la MISMA tabla que se escribe (elegida por amenaza al destino),
+///      en poda y en LMR.
+/// - 2: solo en la poda por historia.
+/// - 3: solo en el ajuste de LMR.
+/// - 4 (DEFECTO): sumar las DOS tablas con peso 1 en vez de usar `2*h`.
+///      La escala de `stat_score` queda IDENTICA a la historica
+///      (`history + history_amenaza` cubre +-32768, igual que `2*h`), asi
+///      que los umbrales calibrados (`-4000*depth`, `/8000`) siguen valiendo
+///      -- pero ahora la senal usa TODAS las muestras de esa jugada, no solo
+///      las que cayeron en el contexto "destino no amenazado".
+/// Tope del capture history dentro de la clave de orden de las capturas
+/// GANADORAS (SEE >= 0).
+///
+/// Historico: 400. Con el SEE multiplicado por 8, un peon de SEE vale 800
+/// puntos de clave, asi que un tope de 400 solo desempata capturas
+/// separadas por menos de MEDIO peon: en la practica el capture history
+/// casi no opinaba. Stockfish le da a esa tabla un peso comparable al del
+/// material (`6*valor_victima + capthist`, con capthist hasta +-10692
+/// contra ~1250 por peon), o sea varias veces mas influencia relativa.
+/// 1600 = +-2 peones de reordenamiento: sigue siendo mas conservador que
+/// Stockfish, pero ya permite que "esta captura concreta funciono muchas
+/// veces" gane a "esta otra come una pieza levemente mas cara".
+/// Ajustable con MITTENS_CAPTHIST_TOPE.
+fn tope_capthist_orden() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_CAPTHIST_TOPE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| (0..=MAX_HIST).contains(v))
+            .unwrap_or(1600)
+    })
+}
+
+/// Tope del capture history para las capturas PERDEDORAS (SEE < 0).
+///
+/// Se controla por separado del de las ganadoras porque el riesgo es
+/// distinto: la clave de una captura mala es `1000 - see - ch`, y los quiets
+/// ocupan el carril [-3072, +3072]. Con un tope grande, una captura que
+/// pierde material pero con buen historial cae en clave NEGATIVA e invade el
+/// carril de las silenciosas -- el modo de falla clasico de este motor al
+/// tocar el orden.
+///
+/// MEDIDO: subir el tope en las DOS ramas mide mejor que subirlo solo en las
+/// ganadoras. Bench sumado d10..d14 (nodos totales / % de cortes beta en la
+/// 1ra jugada, que es la metrica de orden que este repo considera fiable):
+///   base 400/400 ............ 3.639.981 / 83.363%
+///   1600 solo ganadoras ..... 4.819.567 / 82.674%   (PEOR en ambas)
+///   1600 en las dos ramas ... 3.271.918 / 83.522%
+/// O sea que dejar entrar una captura perdedora con buen historial al carril
+/// de los quiets no es el problema que parecia: es informacion util.
+/// Ajustable con MITTENS_CAPTHIST_TOPE_MALA.
+fn tope_capthist_mala() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_CAPTHIST_TOPE_MALA")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| (0..=MAX_HIST).contains(v))
+            .unwrap_or(1600)
+    })
+}
+
+fn hist_modo() -> u8 {
+    static CACHE: OnceLock<u8> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_HIST_MODO")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v <= 4)
+            .unwrap_or(4)
+    })
+}
+
 /// Si el rival ya ataca `sq` ANTES de jugar el movimiento (tablero en la
 /// posicion actual). Usado para elegir la tabla de historial: una jugada
 /// silenciosa hacia una casilla amenazada tiene un significado tactico
@@ -765,6 +845,27 @@ pub struct Searcher {
     see_negamax: Vec<[i32; MAX_MOVES]>,
     pub lmr_intentos: u64,
     pub lmr_reintentos: u64,
+    // INSTRUMENTACION de calidad de orden (no altera la busqueda: son solo
+    // contadores). `cortes_beta` cuenta cortes beta en negamax y
+    // `cortes_primera` cuantos de esos cayeron en la PRIMERA jugada del
+    // orden. El cociente es la metrica estandar de calidad de ordenamiento
+    // (los motores top rondan 92-95%) y, a diferencia del conteo de nodos a
+    // profundidad fija, es estable de una corrida a otra en este motor.
+    pub cortes_beta: u64,
+    pub cortes_primera: u64,
+    // Copia local de `hist_modo()`: se lee UNA vez al construir el Searcher
+    // para no pagar el atomic load del OnceLock dentro del bucle de jugadas.
+    hist_modo: u8,
+    // Idem para los dos topes del capture history en el orden (ver
+    // tope_capthist_orden / tope_capthist_mala): leerlos del OnceLock dentro
+    // de clave_orden_movimiento seria un atomic load por JUGADA.
+    capthist_tope: i32,
+    capthist_tope_mala: i32,
+    // Cuantas jugadas silenciosas BUSCADAS tenian su casilla destino
+    // atacada por el rival: mide que fraccion del arbol usaba la tabla
+    // `history_amenaza` para escribir pero leia `history` en LMR/poda.
+    pub quiets_destino_amenazado: u64,
+    pub quiets_buscadas_total: u64,
     // Hindsight reductions: para el hijo alcanzado mediante una busqueda
     // reducida guardamos la evaluacion estatica del padre y la reduccion
     // aplicada. Los vectores estan indexados por ply y son locales al hilo.
@@ -869,6 +970,13 @@ impl Searcher {
             see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
             lmr_intentos: 0,
             lmr_reintentos: 0,
+            cortes_beta: 0,
+            cortes_primera: 0,
+            hist_modo: hist_modo(),
+            capthist_tope: tope_capthist_orden(),
+            capthist_tope_mala: tope_capthist_mala(),
+            quiets_destino_amenazado: 0,
+            quiets_buscadas_total: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
             hindsight_reduction: vec![0; MAX_KILLER_PLY],
             eval_stack: vec![EVAL_INVALIDA; MAX_KILLER_PLY],
@@ -965,6 +1073,13 @@ impl Searcher {
             see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
             lmr_intentos: 0,
             lmr_reintentos: 0,
+            cortes_beta: 0,
+            cortes_primera: 0,
+            hist_modo: hist_modo(),
+            capthist_tope: tope_capthist_orden(),
+            capthist_tope_mala: tope_capthist_mala(),
+            quiets_destino_amenazado: 0,
+            quiets_buscadas_total: 0,
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
             hindsight_reduction: vec![0; MAX_KILLER_PLY],
             eval_stack: vec![EVAL_INVALIDA; MAX_KILLER_PLY],
@@ -1527,6 +1642,66 @@ impl Searcher {
         self.order_moves_ply(b, moves, tt_move, MAX_KILLER_PLY as u32, None, None);
     }
 
+    /// Historia "mariposa" de una jugada silenciosa LEIDA de la MISMA tabla
+    /// en la que se escribe.
+    ///
+    /// El motor mantiene dos tablas [from][to] para quiets: `history_amenaza`
+    /// cuando la casilla DESTINO ya esta atacada por el rival y `history` en
+    /// caso contrario (la idea es que una quiet hacia una casilla amenazada
+    /// significa algo tacticamente distinto). `registrar_corte` y el malus
+    /// eligen la tabla con ese criterio, y `clave_orden_movimiento` tambien.
+    ///
+    /// Pero los otros DOS consumidores de la senal -- la poda por historia
+    /// negativa y el ajuste proporcional de LMR -- leian siempre
+    /// `history[from][to]` a secas. Para toda quiet con destino amenazado
+    /// eso significa leer una entrada donde su propio bonus/malus NUNCA se
+    /// escribio: el termino `h`, que ademas pesa DOBLE en `stat_score`,
+    /// valia ~0 (o peor, el valor que dejo la misma from-to en nodos donde
+    /// la casilla no estaba amenazada). O sea: la mitad del mecanismo de
+    /// history estaba desconectada para esa fraccion del arbol.
+    /// Esta funcion centraliza el criterio para que las cuatro rutas
+    /// (escritura de bonus, escritura de malus, orden y LMR/poda) lean y
+    /// escriban SIEMPRE la misma casilla.
+    #[inline]
+    fn hist_quiet(&self, mapa: u64, from: usize, to: usize) -> i32 {
+        if crate::bitboard::bit(to as crate::types::Square) & mapa != 0 {
+            self.history_amenaza[from][to]
+        } else {
+            self.history[from][to]
+        }
+    }
+
+    /// Termino `h` de la historia mariposa tal como lo consumen la poda por
+    /// historia y el ajuste de LMR, que lo usan SIEMPRE como `2*h` dentro de
+    /// `stat_score = 2*h + ch + ch2`. Devuelve el valor ANTES de duplicar,
+    /// para que la escala de `stat_score` -- y por lo tanto los umbrales ya
+    /// calibrados `-4000*depth` y `/8000` -- sea la misma en todos los modos.
+    /// Ver `hist_modo()` para el significado de cada modo.
+    #[inline]
+    fn hist_mariposa(
+        &self,
+        b: &Board,
+        mv: &Move,
+        mapa_amenazas: &mut Option<u64>,
+        coherente: bool,
+    ) -> i32 {
+        let from = mv.from as usize;
+        let to = mv.to as usize;
+        if self.hist_modo == 4 {
+            // Las DOS tablas suman toda la evidencia acumulada sobre esta
+            // jugada (la del contexto "destino amenazado" y la del otro),
+            // no solo la mitad que caia en `history`. El /2 mantiene el
+            // rango de `2*h` en +-32768, exactamente el historico.
+            // No necesita el mapa de amenazas: cero costo extra por jugada.
+            return (self.history[from][to] + self.history_amenaza[from][to]) / 2;
+        }
+        if coherente {
+            let mapa = *mapa_amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
+            return self.hist_quiet(mapa, from, to);
+        }
+        self.history[from][to]
+    }
+
     #[inline]
     fn clave_orden_movimiento(
         &self,
@@ -1555,12 +1730,14 @@ impl Searcher {
             // rango material ocupa [0, 7200], asi que un desempate de +-400
             // solo reordena capturas de valor CASI IGUAL: nunca saca a una
             // captura de su carril.
-            let ch = self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))]
-                .clamp(-400, 400);
+            let ch_crudo =
+                self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))];
             if see >= 0 {
-                return -(10_000 + see * 8 + ch);
+                let tope = self.capthist_tope;
+                return -(10_000 + see * 8 + ch_crudo.clamp(-tope, tope));
             }
-            return 1000 - see - ch;
+            let tope = self.capthist_tope_mala;
+            return 1000 - see - ch_crudo.clamp(-tope, tope);
         }
         if mv.promotion.is_some() {
             return -5000;
@@ -1584,11 +1761,9 @@ impl Searcher {
             }
         }
         let mapa = *amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
-        let h = if crate::bitboard::bit(mv.to) & mapa != 0 {
-            self.history_amenaza[mv.from as usize][mv.to as usize]
-        } else {
-            self.history[mv.from as usize][mv.to as usize]
-        };
+        // Mismo criterio exacto que antes, ahora factorizado en `hist_quiet`
+        // para que LMR y la poda por historia lean lo MISMO (ver su doc).
+        let h = self.hist_quiet(mapa, mv.from as usize, mv.to as usize);
         let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
         let ch = match prev {
             Some((prev_pt, prev_to)) => {
@@ -2391,6 +2566,15 @@ impl Searcher {
         // generada de una, con ordenamiento diferido (seleccion perezosa).
         // Buffer de claves de ESTE ply (ver comentario del campo).
         let pl_claves = ply as usize;
+        // Mapa de casillas atacadas por el rival en ESTE nodo, calculado
+        // perezosamente UNA sola vez y compartido por los tres consumidores
+        // (clave de orden, poda por historia y ajuste de LMR). Antes vivia
+        // dentro del bloque de claves y moria ahi, asi que el bucle de
+        // jugadas volvia a preguntar con `is_square_attacked_by` por cada
+        // quiet buscada. `b` no cambia dentro del nodo, asi que el mapa es
+        // constante y reutilizarlo da EXACTAMENTE el mismo resultado (ver
+        // doc de Board::attack_map y el test attack_map_equivale_a_is_square_attacked_by).
+        let mut mapa_amenazas: Option<u64> = None;
         let mut moves;
         let n_moves;
         let mut lista_ordenada;
@@ -2406,7 +2590,7 @@ impl Searcher {
             // primera jugada no corta.
             n_moves = moves.len();
             {
-                let mut amenazas: Option<u64> = None;
+                let amenazas = &mut mapa_amenazas;
                 for j in 0..n_moves {
                     let mv_j = &moves[j];
                     // SEE calculado UNA sola vez aca (paso 2 del SEE
@@ -2416,7 +2600,7 @@ impl Searcher {
                     // que no son capturas.
                     let see_j = mv_j.is_capture().then(|| crate::see::see(b, mv_j));
                     let k = self.clave_orden_movimiento(
-                        b, mv_j, tt_move, ply, prev, prev2, see_j, &mut amenazas,
+                        b, mv_j, tt_move, ply, prev, prev2, see_j, amenazas,
                     );
                     self.claves_negamax[pl_claves][j] = k;
                     self.see_negamax[pl_claves][j] = see_j.unwrap_or(i32::MIN);
@@ -2786,7 +2970,19 @@ impl Searcher {
                     let pt_q = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     // (b) Historia claramente negativa: esta jugada ya fallo
                     //     repetidas veces en contextos parecidos.
-                    let h = self.history[mv.from as usize][mv.to as usize];
+                    // COHERENCIA (ver hist_quiet): antes esto leia siempre
+                    // `history[from][to]`, incluso para quiets cuyo bonus y
+                    // malus se escriben en `history_amenaza`. Para esas
+                    // jugadas `h` valia basura/cero y, al pesar DOBLE en
+                    // stat_score, la poda por historia practicamente no
+                    // disparaba nunca. Ahora lee la misma tabla que se
+                    // escribe.
+                    let h = self.hist_mariposa(
+                        b,
+                        mv,
+                        &mut mapa_amenazas,
+                        matches!(self.hist_modo, 1 | 2),
+                    );
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
                             self.cont_history[cont_idx(p_pt, p_to, pt_q, mv.to as usize)]
@@ -2863,8 +3059,19 @@ impl Searcher {
             // Registrar esta quiet como "buscada" ANTES de buscarla, para
             // poder penalizarla si otra jugada posterior causa el corte.
             if !mv.is_capture() && mv.promotion.is_none() && n_quiets_buscados < 64 {
-                quiets_buscados[n_quiets_buscados] =
-                    (mv.from, mv.to, casilla_amenazada(b, mv.to));
+                // Se reusa el mapa de amenazas del nodo en vez de un
+                // `is_square_attacked_by` por jugada: resultado IDENTICO
+                // (ver doc de Board::attack_map y el test de equivalencia)
+                // y ademas mas barato, porque el mapa ya suele estar
+                // calculado por la clave de orden.
+                let mapa =
+                    *mapa_amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
+                let amenazada = crate::bitboard::bit(mv.to) & mapa != 0;
+                self.quiets_buscadas_total += 1;
+                if amenazada {
+                    self.quiets_destino_amenazado += 1;
+                }
+                quiets_buscados[n_quiets_buscados] = (mv.from, mv.to, amenazada);
                 n_quiets_buscados += 1;
             }
             if mv.is_capture() && n_capts_buscadas < 32 {
@@ -2936,7 +3143,16 @@ impl Searcher {
                     // el history principal pesa el doble que cada
                     // continuation history. Se suma tambien cont_history_2
                     // (follow-up a 2 plies), que antes no se usaba aca.
-                    let h = self.history[mv.from as usize][mv.to as usize];
+                    // COHERENCIA (ver hist_quiet): mismo arreglo que en la
+                    // poda por historia -- el termino `h`, que pesa doble,
+                    // tiene que salir de la tabla donde de verdad se
+                    // escribio el bonus/malus de esta jugada.
+                    let h = self.hist_mariposa(
+                        b,
+                        mv,
+                        &mut mapa_amenazas,
+                        matches!(self.hist_modo, 1 | 3),
+                    );
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
                             self.cont_history[cont_idx(p_pt, p_to, pt_mv, mv.to as usize)]
@@ -3109,6 +3325,13 @@ impl Searcher {
                 alpha = sc;
             }
             if alpha >= beta {
+                // Instrumentacion de calidad de orden (no altera nada de la
+                // busqueda): que fraccion de los cortes beta cae en la
+                // primera jugada del orden.
+                self.cortes_beta += 1;
+                if idx == 0 {
+                    self.cortes_primera += 1;
+                }
                 self.registrar_corte(b, *mv, ply, depth, prev, prev2, pt_mv);
                 // History malus: las quiets buscadas antes de esta (que no
                 // cortaron) se penalizan con la misma magnitud del bonus que

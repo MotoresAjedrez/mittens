@@ -949,4 +949,41 @@ mod tests {
     fn rechaza_reyes_adyacentes() {
         assert!(Board::from_fen("8/8/8/8/8/8/4k3/4K3 w - - 0 1").is_err());
     }
+
+    /// `attack_map(c) & bit(sq) != 0` tiene que ser EXACTAMENTE equivalente a
+    /// `is_square_attacked_by(sq, c)` para las 64 casillas y los dos colores.
+    /// La busqueda depende de esa equivalencia: el mapa se calcula UNA vez
+    /// por nodo y se reusa para elegir la tabla de historia (normal vs
+    /// amenaza) en el orden, en la poda por historia y en LMR, en lugar de
+    /// preguntar por jugada. Si las dos rutas difirieran aunque sea en una
+    /// casilla, el bonus y el malus de una misma jugada podrian ir a tablas
+    /// distintas (bug silencioso de ordenamiento, no de legalidad, asi que
+    /// ningun perft lo detectaria).
+    #[test]
+    fn attack_map_equivale_a_is_square_attacked_by() {
+        let fens = [
+            crate::STARTPOS,
+            "r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6",
+            "2rq1rk1/pp1bppbp/2np1np1/8/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 0 11",
+            "r2q1rk1/ppp2ppp/2n1bn2/2b1p3/4P3/2NP1N2/PPP1BPPP/R1BQ1RK1 w - - 4 8",
+            "8/2p2pk1/1p1p2p1/p2Pp2p/P1P1P2P/1P3PP1/6K1/8 w - - 0 1",
+            "8/8/1p1k4/p1p5/P1P5/1P1K4/8/8 w - - 0 1",
+            "4k3/8/8/3Q4/8/8/8/4K3 w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1",
+        ];
+        for fen in fens {
+            let b = Board::from_fen(fen).unwrap_or_else(|_| panic!("FEN invalida: {fen}"));
+            for color in [crate::types::Color::White, crate::types::Color::Black] {
+                let mapa = b.attack_map(color);
+                for sq in 0u8..64 {
+                    let por_mapa = crate::bitboard::bit(sq) & mapa != 0;
+                    let directo = b.is_square_attacked_by(sq, color);
+                    assert_eq!(
+                        por_mapa, directo,
+                        "desacuerdo en casilla {sq} color {color:?} de la FEN {fen}"
+                    );
+                }
+            }
+        }
+    }
 }

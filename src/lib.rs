@@ -289,6 +289,8 @@ fn run_bench(depth: i32) {
     }
     let mut nodos_totales: u64 = 0;
     let mut ms_totales: u128 = 0;
+    let mut cortes_primera_total: u64 = 0;
+    let mut cortes_beta_total: u64 = 0;
     for (nombre, fen) in BENCH_POSICIONES {
         let b = Board::from_fen(fen).unwrap();
         let mut s = Searcher::new(64);
@@ -316,6 +318,23 @@ fn run_bench(depth: i32) {
                 100.0 * s.lmr_reintentos as f64 / s.lmr_intentos as f64
             );
         }
+        // Calidad de ORDEN: % de cortes beta que caen en la primera jugada.
+        // Es la metrica estandar (motores top: 92-95%) y en este motor es
+        // mucho mas estable de una corrida a otra que el conteo de nodos.
+        if s.cortes_beta > 0 {
+            println!(
+                "  ORDEN: {}/{} cortes beta en la 1ra jugada ({:.2}%) | quiets con destino amenazado: {}/{} ({:.1}%)",
+                s.cortes_primera,
+                s.cortes_beta,
+                100.0 * s.cortes_primera as f64 / s.cortes_beta as f64,
+                s.quiets_destino_amenazado,
+                s.quiets_buscadas_total,
+                100.0 * s.quiets_destino_amenazado as f64
+                    / (s.quiets_buscadas_total.max(1)) as f64
+            );
+            cortes_primera_total += s.cortes_primera;
+            cortes_beta_total += s.cortes_beta;
+        }
     }
     // Bloque resumen en el formato convencional (Stockfish y similares) que
     // los testers automaticos (Cutechess, OpenBench, scripts de CCRL) suelen
@@ -325,6 +344,14 @@ fn run_bench(depth: i32) {
     println!("Total time (ms) : {}", ms_totales);
     println!("Nodes searched  : {}", nodos_totales);
     println!("Nodes/second    : {:.0}", nps_total);
+    if cortes_beta_total > 0 {
+        println!(
+            "Orden (1ra)     : {:.2}%  ({}/{})",
+            100.0 * cortes_primera_total as f64 / cortes_beta_total as f64,
+            cortes_primera_total,
+            cortes_beta_total
+        );
+    }
 
 }
 
