@@ -464,6 +464,17 @@ def main() -> None:
     stop_reason = None
     duplicadas = 0
     firmas_partidas: set[str] = set()
+    if completed and combined.exists():
+        # Al reanudar un checkpoint hay que recuperar las firmas de las
+        # partidas ya jugadas; si no, el detector de duplicados arrancaria
+        # ciego y no veria una repeticion a caballo del corte.
+        with combined.open(encoding="utf-8") as previas:
+            partida = chess.pgn.read_game(previas)
+            while partida is not None:
+                firmas_partidas.add(
+                    " ".join(m.uci() for m in partida.mainline_moves())
+                )
+                partida = chess.pgn.read_game(previas)
     llr = compute_llr(wins, draws, losses, elo0, elo1)
     try:
         mode = "a" if completed else "w"
