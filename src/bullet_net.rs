@@ -694,6 +694,22 @@ impl AcumBullet {
         let mut desbordado = false;
 
         for color in 0..2usize {
+            // ATAJO POR COLOR: si la OCUPACION de este color no cambio, no
+            // pudo cambiar ninguno de sus seis bitboards por tipo -- para que
+            // cambiara el tipo de una pieza sin mover ninguna casilla haria
+            // falta una promocion con origen igual al destino, que no existe.
+            // Y `entrar`/`aplicar_jugada` siempre reciben dos tableros
+            // separados por UNA jugada (o por una jugada nula), asi que en una
+            // jugada silenciosa -- la mayoria -- este chequeo unico reemplaza
+            // seis comparaciones de bitboard, y en una jugada nula reemplaza
+            // las doce.
+            if antes.occupied_co[color] == despues.occupied_co[color] {
+                debug_assert!(
+                    (0..6).all(|i| antes.pieces[color][i] == despues.pieces[color][i]),
+                    "occupied_co igual pero los bitboards por tipo difieren: los tableros no estan separados por una sola jugada"
+                );
+                continue;
+            }
             for (pt_idx, &pt) in ALL_PIECE_TYPES.iter().enumerate() {
                 let a = antes.pieces[color][pt as usize];
                 let d = despues.pieces[color][pt as usize];
