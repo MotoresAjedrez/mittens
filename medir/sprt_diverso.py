@@ -278,7 +278,29 @@ def main() -> None:
     salida = ROOT / "results_sprt" / nombre
     salida.mkdir(parents=True, exist_ok=True)
     pgn_path = salida / "games.pgn"
+    estado_path = salida / "state.json"
     la, lb = limites(alpha, beta)
+
+    def sha256(p: pathlib.Path) -> str:
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    firma_corrida = {
+        "cand": sha256(cand_bin),
+        "cand_pesos": sha256(cand_w),
+        "base": sha256(base_bin),
+        "base_pesos": sha256(base_w),
+        "elo0": elo0,
+        "elo1": elo1,
+        "alpha": alpha,
+        "beta": beta,
+        "nodos": nodos,
+        "n_aperturas": n_aperturas,
+        "semilla": SEMILLA,
+    }
 
     def opciones(e: chess.engine.SimpleEngine, w: pathlib.Path) -> None:
         pedido = {"Threads": 1, "Hash": 128, "NNUEPath": str(w), "UseNNUE": True}
@@ -300,13 +322,47 @@ def main() -> None:
         flush=True,
     )
 
-    w = d = l = 0
+    # Reanudacion: mismo contrato que sprt_real.py -- si hay checkpoint y la
+    # firma coincide (mismos binarios, pesos, parametros y banco), se continua;
+    # si cambio algo, se aborta en vez de mezclar partidas de dos candidatos.
+    w = d = l = hechas = 0
     firmas: set[str] = set()
+    if estado_path.exists():
+        guardado = json.loads(estado_path.read_text(encoding="utf-8"))
+        if guardado.get("firma") != firma_corrida:
+            raise SystemExit(
+                "ABORTADO: el binario, los pesos o los parametros cambiaron "
+                "desde el checkpoint. Usa otro nombre o borra el resultado."
+            )
+        w, d, l = guardado["wins"], guardado["draws"], guardado["losses"]
+        hechas = guardado["completed"]
+        firmas = set(guardado.get("firmas", []))
+        if hechas and not pgn_path.exists():
+            raise SystemExit("Hay checkpoint pero falta games.pgn; no se reanuda a ciegas.")
+
+    def guardar_estado() -> None:
+        tmp = estado_path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "firma": firma_corrida,
+                    "wins": w,
+                    "draws": d,
+                    "losses": l,
+                    "completed": hechas,
+                    "firmas": sorted(firmas),
+                },
+                indent=1,
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(estado_path)
+
     razon = None
-    valor_llr = 0.0
+    valor_llr = llr(w, d, l, elo0, elo1)
     try:
-        with pgn_path.open("w", encoding="utf-8") as fh:
-            for i in range(max_partidas):
+        with pgn_path.open("a" if hechas else "w", encoding="utf-8") as fh:
+            for i in range(hechas, max_partidas):
                 cand_blancas = i % 2 == 0
                 apertura = banco[(i // 2) % len(banco)]
                 t0 = time.monotonic()
@@ -331,8 +387,10 @@ def main() -> None:
                     d += 1
                 else:
                     l += 1
+                hechas = i + 1
                 n = w + d + l
                 valor_llr = llr(w, d, l, elo0, elo1)
+                guardar_estado()
                 score = (w + 0.5 * d) / n
                 print(
                     f"{n}: +{w} ={d} -{l}, score={100*score:.2f}%, "
