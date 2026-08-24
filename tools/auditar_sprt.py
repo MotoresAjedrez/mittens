@@ -70,7 +70,7 @@ def auditar(pgn: pathlib.Path, elo0: float, elo1: float) -> str:
     repetidas = 0
     for bloque in bloques:
         cabeceras = dict(re.findall(r'\[(\w+) "([^"]*)"\]', bloque))
-        cuerpo = "\n".join(
+        cuerpo = cabeceras.get("Opening", "") + " | " + "\n".join(
             linea for linea in bloque.splitlines() if not linea.startswith("[")
         ).strip()
         if cuerpo in vistos:

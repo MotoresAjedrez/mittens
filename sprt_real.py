@@ -472,7 +472,9 @@ def main() -> None:
             partida = chess.pgn.read_game(previas)
             while partida is not None:
                 firmas_partidas.add(
-                    " ".join(m.uci() for m in partida.mainline_moves())
+                    partida.headers.get("Opening", "")
+                    + " | "
+                    + " ".join(m.uci() for m in partida.mainline_moves())
                 )
                 partida = chess.pgn.read_game(previas)
     llr = compute_llr(wins, draws, losses, elo0, elo1)
@@ -503,7 +505,13 @@ def main() -> None:
                 # es lo que el LLR cree que es. Con el libro nuevo no deberia
                 # pasar nunca; si pasa, se corta en vez de seguir inflando el
                 # LLR en silencio.
-                firma_partida = " ".join(m.uci() for m in game.mainline_moves())
+                # La firma incluye la apertura: dos posiciones de arranque
+                # distintas pueden dar la misma secuencia de UCI (las jugadas
+                # son casilla-a-casilla, no dependen de la posicion), y eso
+                # seria un falso positivo.
+                firma_partida = opening + " | " + " ".join(
+                    m.uci() for m in game.mainline_moves()
+                )
                 if firma_partida in firmas_partidas:
                     duplicadas += 1
                     print(
