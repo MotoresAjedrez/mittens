@@ -24,7 +24,7 @@ pub struct Board {
     pub halfmove_clock: u32,
     pub fullmove_number: u32,
     pub zobrist: u64,
-    /// Tres hashes Zobrist PARCIALES que usa el correction history de la
+    /// Cuatro hashes Zobrist PARCIALES que usa el correction history de la
     /// busqueda, EMPAQUETADOS en un solo u64 de 16 bits cada uno:
     ///   bits  0..16 = solo peones (de los dos colores) -> estructura de peones
     ///   bits 16..32 = piezas que NO son peon de BLANCAS
