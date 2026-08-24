@@ -3,7 +3,21 @@
 
 Uso:
   python3 sprt_real.py CANDIDATO_BIN CANDIDATO_PESOS BASELINE_BIN BASELINE_PESOS NOMBRE \
-      [elo0=0] [elo1=5] [alpha=0.05] [beta=0.05] [nodos=100000] [max_partidas=40000]
+      [elo0=0] [elo1=5] [alpha=0.05] [beta=0.05] [nodos=100000] [max_partidas=40000] \
+      [apertura_inicial=0]
+
+`apertura_inicial` permite correr VARIOS trabajadores en paralelo sobre
+TRAMOS DISJUNTOS del libro (el arnes juega una partida por vez). Ej. con un
+libro de 2313 aperturas y 600 partidas por trabajador:
+
+    worker A: ... 600 0
+    worker B: ... 600 300
+    worker C: ... 600 600
+
+Cada trabajador usa 300 aperturas distintas, asi que las partidas de los tres
+son independientes entre si y sus W/D/L se pueden sumar. Los tramos NO pueden
+solaparse: el arnes verifica que `apertura_inicial + max_partidas/2` entre en
+el libro, pero el reparto entre trabajadores lo tiene que hacer quien lanza.
 
 Formula de LLR: el test GSPRT (Generalized SPRT) sobre el "elo normalizado",
 tal como lo documenta y usa fishtest (el framework de testing de Stockfish) y
@@ -371,18 +385,25 @@ def main() -> None:
     beta = float(sys.argv[9]) if len(sys.argv) > 9 else 0.05
     nodes = int(sys.argv[10]) if len(sys.argv) > 10 else 100_000
     max_games = int(sys.argv[11]) if len(sys.argv) > 11 else 40_000
+    apertura_inicial = int(sys.argv[12]) if len(sys.argv) > 12 else 0
 
     for path in (candidate_path, candidate_weights, baseline_path, baseline_weights):
         if not path.exists():
             raise SystemExit(f"No existe: {path}")
 
-    aperturas = cargar_libro()
+    aperturas_todas = cargar_libro()
+    if apertura_inicial < 0 or apertura_inicial >= len(aperturas_todas):
+        raise SystemExit(
+            f"apertura_inicial={apertura_inicial} fuera del libro "
+            f"(0..{len(aperturas_todas) - 1})"
+        )
+    aperturas = aperturas_todas[apertura_inicial:]
     partidas_unicas = 2 * len(aperturas)
     if max_games > partidas_unicas:
         raise SystemExit(
-            f"ABORTADO: pediste max_partidas={max_games} pero el libro solo\n"
-            f"permite {partidas_unicas} partidas UNICAS ({len(aperturas)} aperturas x 2\n"
-            "colores). Con motores deterministas a nodos fijos, jugar mas que eso\n"
+            f"ABORTADO: pediste max_partidas={max_games} pero el tramo del libro\n"
+            f"que arranca en {apertura_inicial} solo permite {partidas_unicas} partidas\n"
+            f"UNICAS ({len(aperturas)} aperturas x 2 colores). Con motores deterministas a nodos fijos, jugar mas que eso\n"
             "significa REPETIR partidas ya jugadas y sumarlas al LLR como si fueran\n"
             "evidencia nueva -- exactamente el error que este arnes tenia antes.\n"
             "Solucion: python3 tools/generar_libro_sprt.py <mas_aperturas>"
@@ -407,7 +428,8 @@ def main() -> None:
         "beta": beta,
         "nodes": nodes,
         "openings_sha256": sha256(LIBRO_APERTURAS),
-        "openings_n": len(aperturas),
+        "openings_n": len(aperturas_todas),
+        "opening_start": apertura_inicial,
     }
 
     if state_path.exists():
@@ -442,8 +464,8 @@ def main() -> None:
             f"Partidas: {n} (+{wins} ={draws} -{losses}), score={fraction:.1%}\n"
             f"LLR final: {llr:.4f} (limites [{la:.4f}, {lb:.4f}])\n"
             f"H0: elo <= {elo0}, H1: elo >= {elo1}, alpha={alpha}, beta={beta}\n"
-            f"Partidas unicas disponibles en el libro: {partidas_unicas} "
-            f"({len(aperturas)} aperturas x 2 colores)\n"
+            f"Partidas unicas disponibles en el tramo: {partidas_unicas} "
+            f"({len(aperturas)} aperturas x 2 colores, desde la {apertura_inicial})\n"
             f"Partidas duplicadas detectadas: {duplicadas}\n"
             f"Razon de corte: {reason}\n"
         )
