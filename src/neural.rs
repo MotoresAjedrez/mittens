@@ -589,6 +589,23 @@ impl NnueAccumulator {
         }
     }
 
+    /// Deja el acumulador listo para ser LEIDO. Solo hace algo en la
+    /// arquitectura bullet, la unica con actualizacion perezosa: alli
+    /// `entrar` se limita a anotar el delta del ply y la pasada real se
+    /// hace aqui, poniendo al dia la cadena de niveles pendientes (ver
+    /// `AcumBullet::materializar`). Las otras dos arquitecturas
+    /// actualizan in-place en `entrar`, asi que ya estan al dia.
+    ///
+    /// TIENE que llamarse antes de cualquier `evaluar()`. En la busqueda hay
+    /// un unico punto donde se obtiene una referencia al acumulador
+    /// (`Searcher::nnue_de`) y es alli donde se llama.
+    #[inline]
+    pub fn asegurar_actualizado(&mut self) {
+        if let NnueAccumulator::Bullet(a) = self {
+            a.materializar();
+        }
+    }
+
     pub fn evaluar(&self) -> f32 {
         match self {
             NnueAccumulator::Amenazas(a) => a.evaluar(),

@@ -458,7 +458,7 @@ impl RedBullet {
 /// margen y sigue cabiendo en registros/pila sin coste.
 const MAX_CAMBIOS: usize = 8;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Cambios {
     add: arrayvec::ArrayVec<u16, MAX_CAMBIOS>,
     sub: arrayvec::ArrayVec<u16, MAX_CAMBIOS>,
@@ -477,32 +477,76 @@ fn feature(persp: usize, color: usize, pieza: usize, sq: usize) -> usize {
 }
 
 /// Un nivel de la pila: el estado completo del acumulador en un ply.
+///
+/// ALINEACION A 64 BYTES, y no es cosmetico. `[i16; 1024]` solo pide
+/// alineacion 2, asi que `Nivel` medía 4098 bytes: el nivel k empezaba en
+/// `base + 4098*k`, o sea desalineado 2*k bytes respecto de la linea de
+/// cache. Todos los accesos NEON del acumulador (`vld1q_s16`/`vst1q_s16`,
+/// 16 bytes cada uno) cruzaban lineas de cache en 15 de cada 16 niveles.
+/// Con `align(64)` el tamano pasa a 4160 (+1,5% de memoria: 400 KB por
+/// hilo) y CADA perspectiva de CADA nivel queda alineada a linea de cache.
 #[derive(Clone)]
+#[repr(C, align(64))]
 struct Nivel {
     /// [0] = acumulador visto por las blancas, [1] = por las negras.
     /// Solo las primeras `red.h` posiciones son significativas.
+    /// SOLO ES VALIDO si el `Pendiente` de este nivel tiene `sucio == false`
+    /// (ver `AcumBullet::materializar`).
     persp: [[i16; H_MAX]; 2],
     negras_mueven: bool,
     /// Piezas totales en el tablero (reyes incluidos). Solo se usa para
-    /// elegir el output bucket; se mantiene incrementalmente.
+    /// elegir el output bucket; se mantiene incrementalmente. A diferencia
+    /// de `persp`, SIEMPRE esta al dia (es un u8, no cuesta nada).
     piezas: u8,
 }
 
-/// Acumulador NNUE con PILA POR PLY.
+/// Delta pendiente de aplicar de un nivel respecto de su padre.
 ///
-/// Antes era un unico buffer mutado in-place: bajar a un hijo aplicaba el
-/// delta y volver aplicaba el delta invertido, o sea DOS pasadas completas
-/// del acumulador por jugada. Perfilando, `aplicar_features` era el 34,5%
-/// del tiempo de busqueda, asi que esa segunda pasada sola costaba ~17%.
+/// `sucio == true` significa: "`pila[i].persp` todavia NO vale; para
+/// obtenerlo hay que aplicar estos cambios sobre `pila[i-1].persp`".
+#[derive(Clone, Default)]
+struct Pendiente {
+    c0: Cambios,
+    c1: Cambios,
+    sucio: bool,
+}
+
+/// Acumulador NNUE con PILA POR PLY y ACTUALIZACION PEREZOSA.
 ///
-/// Con la pila, el hijo se escribe en el slot siguiente leyendo del padre en
-/// una sola pasada (`entrar`) y volver es decrementar un indice (`salir`).
-/// El resultado es BIT-IDENTICO: son los mismos valores, guardados en otro
-/// lado.
+/// Historia en dos pasos:
+///
+/// 1. Antes era un unico buffer mutado in-place: bajar a un hijo aplicaba el
+///    delta y volver aplicaba el delta invertido, o sea DOS pasadas completas
+///    del acumulador por jugada. Perfilando, `aplicar_features` era el 34,5%
+///    del tiempo de busqueda, asi que esa segunda pasada sola costaba ~17%.
+///    La PILA arreglo eso: el hijo se escribe en el slot siguiente leyendo
+///    del padre en una sola pasada (`entrar`) y volver es decrementar un
+///    indice (`salir`).
+///
+/// 2. Aun asi `entrar` seguia haciendo la pasada COMPLETA (2 x h i16) en
+///    cada jugada, incluso cuando ese hijo no llegaba a evaluarse nunca --
+///    corte inmediato por TT, o eval servida por la cache de eval por
+///    zobrist. Perfilado del 2026-08-23 (`sample`, 25 s de busqueda real):
+///    `aplicar_features_desde` = 27,1% del tiempo del hilo de busqueda, el
+///    item mas caro con diferencia. Ahora `entrar` solo ANOTA el delta
+///    (`Pendiente`) y marca el nivel sucio; la pasada se hace recien cuando
+///    alguien LEE el acumulador (`materializar`), poniendose al dia con la
+///    cadena de niveles pendientes. Medido en `bench 13`: de 702.204
+///    llamadas a `entrar` solo 524.203 terminan en una pasada real, o sea
+///    que el 25,3% del trabajo mas caro del motor simplemente no se hace.
+///
+/// Sigue siendo BIT-IDENTICO: son exactamente las mismas sumas y restas
+/// envolventes de i16, en el mismo orden, solo que ejecutadas mas tarde (o
+/// nunca). Verificado con conteos de nodos EXACTOS en `bench 12/13/14`.
 #[derive(Clone)]
 pub struct AcumBullet {
     red: &'static RedBullet,
     pila: Vec<Nivel>,
+    /// Paralelo a `pila`: delta pendiente y bandera de sucio por nivel.
+    /// `pend[0].sucio` es SIEMPRE false (la raiz se calcula del tablero),
+    /// invariante en la que se apoya la busqueda hacia atras de
+    /// `materializar` para no salirse del vector.
+    pend: Vec<Pendiente>,
     nivel: usize,
 }
 
@@ -525,7 +569,14 @@ impl AcumBullet {
         // crece la pila sola si hiciera falta.
         let mut pila = Vec::with_capacity(96);
         pila.push(inicial);
-        AcumBullet { red, pila, nivel: 0 }
+        let mut pend = Vec::with_capacity(96);
+        pend.push(Pendiente::default()); // raiz: nunca sucia
+        AcumBullet {
+            red,
+            pila,
+            pend,
+            nivel: 0,
+        }
     }
 
     /// Construye UN nivel recalculando el acumulador entero desde el tablero.
@@ -567,9 +618,11 @@ impl AcumBullet {
     }
 
     /// Acceso de solo lectura al acumulador vigente (lo usan los tests de
-    /// equivalencia incremental-vs-recalculado).
+    /// equivalencia incremental-vs-recalculado). Materializa primero: con
+    /// actualizacion perezosa, `pila[nivel].persp` puede estar sin calcular.
     #[inline]
-    pub fn persp(&self) -> &[[i16; H_MAX]; 2] {
+    pub fn persp(&mut self) -> &[[i16; H_MAX]; 2] {
+        self.materializar();
         &self.pila[self.nivel].persp
     }
 
@@ -580,6 +633,9 @@ impl AcumBullet {
     /// camino rapido se manifestaria.
     #[cfg(test)]
     pub fn forzar_persp(&mut self, yo: [i16; H_MAX], rival: [i16; H_MAX]) {
+        // Escribir a mano deja el nivel MATERIALIZADO por definicion: el
+        // contenido de `persp` pasa a ser el que pidio el test.
+        self.pend[self.nivel].sucio = false;
         let n = &mut self.pila[self.nivel];
         n.negras_mueven = false;
         n.persp[0] = yo;
@@ -589,7 +645,8 @@ impl AcumBullet {
     /// La capa de salida por el camino vigente (el rapido si los pesos lo
     /// permiten) y por el escalar de referencia. SOLO para tests.
     #[cfg(test)]
-    pub fn productos_punto_para_test(&self, bucket: usize) -> (i64, i64) {
+    pub fn productos_punto_para_test(&mut self, bucket: usize) -> (i64, i64) {
+        self.materializar();
         let n = self.actual();
         (
             self.producto_punto(&n.persp[0], &n.persp[1], bucket),
@@ -678,8 +735,12 @@ impl AcumBullet {
             // entero en vez de aplicar un delta incompleto.
             let n = AcumBullet::nivel_desde_tablero(red, despues);
             self.pila[self.nivel] = n;
+            self.pend[self.nivel].sucio = false;
             return;
         }
+        // Version in-place: muta `persp`, asi que el nivel tiene que estar
+        // materializado antes de tocarlo.
+        self.materializar();
         let nivel = &mut self.pila[self.nivel];
         nivel.negras_mueven = despues.turn == Color::Black;
         nivel.piezas = (nivel.piezas as i32 + delta_piezas) as u8;
@@ -688,34 +749,43 @@ impl AcumBullet {
         red.aplicar_features(&mut nivel.persp[1], &c1.add, &c1.sub);
     }
 
-    /// Baja un nivel: calcula el acumulador del hijo LEYENDO el del padre y
-    /// ESCRIBIENDO en el slot siguiente de la pila, en una sola pasada.
+    /// Baja un nivel. NO calcula el acumulador del hijo: solo ANOTA que
+    /// features cambian y marca el nivel como sucio (actualizacion
+    /// perezosa). La pasada real la hace `materializar` la primera vez que
+    /// alguien lee el acumulador, fusionando de una sola vez todos los
+    /// deltas pendientes de la cadena.
     ///
-    /// Este es el punto de la pila: antes, volver al padre exigia aplicar el
-    /// delta invertido (`aplicar_jugada(despues, antes)`), o sea que cada
-    /// jugada pagaba DOS pasadas completas del acumulador. Con la pila el
-    /// padre nunca se toca, asi que `salir` es solo decrementar un indice.
+    /// Por que: en la busqueda, muchisimos hijos NUNCA se evaluan -- corte
+    /// inmediato por TT, o eval servida por la cache de eval por zobrist --
+    /// y hasta ahora cada uno pagaba igual la pasada completa de 2 x h i16.
+    /// Los metadatos (`negras_mueven`, `piezas`) si se mantienen al dia
+    /// siempre: son un bool y un u8, y `bucket()` los consulta sin
+    /// materializar nada.
     pub fn entrar(&mut self, antes: &Board, despues: &Board) {
         let red = self.red;
         let (c0, c1, delta_piezas, desbordado) = Self::calcular_cambios(antes, despues);
         if self.nivel + 1 >= self.pila.len() {
             let copia = self.pila[self.nivel].clone();
             self.pila.push(copia);
+            self.pend.push(Pendiente::default());
         }
+        debug_assert_eq!(self.pila.len(), self.pend.len());
         if desbordado {
             let n = AcumBullet::nivel_desde_tablero(red, despues);
             self.pila[self.nivel + 1] = n;
+            self.pend[self.nivel + 1].sucio = false;
             self.nivel += 1;
             return;
         }
-        let (izq, der) = self.pila.split_at_mut(self.nivel + 1);
-        let padre = &izq[self.nivel];
-        let hijo = &mut der[0];
+        let piezas_padre = self.pila[self.nivel].piezas;
+        let hijo = &mut self.pila[self.nivel + 1];
         hijo.negras_mueven = despues.turn == Color::Black;
-        hijo.piezas = (padre.piezas as i32 + delta_piezas) as u8;
+        hijo.piezas = (piezas_padre as i32 + delta_piezas) as u8;
         debug_assert_eq!(hijo.piezas, contar_piezas(despues));
-        red.aplicar_features_desde(&padre.persp[0], &mut hijo.persp[0], &c0.add, &c0.sub);
-        red.aplicar_features_desde(&padre.persp[1], &mut hijo.persp[1], &c1.add, &c1.sub);
+        let p = &mut self.pend[self.nivel + 1];
+        p.c0 = c0;
+        p.c1 = c1;
+        p.sucio = true;
         self.nivel += 1;
     }
 
@@ -726,9 +796,66 @@ impl AcumBullet {
         self.nivel -= 1;
     }
 
+    /// Deja `pila[nivel].persp` valido, aplicando los deltas pendientes que
+    /// separan el nivel vigente del ancestro materializado mas cercano.
+    ///
+    /// Se aplican PLY A PLY (no fusionados en una sola pasada) y cada nivel
+    /// intermedio queda marcado como limpio. Es a proposito, y costo una
+    /// medicion aprenderlo: fusionar la cadena entera en una pasada sale
+    /// mas barato la PRIMERA vez, pero deja los intermedios sucios, y como
+    /// un nodo tiene decenas de hermanos, cada hermano volvia a re-aplicar
+    /// los mismos deltas del ancestro. Medido en `bench 13`: la version
+    /// fusionada gastaba 8,27 G instrucciones contra 6,21 G del eager
+    /// (+33%). Ply a ply el coste de ponerse al dia es EXACTAMENTE el mismo
+    /// que tenia la version eager para esa cadena; lo que se ahorra son los
+    /// niveles que nadie llega a leer nunca.
+    ///
+    /// Sigue siendo BIT-IDENTICO a la version eager: son las mismas sumas y
+    /// restas envolventes de i16, en el mismo orden, solo que ejecutadas mas
+    /// tarde (o nunca).
+    pub fn materializar(&mut self) {
+        if !self.pend[self.nivel].sucio {
+            return;
+        }
+        self.materializar_lento();
+    }
+
+    #[inline(never)]
+    fn materializar_lento(&mut self) {
+        let objetivo = self.nivel;
+        // Ancestro materializado mas cercano. `pend[0].sucio` es siempre
+        // false, asi que el bucle termina sin salirse.
+        let mut j = objetivo;
+        while self.pend[j].sucio {
+            debug_assert!(j > 0, "el nivel 0 nunca puede estar sucio");
+            j -= 1;
+        }
+        let red = self.red;
+        while j < objetivo {
+            let (izq, der) = self.pila.split_at_mut(j + 1);
+            let padre = &izq[j];
+            let hijo = &mut der[0];
+            let p = &self.pend[j + 1];
+            red.aplicar_features_desde(&padre.persp[0], &mut hijo.persp[0], &p.c0.add, &p.c0.sub);
+            red.aplicar_features_desde(&padre.persp[1], &mut hijo.persp[1], &p.c1.add, &p.c1.sub);
+            self.pend[j + 1].sucio = false;
+            j += 1;
+        }
+        debug_assert!(!self.pend[objetivo].sucio);
+    }
+
     /// Salida en centipeones desde la perspectiva del lado que mueve
     /// (misma convencion que la evaluacion clasica del motor).
     pub fn evaluar(&self) -> f32 {
+        // Contrato de la actualizacion perezosa: quien consigue una
+        // referencia a este acumulador tiene que haberlo materializado antes
+        // (en la busqueda eso pasa en un unico punto, `Searcher::nnue_de`).
+        // Si algun camino nuevo se saltara ese paso, este assert lo caza en
+        // los tests en vez de devolver una eval de otra posicion.
+        debug_assert!(
+            !self.pend[self.nivel].sucio,
+            "evaluar() sobre un acumulador sin materializar"
+        );
         let n = self.actual();
         let (yo, rival) = if n.negras_mueven {
             (&n.persp[1], &n.persp[0])
@@ -1052,8 +1179,8 @@ mod tests {
             let acc = AcumBullet::desde_tablero(red, &antes);
             for mv in generate_legal(&antes) {
                 let despues = antes.make_move(&mv);
-                let inc = acc.despues_de_jugada(&antes, &despues);
-                let re = AcumBullet::desde_tablero(red, &despues);
+                let mut inc = acc.despues_de_jugada(&antes, &despues);
+                let mut re = AcumBullet::desde_tablero(red, &despues);
                 assert_eq!(inc.persp(), re.persp(), "acumulador difiere tras {}", mv.to_uci());
                 assert_eq!(inc.negras_mueven(), re.negras_mueven());
                 assert_eq!(inc.evaluar(), re.evaluar());
@@ -1090,7 +1217,7 @@ mod tests {
             let mv = legales[(semilla as usize) % legales.len()];
             let siguiente = tablero.make_move(&mv);
             acumulador.aplicar_jugada(&tablero, &siguiente);
-            let re = AcumBullet::desde_tablero(red, &siguiente);
+            let mut re = AcumBullet::desde_tablero(red, &siguiente);
             assert_eq!(acumulador.persp(), re.persp(), "in-place difiere tras {}", mv.to_uci());
             assert_eq!(acumulador.negras_mueven(), re.negras_mueven());
             pila.push((tablero, siguiente));
@@ -1098,7 +1225,7 @@ mod tests {
         }
         while let Some((antes, despues)) = pila.pop() {
             acumulador.aplicar_jugada(&despues, &antes);
-            let re = AcumBullet::desde_tablero(red, &antes);
+            let mut re = AcumBullet::desde_tablero(red, &antes);
             assert_eq!(acumulador.persp(), re.persp(), "undo no restauro el padre");
             assert_eq!(acumulador.negras_mueven(), re.negras_mueven());
         }
@@ -1346,7 +1473,7 @@ mod tests {
 
                     let siguiente = tablero.make_move(&mv);
                     acumulador.aplicar_jugada(&tablero, &siguiente);
-                    comparar(&acumulador, red, &siguiente, "bajada", &mv);
+                    comparar(&mut acumulador, red, &siguiente, "bajada", &mv);
                     posiciones += 1;
 
                     pila.push((tablero, siguiente));
@@ -1356,7 +1483,7 @@ mod tests {
                 while let Some((antes, despues)) = pila.pop() {
                     acumulador.aplicar_jugada(&despues, &antes);
                     comparar(
-                        &acumulador,
+                        &mut acumulador,
                         red,
                         &antes,
                         "undo",
@@ -1385,13 +1512,13 @@ mod tests {
     /// Compara el acumulador incremental con el recalculo completo desde
     /// `tablero`, en todos sus campos observables.
     fn comparar(
-        acumulador: &AcumBullet,
+        acumulador: &mut AcumBullet,
         red: &'static RedBullet,
         tablero: &crate::board::Board,
         fase: &str,
         mv: &crate::types::Move,
     ) {
-        let re = AcumBullet::desde_tablero(red, tablero);
+        let mut re = AcumBullet::desde_tablero(red, tablero);
         assert_eq!(
             acumulador.persp()[0], re.persp()[0],
             "[{fase}] perspectiva blanca difiere tras {} en {}",
@@ -1454,7 +1581,7 @@ mod tests {
             let original = *acumulador.persp();
             let nulo = b.make_null_move();
             acumulador.aplicar_jugada(&b, &nulo);
-            let re = AcumBullet::desde_tablero(red, &nulo);
+            let mut re = AcumBullet::desde_tablero(red, &nulo);
             assert_eq!(acumulador.persp(), re.persp(), "nula: acumulador difiere en {fen}");
             assert_eq!(acumulador.negras_mueven(), re.negras_mueven());
             assert_eq!(acumulador.piezas(), re.piezas());
@@ -1478,7 +1605,7 @@ mod tests {
             "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
         )
         .unwrap();
-        let base = AcumBullet::desde_tablero(red, &b);
+        let mut base = AcumBullet::desde_tablero(red, &b);
         // Caso tipico de captura: 3 features cambian (origen, destino, pieza
         // capturada).
         let add: [u16; 1] = [feature(0, 0, 4, 27) as u16];
@@ -1590,7 +1717,7 @@ mod tests {
                 hijo.make_move(mv);
 
                 acum.entrar(&b, &hijo);
-                let re = AcumBullet::desde_tablero(red, &hijo);
+                let mut re = AcumBullet::desde_tablero(red, &hijo);
                 assert_eq!(
                     acum.persp(),
                     re.persp(),
@@ -1637,7 +1764,7 @@ mod tests {
             historia.push(b.clone());
             b = hijo;
         }
-        let re = AcumBullet::desde_tablero(red, &b);
+        let mut re = AcumBullet::desde_tablero(red, &b);
         assert_eq!(acum.persp(), re.persp(), "pila profunda: hoja mal");
 
         while historia.pop().is_some() {

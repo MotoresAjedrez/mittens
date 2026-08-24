@@ -1017,13 +1017,36 @@ impl Searcher {
     /// Acumulador a consultar para `eval_state`. Devuelve None si este nodo
     /// tiene la NNUE apagada: en ese caso el buffer del Searcher quedo
     /// congelado en un ancestro y no corresponde al tablero actual.
+    ///
+    /// UNICO punto del motor que entrega una referencia al acumulador, y por
+    /// eso es aqui donde se paga la actualizacion perezosa: `entrar_hijo`
+    /// solo anota el delta de cada ply, y la pasada real (ponerse al dia con
+    /// la cadena pendiente) se hace recien cuando alguien pide leer. Si un
+    /// camino nuevo consiguiera el acumulador sin pasar por aca,
+    /// `AcumBullet::evaluar` lo caza con un debug_assert.
     #[inline]
-    fn nnue_de(&self, eval_state: &EvalState) -> Option<&crate::neural::NnueAccumulator> {
+    fn nnue_de(&mut self, eval_state: &EvalState) -> Option<&crate::neural::NnueAccumulator> {
         if eval_state.nnue_activo() {
-            self.nnue.as_ref()
+            let acum = self.nnue.as_mut()?;
+            acum.asegurar_actualizado();
+            Some(acum)
         } else {
             None
         }
+    }
+
+    /// True si este nodo evalua por el camino "red bullet pura", el unico
+    /// que puede usar la cache de eval por zobrist. NO toca el acumulador
+    /// (solo mira que arquitectura hay cargada), asi que se puede consultar
+    /// ANTES de materializar -- que es justo lo que permite que un acierto
+    /// de cache no pague ninguna pasada del acumulador.
+    #[inline]
+    fn usa_cache_eval(&self, eval_state: &EvalState) -> bool {
+        eval_state.nnue_activo()
+            && match self.nnue.as_ref() {
+                Some(acum) => acum.pura(),
+                None => false,
+            }
     }
 
     /// True si en ESTA configuracion la parte clasica de la evaluacion puede
@@ -1050,35 +1073,43 @@ impl Searcher {
     }
 
     #[inline]
-    fn evaluar_completo(&self, b: &Board, eval_state: &EvalState) -> i32 {
-        let nnue = self.nnue_de(eval_state);
+    fn evaluar_completo(&mut self, b: &Board, eval_state: &EvalState) -> i32 {
         // Cache de eval por zobrist: SOLO en el camino "red bullet pura"
         // (el default de produccion), donde la eval es funcion pura de la
         // posicion -- ver src/eval_cache.rs. En cualquier otro camino
         // (clasica, hibrido, red de amenazas) se evalua directo, como antes.
-        if let Some(acum) = nnue {
-            if acum.pura() {
-                if let Some(v) = crate::eval_cache::probe(b.zobrist) {
-                    // En builds de debug, cada acierto se verifica contra la
-                    // eval recomputada: si esto falla, la cache esta
-                    // devolviendo un valor que NO es el de la posicion.
-                    debug_assert_eq!(
-                        v,
-                        evaluate_with_state(b, eval_state, nnue),
-                        "eval_cache devolvio un valor distinto del recomputado"
-                    );
-                    return v;
-                }
-                let v = evaluate_with_state(b, eval_state, nnue);
-                crate::eval_cache::store(b.zobrist, v);
+        //
+        // OJO AL ORDEN: la consulta a la cache va ANTES de pedir el
+        // acumulador. Un acierto devuelve el valor sin materializar nada, y
+        // esa es la mitad del ahorro de la actualizacion perezosa: el nodo
+        // no paga la pasada del acumulador, y si ademas ninguno de sus
+        // descendientes lee, tampoco la pagan ellos.
+        if self.usa_cache_eval(eval_state) {
+            if let Some(v) = crate::eval_cache::probe(b.zobrist) {
+                // En builds de debug, cada acierto se verifica contra la
+                // eval recomputada: si esto falla, la cache esta
+                // devolviendo un valor que NO es el de la posicion.
+                debug_assert_eq!(
+                    v,
+                    {
+                        let nnue = self.nnue_de(eval_state);
+                        evaluate_with_state(b, eval_state, nnue)
+                    },
+                    "eval_cache devolvio un valor distinto del recomputado"
+                );
                 return v;
             }
+            let nnue = self.nnue_de(eval_state);
+            let v = evaluate_with_state(b, eval_state, nnue);
+            crate::eval_cache::store(b.zobrist, v);
+            return v;
         }
+        let nnue = self.nnue_de(eval_state);
         evaluate_with_state(b, eval_state, nnue)
     }
 
     #[inline]
-    fn evaluar_quiescence(&self, b: &Board, eval_state: &EvalState) -> i32 {
+    fn evaluar_quiescence(&mut self, b: &Board, eval_state: &EvalState) -> i32 {
         if self.qsearch_nnue {
             self.evaluar_completo(b, eval_state)
         } else {
