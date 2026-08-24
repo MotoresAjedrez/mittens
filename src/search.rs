@@ -396,6 +396,65 @@ fn ordenar_estable(moves: &mut [Move], claves: &mut [i32], sees: &mut [i32], ini
 /// hacía su propio `b.make_move(mv)` para consultar eso (hasta 3 copias de
 /// 144 bytes por jugada en los nodos poco profundos, que son la mayoria del
 /// arbol). Maneja capturas, al paso, enroque y promociones.
+#[inline]
+fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
+    use crate::bitboard::{
+        bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, rook_attacks,
+    };
+    use crate::types::{Color, file_of, make_square, rank_of};
+
+    let us = b.turn;
+    let them = us.opposite();
+    let ksq = b.king_square(them);
+    let (_, pt) = b
+        .piece_at(mv.from)
+        .expect("da_jaque_sin_copiar: no hay pieza en 'from'");
+    let pieza_final = mv.promotion.unwrap_or(pt);
+
+    // Posicion virtual post-jugada: ocupacion + piezas propias ajustadas.
+    let mut occ = (b.occupied & !bit(mv.from)) | bit(mv.to);
+    let mut piezas = b.pieces[us as usize];
+    piezas[pt as usize] &= !bit(mv.from);
+    piezas[pieza_final as usize] |= bit(mv.to);
+    if mv.flag == MoveFlag::EnPassant {
+        let ep = make_square(file_of(mv.to), rank_of(mv.from));
+        occ &= !bit(ep);
+        piezas[PieceType::Pawn as usize] &= !bit(ep);
+    }
+    let (rf, rt) = match (mv.flag, us) {
+        (MoveFlag::CastleKing, Color::White) => (make_square(7, 0), make_square(5, 0)),
+        (MoveFlag::CastleKing, Color::Black) => (make_square(7, 7), make_square(5, 7)),
+        (MoveFlag::CastleQueen, Color::White) => (make_square(0, 0), make_square(3, 0)),
+        (MoveFlag::CastleQueen, Color::Black) => (make_square(0, 7), make_square(3, 7)),
+        _ => (0, 0),
+    };
+    if mv.flag == MoveFlag::CastleKing || mv.flag == MoveFlag::CastleQueen {
+        occ = (occ & !bit(rf)) | bit(rt);
+        piezas[PieceType::Rook as usize] &= !bit(rf);
+        piezas[PieceType::Rook as usize] |= bit(rt);
+    }
+
+    // Misma logica que Board::is_square_attacked_by(ksq, us).
+    if pawn_attacks(them, ksq) & piezas[PieceType::Pawn as usize] != 0 {
+        return true;
+    }
+    if knight_attacks(ksq) & piezas[PieceType::Knight as usize] != 0 {
+        return true;
+    }
+    if king_attacks(ksq) & piezas[PieceType::King as usize] != 0 {
+        return true;
+    }
+    let alfil_dama = piezas[PieceType::Bishop as usize] | piezas[PieceType::Queen as usize];
+    if alfil_dama != 0 && bishop_attacks(ksq, occ) & alfil_dama != 0 {
+        return true;
+    }
+    let torre_dama = piezas[PieceType::Rook as usize] | piezas[PieceType::Queen as usize];
+    if torre_dama != 0 && rook_attacks(ksq, occ) & torre_dama != 0 {
+        return true;
+    }
+    false
+}
+
 /// Mascaras de jaque de UN NODO (no de una jugada). `da_jaque_sin_copiar` es
 /// exacto pero caro (reconstruye la ocupacion virtual y hace hasta cinco
 /// consultas de ataque, dos de ellas magicas) y la busqueda lo llamaba una vez
@@ -502,64 +561,6 @@ fn da_jaque_con_mascaras(b: &Board, mv: &Move, m: &MascarasJaque) -> bool {
     da_jaque_sin_copiar(b, mv)
 }
 
-#[inline]
-fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
-    use crate::bitboard::{
-        bishop_attacks, bit, king_attacks, knight_attacks, pawn_attacks, rook_attacks,
-    };
-    use crate::types::{Color, file_of, make_square, rank_of};
-
-    let us = b.turn;
-    let them = us.opposite();
-    let ksq = b.king_square(them);
-    let (_, pt) = b
-        .piece_at(mv.from)
-        .expect("da_jaque_sin_copiar: no hay pieza en 'from'");
-    let pieza_final = mv.promotion.unwrap_or(pt);
-
-    // Posicion virtual post-jugada: ocupacion + piezas propias ajustadas.
-    let mut occ = (b.occupied & !bit(mv.from)) | bit(mv.to);
-    let mut piezas = b.pieces[us as usize];
-    piezas[pt as usize] &= !bit(mv.from);
-    piezas[pieza_final as usize] |= bit(mv.to);
-    if mv.flag == MoveFlag::EnPassant {
-        let ep = make_square(file_of(mv.to), rank_of(mv.from));
-        occ &= !bit(ep);
-        piezas[PieceType::Pawn as usize] &= !bit(ep);
-    }
-    let (rf, rt) = match (mv.flag, us) {
-        (MoveFlag::CastleKing, Color::White) => (make_square(7, 0), make_square(5, 0)),
-        (MoveFlag::CastleKing, Color::Black) => (make_square(7, 7), make_square(5, 7)),
-        (MoveFlag::CastleQueen, Color::White) => (make_square(0, 0), make_square(3, 0)),
-        (MoveFlag::CastleQueen, Color::Black) => (make_square(0, 7), make_square(3, 7)),
-        _ => (0, 0),
-    };
-    if mv.flag == MoveFlag::CastleKing || mv.flag == MoveFlag::CastleQueen {
-        occ = (occ & !bit(rf)) | bit(rt);
-        piezas[PieceType::Rook as usize] &= !bit(rf);
-        piezas[PieceType::Rook as usize] |= bit(rt);
-    }
-
-    // Misma logica que Board::is_square_attacked_by(ksq, us).
-    if pawn_attacks(them, ksq) & piezas[PieceType::Pawn as usize] != 0 {
-        return true;
-    }
-    if knight_attacks(ksq) & piezas[PieceType::Knight as usize] != 0 {
-        return true;
-    }
-    if king_attacks(ksq) & piezas[PieceType::King as usize] != 0 {
-        return true;
-    }
-    let alfil_dama = piezas[PieceType::Bishop as usize] | piezas[PieceType::Queen as usize];
-    if alfil_dama != 0 && bishop_attacks(ksq, occ) & alfil_dama != 0 {
-        return true;
-    }
-    let torre_dama = piezas[PieceType::Rook as usize] | piezas[PieceType::Queen as usize];
-    if torre_dama != 0 && rook_attacks(ksq, occ) & torre_dama != 0 {
-        return true;
-    }
-    false
-}
 
 // TT compartida entre hilos (Lazy SMP): LOCKLESS de verdad, sin Mutex.
 // Motivacion (analisis comparativo contra Reckless, motor top-3 CCRL): su TT
