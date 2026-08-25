@@ -18,6 +18,8 @@ import chess.engine
 
 
 def main() -> None:
+    if len(sys.argv) < 5:
+        raise SystemExit(__doc__)
     motor_path = pathlib.Path(sys.argv[1]).resolve()
     pesos = pathlib.Path(sys.argv[2]).resolve()
     fens_path = pathlib.Path(sys.argv[3]).resolve()

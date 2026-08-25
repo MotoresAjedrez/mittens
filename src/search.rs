@@ -260,22 +260,25 @@ fn se_doble_activa() -> bool {
 /// `HOLGURA > REDUCCION`. Con REDUCCION = 1, cualquier HOLGURA >= 2 es seguro.
 ///
 /// POR QUE 4 Y NO EL MAS AGRESIVO POSIBLE (2). Barrido medido con
-/// `medir/nodos_arbol.py` (400 posiciones, profundidad 12, razon pareada) y
-/// SPRT a nodos fijos con `medir/sprt_diverso.py`:
+/// `medir/nodos_arbol.py` + `medir/pareado.py` (400 posiciones, profundidad 12,
+/// razon geometrica pareada), `medir/prof_a_nodos.py` y SPRT a nodos fijos con
+/// `medir/sprt_diverso.py`:
 ///
-/// | holgura | arbol a prof. 12 | plies extra a 100k nodos | Elo (partidas)   |
-/// |---------|------------------|--------------------------|------------------|
+/// | holgura | arbol a prof. 12 | plies extra a 100k nodos | Elo a 25k nodos     |
+/// |---------|------------------|--------------------------|---------------------|
 /// |   2     |     -47,7%       |          +1,86           | +3,0 +/-13,1 (1600) |
 /// |   3     |     -19,8%       |          (sin medir)     | -13,0 +/-26,7 (400) |
-/// |   4     |     -11,4%       |          +0,24           | +11,3 +/-13,2 (1600)|
-/// |   5     |      -3,4%       |          (sin medir)     | (sin medir)      |
+/// |   4     |     -11,4%       |          +0,24           | +8,4 +/- 8,2 (4160) |
+/// |   5     |      -3,4%       |          (sin medir)     | (sin medir)         |
 ///
-/// La holgura 2 achica el arbol casi a la mitad, pero eso NO es eficiencia: se
-/// gana profundidad NOMINAL (+3,1 plies a 400k nodos) sin ganar Elo, o sea que
-/// el ply pasa a valer menos. Es la trampa de medir solo con `nodos_arbol.py`:
-/// cualquier cambio que abarate el significado de un ply "gana" ahi. La holgura
-/// 4 achica menos pero es la unica del barrido cuyo Elo apunta hacia arriba con
-/// 2000 partidas acumuladas.
+/// La holgura 2 achica el arbol casi a la mitad y sube la profundidad NOMINAL
+/// (+3,1 plies a 400.000 nodos) sin ganar un solo Elo, y a 100.000 nodos/jugada
+/// incluso pierde (-15,9 +/-31,0 en 240 partidas). O sea: el ply se abarata y
+/// pasa a valer menos en la misma proporcion. Es la trampa de medir solo con
+/// `nodos_arbol.py` -- cualquier cambio que abarate el significado de un ply
+/// "gana" ahi. La holgura 4 achica menos pero es la unica del barrido que
+/// aguanta el SPRT, y a 100.000 nodos/jugada tambien va hacia arriba
+/// (+27,6 +/-31,6 en 240 partidas).
 fn iir_tt_holgura() -> i32 {
     static CACHE: OnceLock<i32> = OnceLock::new();
     *CACHE.get_or_init(|| {

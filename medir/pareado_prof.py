@@ -12,6 +12,8 @@ def crudo(p: pathlib.Path) -> list[int]:
     raise SystemExit(f"sin linea CRUDO en {p}")
 
 
+if len(sys.argv) < 3:
+    raise SystemExit(__doc__)
 a = crudo(pathlib.Path(sys.argv[1]))
 b = crudo(pathlib.Path(sys.argv[2]))
 if len(a) != len(b):
