@@ -185,6 +185,60 @@ fn rfp_margen_por_ply() -> i32 {
     })
 }
 
+// --- Perillas de calibracion de la extension singular (solo para medir) ---
+// Con la sonda barata (jugada excluida) el veredicto de singularidad cambia de
+// frecuencia respecto de la version que re-buscaba cada hermana a pelo, asi que
+// el margen y el piso de profundidad hay que RE-CALIBRARLOS. Se exponen por
+// variable de entorno para poder barrer valores con `bench` sin recompilar; los
+// valores por defecto son los que quedaron elegidos tras la medicion.
+fn se_margen_mult() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_SE_MARGEN")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v >= 1 && *v <= 32)
+            .unwrap_or(2)
+    })
+}
+
+fn se_prof_min() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_SE_PROF_MIN")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v >= 3 && *v <= 20)
+            .unwrap_or(8)
+    })
+}
+
+/// Podas de jugada-por-jugada DENTRO de la sonda de singularidad (LMP,
+/// futilidad de frontera y poda de quiets por SEE/historia). APAGADAS por
+/// defecto, y esto se midio, no se supuso:
+///
+/// esas podas pueden descartar justo la jugada hermana que REFUTARIA la
+/// singularidad. Cuando eso pasa la sonda contesta "singular" de mas y el
+/// arbol se llena de extensiones que no corresponden. Medido sobre 150
+/// posiciones a profundidad 12 (medir/nodos_arbol.py), con las podas
+/// encendidas el arbol crece un 2,8% respecto de main y el SPRT a 20.000
+/// nodos daba peor resultado; apagadas queda en 99,4% de main (neutro) y el
+/// SPRT sale a favor. La sonda sigue siendo barata igual: conserva orden de
+/// jugadas, LMR, TT y todas las podas de los niveles mas profundos, que es
+/// de donde sale el grueso del ahorro frente a la version vieja.
+///
+/// MITTENS_SE_PODA=1 las enciende (comportamiento estilo Stockfish puro).
+fn se_poda_en_sonda() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("MITTENS_SE_PODA").as_deref() == Ok("1"))
+}
+
+/// 0 desactiva la doble extension (+2); 1 la deja activa.
+fn se_doble_activa() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("MITTENS_SE_DOBLE").as_deref() != Ok("0"))
+}
+
 // Tabla LMR precalculada: reduccion base en plies para cada par
 // (profundidad, numero de jugada en el orden). Formula logaritmica clasica
 // (Ethereal/Stockfish): crece suave con ambas -- las jugadas muy tardias a
@@ -765,6 +819,25 @@ pub struct Searcher {
     see_negamax: Vec<[i32; MAX_MOVES]>,
     pub lmr_intentos: u64,
     pub lmr_reintentos: u64,
+    // Diagnostico de la extension singular (se imprime en `bench`): cuantas
+    // sondas de singularidad se lanzaron y cuantos nodos se fueron en ellas.
+    // Es el numero que permite comparar de frente el costo de la sonda vieja
+    // (re-buscar cada hermana a mano) contra la nueva (jugada excluida), que
+    // es de lo que trata este cambio. Dos sumas por sonda: costo despreciable.
+    pub se_sondas: u64,
+    pub se_nodos: u64,
+    // Jugada EXCLUIDA por ply (equivalente de `ss->excludedMove` de
+    // Stockfish). La usa la verificacion de singularidad: en vez de re-buscar
+    // a mano cada jugada hermana (lo que hacia antes esta implementacion, sin
+    // LMR/LMP/futilidad y por lo tanto carisimo), se vuelve a entrar a ESTE
+    // MISMO nodo con profundidad reducida marcando la jugada de la TT como
+    // excluida. Asi la sonda reutiliza toda la maquinaria de poda y orden del
+    // motor y cuesta una fraccion de lo que costaba.
+    //
+    // Contrato "consumir una vez": negamax LEE y BORRA la ranura de su ply al
+    // entrar, asi que no puede quedar un valor viejo contaminando otra rama.
+    // Solo la sonda de singularidad la escribe, justo antes de recursar.
+    excluded: Vec<Option<Move>>,
     // Hindsight reductions: para el hijo alcanzado mediante una busqueda
     // reducida guardamos la evaluacion estatica del padre y la reduccion
     // aplicada. Los vectores estan indexados por ply y son locales al hilo.
@@ -867,8 +940,11 @@ impl Searcher {
             path_len: 0,
             claves_negamax: vec![[0i32; MAX_MOVES]; MAX_PLY as usize + 2],
             see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
+            se_sondas: 0,
+            se_nodos: 0,
             lmr_intentos: 0,
             lmr_reintentos: 0,
+            excluded: vec![None; MAX_KILLER_PLY],
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
             hindsight_reduction: vec![0; MAX_KILLER_PLY],
             eval_stack: vec![EVAL_INVALIDA; MAX_KILLER_PLY],
@@ -963,8 +1039,11 @@ impl Searcher {
             path_len: 0,
             claves_negamax: vec![[0i32; MAX_MOVES]; MAX_PLY as usize + 2],
             see_negamax: vec![[i32::MIN; MAX_MOVES]; MAX_PLY as usize + 2],
+            se_sondas: 0,
+            se_nodos: 0,
             lmr_intentos: 0,
             lmr_reintentos: 0,
+            excluded: vec![None; MAX_KILLER_PLY],
             hindsight_parent_eval: vec![0; MAX_KILLER_PLY],
             hindsight_reduction: vec![0; MAX_KILLER_PLY],
             eval_stack: vec![EVAL_INVALIDA; MAX_KILLER_PLY],
@@ -1957,6 +2036,18 @@ impl Searcher {
     ) -> Result<i32, TimeUp> {
         self.check_time()?;
 
+        // Jugada excluida de ESTE nodo (ver campo `excluded`). Se lee y se
+        // BORRA de inmediato: el contrato es "consumir una vez", asi ninguna
+        // rama posterior puede heredar por accidente la exclusion de otra.
+        let excluida: Option<Move> = {
+            let pe = ply as usize;
+            if pe < MAX_KILLER_PLY {
+                self.excluded[pe].take()
+            } else {
+                None
+            }
+        };
+
         if b.halfmove_clock >= 100 {
             return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
         }
@@ -2049,7 +2140,11 @@ impl Searcher {
             // motivo; aca no habia ninguna guarda. Solo se pierde el ATAJO:
             // la busqueda real de ese nodo si respeta la regla (el chequeo
             // halfmove_clock >= 100 esta al entrar a negamax y a quiescence).
-            if entry.depth >= depth && !nodo_pv && b.halfmove_clock < 90 {
+            // Con una jugada EXCLUIDA la entrada de la TT responde a otra
+            // pregunta (el valor del nodo CON esa jugada disponible), asi que
+            // no puede cortar: solo aporta `tt_move` para el orden. Mismo
+            // criterio que `!excludedMove` en el corte por TT de Stockfish.
+            if entry.depth >= depth && !nodo_pv && b.halfmove_clock < 90 && excluida.is_none() {
                 match entry.flag {
                     TTFlag::Exact => return Ok(entry.score),
                     TTFlag::Beta if entry.score >= beta => return Ok(entry.score),
@@ -2214,8 +2309,15 @@ impl Searcher {
         const NULL_MOVE_EVAL_DIV: i32 = 200;
         const NULL_MOVE_EVAL_MAX: i32 = 2;
         const NULL_MOVE_PROF_MIN: i32 = 3;
+        // `excluida.is_none()`: en la sonda de singularidad el sondeo nulo
+        // contestaria "el rival no aguanta ni pasando el turno", que NO es lo
+        // que la sonda pregunta ("¿alguna jugada DISTINTA de la de la TT
+        // alcanza sbeta?"). Un corte por null-move ahi seria un falso
+        // positivo que mata la extension. Stockfish tiene la misma guarda
+        // (`&& !excludedMove` en la condicion de NMP).
         if !en_jaque
             && !es_pv
+            && excluida.is_none()
             && depth >= NULL_MOVE_PROF_MIN
             && beta < MATE - 1000
             && alpha > -(MATE - 1000)
@@ -2269,7 +2371,15 @@ impl Searcher {
         // significativa, y lejos de puntajes de mate.
         const PROBCUT_PROF_MIN: i32 = 5;
         const PROBCUT_MARGEN: i32 = 150;
-        if !en_jaque && !es_pv && depth >= PROBCUT_PROF_MIN && beta.abs() < MATE - 1000 {
+        // Igual que el null-move: ProbCut podria cortar CON la jugada de la TT
+        // (que en la sonda esta excluida) o con una cota de TT ajena a la
+        // pregunta de la sonda. Se apaga cuando hay jugada excluida.
+        if !en_jaque
+            && !es_pv
+            && excluida.is_none()
+            && depth >= PROBCUT_PROF_MIN
+            && beta.abs() < MATE - 1000
+        {
             let probcut_beta = beta + PROBCUT_MARGEN;
             let sdepth_guarda = (depth - 4).max(1);
             // Guarda de TT: si ya hay una entrada para esta posicion buscada a
@@ -2381,9 +2491,14 @@ impl Searcher {
         }
 
         // Profundidad minima para activar la verificacion de singularidad.
-        const SE_PROF_MIN: i32 = 8;
-        let se_activable =
-            self.modo_singular && !en_sondeo_se && !en_jaque && ply > 0 && depth >= SE_PROF_MIN;
+        let se_prof_min = se_prof_min();
+        let se_activable = self.modo_singular
+            && !en_sondeo_se
+            && excluida.is_none()
+            && !en_jaque
+            && ply > 0
+            && (ply as usize) < MAX_KILLER_PLY
+            && depth >= se_prof_min;
         // NOTA HISTORICA: se probo una "generacion por etapas" completa
         // (TT sola -> capturas -> silenciosas) al estilo Stockfish. Medida
         // h2h dio 42.0% (+21 =42 -37): regresion clara, asi que se revirtio
@@ -2391,39 +2506,13 @@ impl Searcher {
         // generada de una, con ordenamiento diferido (seleccion perezosa).
         // Buffer de claves de ESTE ply (ver comentario del campo).
         let pl_claves = ply as usize;
-        let mut moves;
-        let n_moves;
-        let mut lista_ordenada;
-        {
-            moves = MoveList::new();
-            generate_legal_into_con_jaque(b, &mut moves, en_jaque);
-            if moves.is_empty() {
-                self.path_len = self.path_len.saturating_sub(1);
-                return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
-            }
-            // ORDEN DE JUGADAS BAJO DEMANDA (seleccion perezosa): claves
-            // calculadas todas de una, ordenamiento diferido hasta que la
-            // primera jugada no corta.
-            n_moves = moves.len();
-            {
-                let mut amenazas: Option<u64> = None;
-                for j in 0..n_moves {
-                    let mv_j = &moves[j];
-                    // SEE calculado UNA sola vez aca (paso 2 del SEE
-                    // deduplicado) y reutilizado tanto por
-                    // clave_orden_movimiento como por el SEE-prune mas abajo
-                    // en el bucle principal. Centinela i32::MIN para jugadas
-                    // que no son capturas.
-                    let see_j = mv_j.is_capture().then(|| crate::see::see(b, mv_j));
-                    let k = self.clave_orden_movimiento(
-                        b, mv_j, tt_move, ply, prev, prev2, see_j, &mut amenazas,
-                    );
-                    self.claves_negamax[pl_claves][j] = k;
-                    self.see_negamax[pl_claves][j] = see_j.unwrap_or(i32::MIN);
-                }
-            }
-            lista_ordenada = false;
+        let mut moves = MoveList::new();
+        generate_legal_into_con_jaque(b, &mut moves, en_jaque);
+        if moves.is_empty() {
+            self.path_len = self.path_len.saturating_sub(1);
+            return Ok(if en_jaque { -MATE + ply as i32 } else { 0 });
         }
+        let n_moves = moves.len();
 
         // Singular extensions: si la jugada de la TT es tan claramente
         // superior a TODAS las demas que ninguna otra logra siquiera
@@ -2447,6 +2536,49 @@ impl Searcher {
         //     "parece" singular) y la extension de jaque ya existente puede
         //     encadenarse con la sonda de verificacion, multiplicando el
         //     costo sin aportar nada (la extension de jaque ya cubre ese caso).
+        // COMO se verifica la singularidad (v13, reescritura). Antes esta
+        // implementacion recorria A MANO todas las jugadas hermanas y lanzaba
+        // un negamax por cada una a profundidad sdepth, con ventana nula y SIN
+        // ninguna de las podas ni reducciones del motor en ese primer nivel
+        // (nada de LMR, LMP, futilidad ni SEE-prune, y ademas pasaba
+        // prev=None/prev2=None, o sea que TODO el subarbol de la sonda perdia
+        // el contexto de continuation history). Cada nodo realmente singular
+        // -- el caso sin corte temprano -- pagaba N-1 busquedas completas.
+        //
+        // Costo real medido con los contadores se_sondas/se_nodos (`bench`,
+        // las mismas 6 posiciones, mismo binario salvo este cambio):
+        //
+        //   profundidad | nodos por sonda      | % del arbol en sondas
+        //               |  antes  -> despues   |  antes -> despues
+        //        12     |  65,6   ->  27,9     |  6,1%  ->  3,3%
+        //        14     |  67,6   ->  30,5     |  5,5%  ->  4,4%
+        //        16     |  55,0   ->  28,7     |  8,5%  ->  4,3%
+        //
+        // O sea la sonda cuesta la MITAD por invocacion. (Ojo: el tamano
+        // TOTAL del arbol no baja en la misma proporcion, porque con la sonda
+        // barata se disparan mas sondas y cambian los veredictos; medido
+        // sobre 150 posiciones con medir/nodos_arbol.py el total queda en
+        // 99,4% de main a profundidad 12, o sea neutro. Lo que mejora es la
+        // CALIDAD por nodo, no la cantidad de nodos.)
+        //
+        // La forma estandar (Stockfish y todo motor moderno) es re-entrar al
+        // MISMO nodo con la jugada de la TT marcada como EXCLUIDA y
+        // profundidad reducida. La sonda pasa entonces por el bucle normal de
+        // negamax y hereda gratis el orden de jugadas, LMR, LMP, futilidad,
+        // SEE-prune y la TT -- exactamente el mismo veredicto (¿alguna jugada
+        // distinta de la de la TT alcanza sbeta?) por una fraccion del costo.
+        //
+        // Detalles de re-entrar al mismo ply (no los tiene Stockfish porque
+        // alla el estado de orden es local al frame, aca es un buffer por ply):
+        //  * `path`: el zobrist de este nodo ya se empujo antes del null-move.
+        //    Si sigue ahi, la sonda -- que es LA MISMA posicion -- se detecta a
+        //    si misma como repeticion y devuelve tablas. Se saca antes y se
+        //    repone despues.
+        //  * `hindsight_reduction[ply]`: ya se consumio al entrar a este nodo;
+        //    dejarlo puesto lo aplicaria dos veces sobre la profundidad.
+        //  * `claves_negamax[ply]` / `see_negamax[ply]`: por eso la sonda corre
+        //    ANTES de calcular las claves de este nodo (ver mas abajo), asi la
+        //    sonda puede usar esos buffers sin pisar nada.
         let mut jugada_singular: Option<Move> = None;
         // Cuanto se ajusta la profundidad de la jugada de la TT cuando la
         // verificacion singular dice algo sobre ella. Rango posible:
@@ -2457,22 +2589,6 @@ impl Searcher {
         //         y no vale la pena gastar profundidad completa en esa rama.
         // Solo se usa si jugada_singular == Some(esa jugada).
         let mut ext_singular: i32 = 0;
-        // La verificacion de singularidad recorre TODAS las jugadas antes del
-        // bucle principal y corta apenas una alcanza la ventana: su costo (y
-        // el contenido de la TT que deja) depende del orden en que las
-        // recorre. Para que el comportamiento sea identico al de antes, en
-        // los (pocos) nodos donde la verificacion puede activarse se ordena
-        // la lista completa de una, como se hacia siempre.
-        if se_activable {
-            ordenar_estable(
-                &mut moves,
-                &mut self.claves_negamax[pl_claves],
-                &mut self.see_negamax[pl_claves],
-                0,
-                n_moves,
-            );
-            lista_ordenada = true;
-        }
         if se_activable {
             if let (Some(entry), Some(tmv)) = (tt_entry_full, tt_move) {
                 if entry.depth >= depth - 3
@@ -2480,102 +2596,117 @@ impl Searcher {
                     && entry.score.abs() < MATE - 1000
                     && moves.contains(&tmv)
                 {
-                    let margen = 2 * depth;
+                    let margen = se_margen_mult() * depth;
                     let sbeta = entry.score - margen;
                     let sdepth = (depth - 1) / 2;
-                    let mut mejor_otra = -INFINITO;
-                    let mut se_timed_out = false;
-                    for mv in &moves {
-                        if *mv == tmv {
-                            continue;
-                        }
-                        let next = b.make_move(mv);
-                        let next_eval =
-                            self.siguiente_estado_busqueda(eval_state, b, &next, sdepth);
-                        // El hijo NO llega por LMR: limpiar el estado hindsight
-                        // del ply hijo para que no lea la reduccion de otro
-                        // subarbol.
-                        let child_ply = (ply + 1) as usize;
-                        if child_ply < MAX_KILLER_PLY {
-                            self.hindsight_reduction[child_ply] = 0;
-                        }
-                        let res_se = self.negamax(
-                            &next,
-                            &next_eval,
-                            sdepth,
-                            -sbeta,
-                            -sbeta + 1,
-                            ply + 1,
-                            None,
-                            None,
-                            true,
-                        );
-                        // Deshacer ANTES del match: los dos brazos pueden
-                        // romper el bucle.
-                        self.salir_hijo(&next_eval, b, &next);
-                        match res_se {
-                            Ok(v) => {
-                                let sc = -v;
-                                if sc > mejor_otra {
-                                    mejor_otra = sc;
-                                }
-                                if mejor_otra >= sbeta {
-                                    break; // otra jugada ya alcanza la ventana: no es singular
-                                }
+
+                    self.se_sondas += 1;
+                    let nodos_antes_se = self.nodes;
+                    let path_len_antes = self.path_len;
+                    self.path_len = self.path_len.saturating_sub(1);
+                    let hind_antes =
+                        std::mem::replace(&mut self.hindsight_reduction[pl_claves], 0);
+                    self.excluded[pl_claves] = Some(tmv);
+                    let res_se = self.negamax(
+                        b,
+                        eval_state,
+                        sdepth,
+                        sbeta - 1,
+                        sbeta,
+                        ply,
+                        prev,
+                        prev2,
+                        true,
+                    );
+                    // La sonda consume la exclusion al entrar; se limpia igual
+                    // por si un corte por tiempo la dejo sin consumir.
+                    self.excluded[pl_claves] = None;
+                    self.hindsight_reduction[pl_claves] = hind_antes;
+                    self.path_len = path_len_antes;
+                    self.se_nodos += self.nodes - nodos_antes_se;
+
+                    match res_se {
+                        // Corte por tiempo: el valor no es confiable, sin
+                        // veredicto (ni singular ni multicut), igual que antes.
+                        Err(_) => {}
+                        Ok(mejor_otra) => {
+                            if mejor_otra < sbeta {
+                                jugada_singular = Some(tmv);
+                                // DOBLE EXTENSION: no solo ninguna otra jugada
+                                // llega a sbeta, sino que ni siquiera se le
+                                // acerca por un margen adicional. La brecha con
+                                // la segunda mejor es GRANDE: señal mucho mas
+                                // fuerte de que la posicion es "forzada" y
+                                // conviene invertir mas busqueda ahi. Solo en
+                                // nodos que NO son PV: en PV la profundidad ya
+                                // es la mas alta y doblar extensiones ahi es la
+                                // receta clasica para explosiones de arbol.
+                                const SE_MARGEN2: i32 = 30;
+                                ext_singular = if se_doble_activa()
+                                    && !es_pv
+                                    && mejor_otra < sbeta - SE_MARGEN2
+                                {
+                                    2
+                                } else {
+                                    1
+                                };
+                            } else if mejor_otra >= beta && mejor_otra.abs() < MATE - 1000 {
+                                // MULTICUT: la jugada de la TT ya fallo alto
+                                // (entry.flag == TTFlag::Beta) y ADEMAS otra
+                                // jugada distinta supera beta en la busqueda
+                                // reducida. Dos fail-highs independientes: es
+                                // casi seguro que el nodo corta, asi que se
+                                // devuelve sin explorar mas. No se guarda en la
+                                // TT: el score viene de una ventana ajena a
+                                // beta y contaminaria la tabla.
+                                self.path_len = self.path_len.saturating_sub(1);
+                                return Ok(mejor_otra);
+                            } else if entry.score >= beta {
+                                // EXTENSION NEGATIVA: la jugada de la TT NO
+                                // resulto singular (otra jugada alcanza sbeta)
+                                // pero el valor guardado en la TT ya dice que
+                                // esta posicion es buena para el que mueve
+                                // incluso mas alla de la ventana actual. No hay
+                                // corte duro (eso lo cubre el multicut de
+                                // arriba), pero si hay evidencia de que el nodo
+                                // se resuelve solo: se REDUCE la jugada de la
+                                // TT en vez de buscarla a profundidad completa.
+                                jugada_singular = Some(tmv);
+                                ext_singular = -2;
                             }
-                            Err(_) => {
-                                se_timed_out = true;
-                                break;
-                            }
                         }
-                    }
-                    if se_timed_out {
-                        // Ni singular ni multicut: con corte por tiempo el
-                        // valor de mejor_otra no es confiable.
-                    } else if mejor_otra < sbeta {
-                        jugada_singular = Some(tmv);
-                        // DOBLE EXTENSION: no solo ninguna otra jugada llega a
-                        // sbeta, sino que ni siquiera se le acerca por un
-                        // margen adicional. La brecha con la segunda mejor es
-                        // GRANDE: señal mucho mas fuerte de que la posicion es
-                        // "forzada" y conviene invertir mas busqueda ahi. Solo
-                        // en nodos que NO son PV: en PV la profundidad ya es
-                        // la mas alta y doblar extensiones ahi es la receta
-                        // clasica para explosiones de arbol.
-                        const SE_MARGEN2: i32 = 30;
-                        ext_singular = if !es_pv && mejor_otra < sbeta - SE_MARGEN2 {
-                            2
-                        } else {
-                            1
-                        };
-                    } else if mejor_otra >= beta && mejor_otra.abs() < MATE - 1000 {
-                        // MULTICUT: la jugada de la TT ya fallo alto
-                        // (entry.flag == TTFlag::Beta) y ADEMAS otra jugada
-                        // distinta supera beta en la busqueda reducida. Dos
-                        // fail-highs independientes: es casi seguro que el
-                        // nodo corta, asi que se devuelve sin explorar mas.
-                        // No se guarda en la TT: el score viene de una ventana
-                        // ajena a beta y contaminaria la tabla.
-                        self.path_len = self.path_len.saturating_sub(1);
-                        return Ok(mejor_otra);
-                    } else if entry.score >= beta {
-                        // EXTENSION NEGATIVA: la jugada de la TT NO resulto
-                        // singular (otra jugada alcanza sbeta) pero el valor
-                        // guardado en la TT ya dice que esta posicion es buena
-                        // para el que mueve incluso mas alla de la ventana
-                        // actual. No hay corte duro (eso lo cubre el multicut
-                        // de arriba), pero si hay evidencia de que el nodo se
-                        // resuelve solo: se REDUCE la jugada de la TT en vez
-                        // de buscarla a profundidad completa. Stockfish usa -3
-                        // aca (y -2 extra en cutNode); Mittens no tiene la
-                        // señal de cutNode, asi que se queda con el valor
-                        // conservador -2.
-                        jugada_singular = Some(tmv);
-                        ext_singular = -2;
                     }
                 }
             }
         }
+
+        // ORDEN DE JUGADAS BAJO DEMANDA (seleccion perezosa): claves
+        // calculadas todas de una, ordenamiento diferido hasta que la primera
+        // jugada no corta.
+        //
+        // Va DESPUES de la sonda de singularidad a proposito: la sonda vuelve
+        // a entrar a este mismo ply y usa `claves_negamax[ply]` /
+        // `see_negamax[ply]`, asi que calcularlas antes seria calcularlas para
+        // que la sonda las pise. Como efecto lateral, las claves salen con el
+        // history/killers ya actualizados por la sonda, que es informacion mas
+        // fresca.
+        {
+            let mut amenazas: Option<u64> = None;
+            for j in 0..n_moves {
+                let mv_j = &moves[j];
+                // SEE calculado UNA sola vez aca (paso 2 del SEE deduplicado)
+                // y reutilizado tanto por clave_orden_movimiento como por el
+                // SEE-prune mas abajo en el bucle principal. Centinela
+                // i32::MIN para jugadas que no son capturas.
+                let see_j = mv_j.is_capture().then(|| crate::see::see(b, mv_j));
+                let k = self.clave_orden_movimiento(
+                    b, mv_j, tt_move, ply, prev, prev2, see_j, &mut amenazas,
+                );
+                self.claves_negamax[pl_claves][j] = k;
+                self.see_negamax[pl_claves][j] = see_j.unwrap_or(i32::MIN);
+            }
+        }
+        let mut lista_ordenada = false;
 
         // Mas conservador que en Python (que reducia desde la jugada #3 a
         // partir de profundidad 3): con SEE+killers el motor en Rust ya
@@ -2625,6 +2756,10 @@ impl Searcher {
         // victima), para aplicarles el malus de capture history.
         let mut capts_buscadas: [(u8, u8, u8); 32] = [(0, 0, 0); 32];
         let mut n_capts_buscadas = 0usize;
+        // Podas de jugada-por-jugada (LMP, futilidad de frontera, quiets por
+        // SEE/historia): se pueden apagar dentro de la sonda de singularidad
+        // (ver se_poda_en_sonda). Fuera de la sonda siempre estan activas.
+        let podar_en_este_nodo = excluida.is_none() || se_poda_en_sonda();
         let mut idx_siguiente = 0usize;
         'jugadas: loop {
             // Se agotaron las jugadas: fin del bucle.
@@ -2676,6 +2811,13 @@ impl Searcher {
             }
             let mv_actual = moves[idx];
             let mv = &mv_actual;
+            // Jugada EXCLUIDA (sonda de singularidad): este nodo tiene que
+            // contestar "¿que puede hacer el bando sin esta jugada?", asi que
+            // se la saltea. Es la unica diferencia entre la sonda y una
+            // busqueda normal de este mismo nodo.
+            if excluida == Some(*mv) {
+                continue;
+            }
             // LMR: candidatas a reducir son jugadas silenciosas, tarde en el
             // orden (ya viene de mejor a peor), sin jaque propio ni jaque
             // que dan -- justo donde el orden ya filtra la mayoria de
@@ -2710,6 +2852,7 @@ impl Searcher {
             let mut da_jaque: Option<bool> = None;
 
             if !en_jaque
+                && podar_en_este_nodo
                 && depth <= FUT_PROF_MAX
                 && idx > 0
                 && best_move.is_some()
@@ -2754,6 +2897,7 @@ impl Searcher {
             let lmp_umbral = ((3 + depth * depth) / (2 - improving as i32)) as usize;
             if !es_pv
                 && !en_jaque
+                && podar_en_este_nodo
                 && depth <= LMP_PROF_MAX
                 && best_move.is_some()
                 && !mv.is_capture()
@@ -2775,6 +2919,7 @@ impl Searcher {
             // de podar por `depth` a secas.
             if !es_pv
                 && !en_jaque
+                && podar_en_este_nodo
                 && best_move.is_some()
                 && !mv.is_capture()
                 && mv.promotion.is_none()
@@ -3159,6 +3304,15 @@ impl Searcher {
         }
         self.path_len = self.path_len.saturating_sub(1);
 
+        // Con jugada excluida puede pasar que la UNICA legal fuera justamente
+        // la excluida: no se busco nada. Eso no es mate ni ahogado (hay jugada
+        // legal), es "sin alternativas". Se devuelve alpha, igual que
+        // Stockfish, y la sonda lo lee como singular (alpha = sbeta-1 < sbeta),
+        // que es exactamente lo correcto: no hay ninguna otra opcion.
+        if excluida.is_some() && best_move.is_none() && best_score == -INFINITO {
+            return Ok(alpha);
+        }
+
         let flag = if best_score <= alpha_orig {
             TTFlag::Alpha
         } else if best_score >= beta {
@@ -3166,6 +3320,14 @@ impl Searcher {
         } else {
             TTFlag::Exact
         };
+        // Con jugada excluida el valor NO describe esta posicion (describe la
+        // posicion privada de una jugada), asi que no puede entrar ni a la TT
+        // ni al correction history: contaminaria las dos para toda busqueda
+        // posterior. Mismo criterio que `!excludedMove` en el ttWriter.write
+        // de Stockfish.
+        if excluida.is_some() {
+            return Ok(best_score);
+        }
         self.tt_store(key, depth, best_score, ply, flag, best_move, fue_pv);
 
         // Correction history: registrar el error entre el score REAL de la

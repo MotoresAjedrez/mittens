@@ -5,3 +5,7 @@
 
 # Respaldos manuales de archivos fuente (no deben ir al repo)
 *.bak_pre_*
+
+# Resultados locales de SPRT (PGN y checkpoints, no son fuente)
+/results_sprt/
+__pycache__/
