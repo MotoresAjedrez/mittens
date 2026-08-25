@@ -115,6 +115,50 @@ contamina mediciones"). Imprime la lista cruda `CRUDO ...` para poder comparar
 dos binarios **posicion a posicion** (razon geometrica pareada con IC95%), que
 tiene muchisima menos varianza que comparar los totales.
 
+### `pareado.py` — hace esa comparacion pareada
+
+```
+python3 medir/pareado.py salida_BASE.txt salida_CANDIDATO.txt
+```
+
+Lee las dos lineas `CRUDO` y saca la **razon geometrica pareada con IC95%**.
+Es lo que hay que citar, no el cociente de los totales: el total lo domina un
+punado de posiciones caras, mientras que el pareado usa las 400 muestras. Con
+400 posiciones a profundidad 12 el IC95 tipico ronda +-4%, o sea que **por
+debajo de ~4% no hay señal**, aunque el cociente de totales muestre un numero
+llamativo.
+
+---
+
+## 2b. `prof_a_nodos.py` — ¿el arbol mas chico se convierte en profundidad?
+
+```
+python3 medir/prof_a_nodos.py MOTOR PESOS medir/aperturas.txt NODOS [N_POSICIONES]
+python3 medir/pareado_prof.py salida_BASE.txt salida_CANDIDATO.txt
+```
+
+`pareado_prof.py` saca la **diferencia pareada de plies con IC95%** entre las
+dos corridas (y cuantas posiciones quedaron mas hondo / igual / menos hondo).
+
+Es la **contracara** de `nodos_arbol.py`: alli se fija la profundidad y se
+cuentan nodos; aca se fija el presupuesto de nodos y se mira hasta que
+profundidad llega.
+
+**Por que hace falta.** Un arbol mas chico a profundidad fija NO es por si solo
+una mejora: si la palanca lo unico que hace es recortar profundidad adentro del
+arbol, la "profundidad 12" del candidato es en realidad la 11 del baseline y el
+ahorro es un cambio de etiqueta, no eficiencia. Las tres mediciones juntas
+cuentan la historia completa:
+
+| medicion | que contesta |
+|---|---|
+| `nodos_arbol.py` + `pareado.py` | el arbol, ¿es mas chico a profundidad fija? |
+| `prof_a_nodos.py` | ese ahorro, ¿se convierte en mas plies con el mismo presupuesto? |
+| `sprt_diverso.py` | esos plies de mas, ¿ganan partidas? |
+
+Solo la tercera decide. Las dos primeras sirven para entender **por que** gana o
+pierde, y para descartar barato antes de gastar mil partidas.
+
 ---
 
 ## 3. `generar_aperturas.py` — arma el banco

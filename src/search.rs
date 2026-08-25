@@ -239,6 +239,67 @@ fn se_doble_activa() -> bool {
     *CACHE.get_or_init(|| std::env::var("MITTENS_SE_DOBLE").as_deref() != Ok("0"))
 }
 
+// --- Perillas del IIR (Internal Iterative Reduction) ---
+//
+// Ver el bloque de IIR dentro de `negamax` para el razonamiento completo. Las
+// dos perillas existen para poder barrer valores con `medir/nodos_arbol.py` sin
+// recompilar; los defaults son los que quedaron elegidos tras la medicion.
+
+/// Holgura de profundidad a partir de la cual una entrada de TT se considera
+/// DEMASIADO SUPERFICIAL como para confiarle el orden de jugadas.
+///
+/// El IIR dispara cuando `entry.depth + HOLGURA <= depth` (ademas del caso
+/// historico "no hay jugada de TT"). `0` desactiva la ampliacion y deja el
+/// comportamiento historico exacto.
+///
+/// INVARIANTE DE SEGURIDAD: la pasada reducida guarda su resultado en la TT con
+/// profundidad `depth - REDUCCION`. Si en la siguiente visita al mismo nodo a la
+/// misma profundidad esa entrada volviera a cumplir la condicion, el nodo se
+/// reduciria OTRA VEZ, y otra, erosionando la profundidad sin freno. La
+/// condicion se vuelve falsa en la segunda visita si y solo si
+/// `HOLGURA > REDUCCION`. Con REDUCCION = 1, cualquier HOLGURA >= 2 es seguro.
+///
+/// POR QUE 4 Y NO EL MAS AGRESIVO POSIBLE (2). Barrido medido con
+/// `medir/nodos_arbol.py` (400 posiciones, profundidad 12, razon pareada) y
+/// SPRT a nodos fijos con `medir/sprt_diverso.py`:
+///
+/// | holgura | arbol a prof. 12 | plies extra a 100k nodos | Elo (partidas)   |
+/// |---------|------------------|--------------------------|------------------|
+/// |   2     |     -47,7%       |          +1,86           | +3,0 +/-13,1 (1600) |
+/// |   3     |     -19,8%       |          (sin medir)     | -13,0 +/-26,7 (400) |
+/// |   4     |     -11,4%       |          +0,24           | +11,3 +/-13,2 (1600)|
+/// |   5     |      -3,4%       |          (sin medir)     | (sin medir)      |
+///
+/// La holgura 2 achica el arbol casi a la mitad, pero eso NO es eficiencia: se
+/// gana profundidad NOMINAL (+3,1 plies a 400k nodos) sin ganar Elo, o sea que
+/// el ply pasa a valer menos. Es la trampa de medir solo con `nodos_arbol.py`:
+/// cualquier cambio que abarate el significado de un ply "gana" ahi. La holgura
+/// 4 achica menos pero es la unica del barrido cuyo Elo apunta hacia arriba con
+/// 2000 partidas acumuladas.
+fn iir_tt_holgura() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_IIR_TT")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| (0..=12).contains(v))
+            .unwrap_or(4)
+    })
+}
+
+/// Cuantos plies recorta el IIR cuando dispara. Ver la invariante de
+/// `iir_tt_holgura`: subir esto sin subir la holgura reabre la erosion.
+fn iir_reduccion() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_IIR_R")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| (1..=3).contains(v))
+            .unwrap_or(1)
+    })
+}
+
 // Tabla LMR precalculada: reduccion base en plies para cada par
 // (profundidad, numero de jugada en el orden). Formula logaritmica clasica
 // (Ethereal/Stockfish): crece suave con ambas -- las jugadas muy tardias a
@@ -2485,9 +2546,33 @@ impl Searcher {
         // busqueda real. No aplica en jaque (la extension de jaque ya
         // gestiona la profundidad ahi) ni a profundidad baja (el ahorro no
         // compensa el costo de una pasada extra).
+        //
+        // AMPLIACION (cand_arbol_v2): el mismo razonamiento vale cuando la
+        // jugada de la TT EXISTE pero viene de una busqueda mucho mas
+        // superficial que la que se va a hacer ahora. El caso tipico no es una
+        // iteracion vieja del iterative deepening -- esa deja la entrada a
+        // `depth - 1`, o sea casi tan buena como la que se va a hacer -- sino
+        // una pasada REDUCIDA por LMR, que deja la entrada 2, 3 o mas plies
+        // por debajo. Esa jugada ordena, si, pero con informacion de un
+        // subarbol mucho mas chico: es tan probable que mande el orden por el
+        // camino equivocado como que acierte, y aun asi el nodo se buscaba a
+        // profundidad completa. Reducir 1 ply refresca la entrada (la pasada
+        // reducida guarda su propia mejor jugada) y el trabajo caro se hace
+        // despues con el orden bueno. Es la misma idea que ya usa Stockfish
+        // (`ttData.depth < depth - 4`), con la holgura re-calibrada para
+        // Mittens por medicion directa del arbol (ver `iir_tt_holgura`).
         const IIR_PROF_MIN: i32 = 4;
-        if !en_jaque && tt_move.is_none() && depth >= IIR_PROF_MIN {
-            depth -= 1;
+        if !en_jaque && depth >= IIR_PROF_MIN {
+            let holgura = iir_tt_holgura();
+            let tt_pobre = holgura > 0
+                && tt_move.is_some()
+                && tt_entry_full.as_ref().is_some_and(|e| e.depth + holgura <= depth);
+            if tt_move.is_none() || tt_pobre {
+                // El clamp deja la profundidad hija siempre >= 1: con
+                // depth >= 4 y reduccion <= 3 nunca se cae directo a
+                // quiescence por culpa del IIR.
+                depth -= iir_reduccion().clamp(1, depth - 1);
+            }
         }
 
         // Profundidad minima para activar la verificacion de singularidad.
