@@ -308,6 +308,14 @@ fn run_bench(depth: i32) {
             dt.as_secs_f64(),
             nps
         );
+        if s.se_sondas > 0 {
+            println!(
+                "  SE: {} sondas, {} nodos en sondas ({:.1}% del arbol)",
+                s.se_sondas,
+                s.se_nodos,
+                100.0 * s.se_nodos as f64 / nodes as f64
+            );
+        }
         if s.lmr_intentos > 0 {
             println!(
                 "  LMR: {} intentos, {} re-busquedas a profundidad completa ({:.1}%)",
