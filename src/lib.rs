@@ -1246,8 +1246,9 @@ pub fn uci_loop() {
     // "ucinewgame" o "quit": cada uno conserva su propio Searcher, y con el
     // su history/continuation/corrhist de la partida, igual que smp_tt.
     // Antes cada "go" creaba y destruia N hilos de sistema operativo y N
-    // Searchers -- un costo fijo que a movetime de 2-5 ms hacia que 8 hilos
-    // llegaran MENOS hondo que 1 solo.
+    // Searchers: con Threads=8, 1.8 ms de CPU de NUCLEO por jugada gastados
+    // en crear y destruir hilos, sin buscar un nodo (medido -- ver el
+    // comentario de PoolHilosSMP en search.rs).
     let mut pool_slot: Option<search::PoolHilosSMP> = Some(search::PoolHilosSMP::nuevo());
     let mut activa: Option<BusquedaActiva> = None;
 
