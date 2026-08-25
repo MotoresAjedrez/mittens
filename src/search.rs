@@ -971,8 +971,8 @@ impl Searcher {
     /// history de 6*64*6*64 i32 = 590 KB cada una, tres corrhist, dos buffers
     /// por ply de MAX_MOVES claves...) que ademas hay que poner en cero: con
     /// 8 hilos eso son ~16 MB de reserva+puesta a cero en CADA jugada, un
-    /// costo fijo que a `movetime` de 2-5 ms (datagen, selfplay, bullet) se
-    /// come una fraccion enorme del presupuesto de pensar.
+    /// costo fijo que a `movetime` de 2-5 ms (datagen, selfplay, bullet) pesa
+    /// tanto como el presupuesto de pensar entero.
     ///
     /// La lista de campos de abajo es el contrato: si se agrega un campo
     /// nuevo al Searcher que sea estado DE UNA BUSQUEDA (no memoria de la
@@ -4038,11 +4038,16 @@ pub struct ResultadoHilo {
 // destruidos, y ~16 MB de memoria reservada y puesta a cero, POR JUGADA.
 //
 // A relojes normales (segundos) ese costo fijo se diluye. A `movetime` de
-// 2-5 ms -- el rango tipico de selfplay/datagen y de las mediciones de
-// candidatos -- NO se diluye: medido en vivo sobre el binario de produccion,
-// con 8 hilos el motor solo llegaba a profundidad 3 mientras que con 1 hilo
-// (sin ese costo) llegaba a 4 en el MISMO presupuesto. Los 8 hilos rendian
-// MENOS que uno solo porque el arranque se comia el tiempo de pensar.
+// 2-5 ms -- el rango tipico de selfplay/datagen y de las partidas de bullet
+// -- no: MEDIDO en esta maquina (10 nucleos, 2026-08-25), 1500 "go" con
+// Threads=8, comparando el binario de main contra este:
+//
+//   CPU de sistema (nucleo) por "go":  1.46 ms  ->  0.42 ms   (-71%)
+//   CPU total por "go" (nodes 2000):  14.58 ms -> 13.36 ms    (-8.4%)
+//   nodos vistos en `go movetime 2`:   18216   ->  19465      (+6.8%)
+//
+// Esa CPU de sistema es casi toda `thread_create`/`thread_terminate`: es
+// trabajo que la maquina hacia en cada jugada sin buscar un solo nodo.
 //
 // AHORA: los N hilos se crean UNA vez (en el primer "go" que los necesite) y
 // se quedan dormidos bloqueados en `Receiver::recv()`. Cada "go" les manda
