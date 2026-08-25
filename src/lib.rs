@@ -208,7 +208,7 @@ fn run_smp_bench(movetime_ms: u64) {
         let generacion = AtomicU8::new(0);
         // Bench de una sola medicion por config: pool nuevo cada vez, que es
         // justo lo que se quiere aca (arrancar sin history heredado).
-        let mut pool = search::PoolMemoriaSMP::nuevo();
+        let mut pool = search::PoolHilosSMP::nuevo();
         let t0 = Instant::now();
         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
             &b,
@@ -995,12 +995,13 @@ fn run_see_tests() {
 /// Handle de una busqueda corriendo en su propio hilo (spawneada al recibir
 /// "go") + la bandera compartida para pedirle que pare ("stop"). El hilo
 /// devuelve el Searcher de un solo hilo si lo tomo prestado (para
-/// recuperarlo y seguir usandolo en la siguiente jugada), o el pool de
-/// memorias si la busqueda fue Lazy SMP (los Searchers de los hilos son
-/// desechables, pero sus tablas de history NO: viajan al hilo y vuelven aca
-/// para la jugada siguiente -- ver PoolMemoriaSMP).
+/// recuperarlo y seguir usandolo en la siguiente jugada), o el pool de hilos
+/// si la busqueda fue Lazy SMP. El pool es PERSISTENTE: sus hilos (y el
+/// Searcher de cada uno, con su history de la partida) sobreviven a la
+/// busqueda; lo que viaja de ida y vuelta por este handle son solo los
+/// `Sender`/`JoinHandle`, no los hilos -- ver PoolHilosSMP en search.rs.
 struct BusquedaActiva {
-    handle: std::thread::JoinHandle<(Option<Searcher>, Option<search::PoolMemoriaSMP>)>,
+    handle: std::thread::JoinHandle<(Option<Searcher>, Option<search::PoolHilosSMP>)>,
     stop_flag: Arc<AtomicBool>,
 }
 
@@ -1014,7 +1015,7 @@ struct BusquedaActiva {
 fn detener_y_recuperar(
     activa: &mut Option<BusquedaActiva>,
     searcher_slot: &mut Option<Searcher>,
-    pool_slot: &mut Option<search::PoolMemoriaSMP>,
+    pool_slot: &mut Option<search::PoolHilosSMP>,
 ) {
     if let Some(a) = activa.take() {
         a.stop_flag.store(true, Ordering::Relaxed);
@@ -1240,10 +1241,14 @@ pub fn uci_loop() {
         .as_mut()
         .expect("searcher inicial")
         .set_nnue_classical_depth(nnue_classical_depth);
-    // Memoria de history/continuation/corrhist por hilo de Lazy SMP, que
-    // persiste entre jugadas de la misma partida igual que smp_tt. Antes cada
-    // "go" con Threads>1 creaba Searchers nuevos y perdia todo lo aprendido.
-    let mut pool_slot: Option<search::PoolMemoriaSMP> = Some(search::PoolMemoriaSMP::nuevo());
+    // Pool PERSISTENTE de hilos de Lazy SMP. Sus hilos se crean en el primer
+    // "go" con Threads>1 y siguen vivos (dormidos entre busquedas) hasta
+    // "ucinewgame" o "quit": cada uno conserva su propio Searcher, y con el
+    // su history/continuation/corrhist de la partida, igual que smp_tt.
+    // Antes cada "go" creaba y destruia N hilos de sistema operativo y N
+    // Searchers -- un costo fijo que a movetime de 2-5 ms hacia que 8 hilos
+    // llegaran MENOS hondo que 1 solo.
+    let mut pool_slot: Option<search::PoolHilosSMP> = Some(search::PoolHilosSMP::nuevo());
     let mut activa: Option<BusquedaActiva> = None;
 
     for line in stdin.lock().lines() {
@@ -1482,7 +1487,7 @@ pub fn uci_loop() {
                 if let Some(p) = pool_slot.as_mut() {
                     p.limpiar();
                 } else {
-                    pool_slot = Some(search::PoolMemoriaSMP::nuevo());
+                    pool_slot = Some(search::PoolHilosSMP::nuevo());
                 }
                 let old_tt = std::mem::replace(&mut smp_tt, Arc::new(Vec::new()));
                 drop(old_tt);
@@ -1606,7 +1611,7 @@ pub fn uci_loop() {
                         let hist_copy = game_history.clone();
                         let board_copy = board;
                         let mut pool =
-                            pool_slot.take().unwrap_or_else(search::PoolMemoriaSMP::nuevo);
+                            pool_slot.take().unwrap_or_else(search::PoolHilosSMP::nuevo);
                         let handle = std::thread::spawn(move || {
                             let t0 = std::time::Instant::now();
                             let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
@@ -1859,7 +1864,7 @@ pub fn uci_loop() {
                                 // devolvio el pool, se arranca uno nuevo en vez
                                 // de tirar el motor: perder el history es
                                 // recuperable, un panic en medio de una partida no.
-                                pool_slot.get_or_insert_with(search::PoolMemoriaSMP::nuevo),
+                                pool_slot.get_or_insert_with(search::PoolHilosSMP::nuevo),
                                 nodes_limit,
                             );
                             let prof = resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
@@ -1958,8 +1963,10 @@ pub fn uci_loop() {
                     let filtro = searchmoves_filtro.clone();
                     // El pool viaja al hilo de busqueda y vuelve por el join
                     // (ver detener_y_recuperar), igual que el Searcher del
-                    // camino de un hilo: propiedad exclusiva, sin locks.
-                    let mut pool = pool_slot.take().unwrap_or_else(search::PoolMemoriaSMP::nuevo);
+                    // camino de un hilo: propiedad exclusiva, sin locks. Los
+                    // hilos ayudantes NO se mueven ni se recrean: lo que se
+                    // mueve son sus canales.
+                    let mut pool = pool_slot.take().unwrap_or_else(search::PoolHilosSMP::nuevo);
                     let handle = std::thread::spawn(move || {
                         let t0 = std::time::Instant::now();
                         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(

@@ -265,8 +265,15 @@ def guardar_estado(path: pathlib.Path, estado: dict) -> None:
     tmp.replace(path)
 
 
+# Hilos por motor. Por defecto 1 (el modo en que se miden los candidatos de
+# busqueda/evaluacion: determinista y barato). SPRT_THREADS=N permite medir
+# expresamente el camino Lazy SMP, que es otro codigo -- ojo que con N>1 la
+# maquina tiene que poder darle 2*N nucleos o se mide contencion, no fuerza.
+HILOS = max(1, int(os.environ.get("SPRT_THREADS", "1")))
+
+
 def configurar(motor: chess.engine.SimpleEngine, pesos: pathlib.Path) -> None:
-    pedido = {"Threads": 1, "Hash": 128, "NNUEPath": str(pesos), "UseNNUE": True}
+    pedido = {"Threads": HILOS, "Hash": 128, "NNUEPath": str(pesos), "UseNNUE": True}
     motor.configure({k: v for k, v in pedido.items() if k in motor.options})
 
 
@@ -399,7 +406,7 @@ def main() -> None:
             f"{nombre}\n"
             f"Candidato : {cand_bin}\n"
             f"Baseline  : {base_bin}\n"
-            f"Nodos/jugada: {nodos}, Threads=1 en ambos\n"
+            f"Nodos/jugada: {nodos}, Threads={HILOS} en ambos\n"
             f"Tramo del banco: aperturas {apertura_inicial}.."
             f"{apertura_inicial + (n + 1) // 2 - 1} de {len(aperturas)}\n"
             f"Partidas: {n} (+{wins} ={draws} -{losses}), score={frac:.2%}\n"

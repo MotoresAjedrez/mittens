@@ -959,52 +959,94 @@ impl Searcher {
         }
     }
 
-    /// Se lleva las tablas que acumulan entre jugadas (ver TablasPersistentes).
-    /// CONSUME el Searcher: se usa justo antes de tirarlo al final de un hilo
-    /// de Lazy SMP, de modo que no puede quedar un Searcher a medio vaciar.
-    pub fn extraer_memoria(self) -> MemoriaHilo {
-        MemoriaHilo(Some(TablasPersistentes {
-            history: self.history,
-            history_amenaza: self.history_amenaza,
-            cont_history: self.cont_history,
-            cont_history_2: self.cont_history_2,
-            capture_history: self.capture_history,
-            counter_moves: self.counter_moves,
-            corr_pawn: self.corr_pawn,
-            corr_nonpawn: self.corr_nonpawn,
-            corr_cont: self.corr_cont,
-        }))
+    /// Deja este Searcher EXACTAMENTE en el estado en que lo dejaria
+    /// `new_con_tt_compartida`, salvo por las tablas que por diseño acumulan
+    /// entre jugadas de la partida (history, history_amenaza, las dos
+    /// continuation history, capture history, counter moves y los tres
+    /// corrhist), que se conservan intactas.
+    ///
+    /// Es la pieza que permite que un hilo del pool persistente REUTILICE su
+    /// Searcher entre llamadas a "go" en vez de construir uno nuevo. Cada
+    /// `Searcher` reserva ~2 MB de tablas en el heap (dos continuation
+    /// history de 6*64*6*64 i32 = 590 KB cada una, tres corrhist, dos buffers
+    /// por ply de MAX_MOVES claves...) que ademas hay que poner en cero: con
+    /// 8 hilos eso son ~16 MB de reserva+puesta a cero en CADA jugada, un
+    /// costo fijo que a `movetime` de 2-5 ms (datagen, selfplay, bullet) se
+    /// come una fraccion enorme del presupuesto de pensar.
+    ///
+    /// La lista de campos de abajo es el contrato: si se agrega un campo
+    /// nuevo al Searcher que sea estado DE UNA BUSQUEDA (no memoria de la
+    /// partida), tiene que reiniciarse aca tambien.
+    pub fn preparar_reutilizacion(&mut self, tt: &Arc<SharedTT>, tt_mask: usize, modo_lmr: bool) {
+        // La TT compartida se reconstruye en "ucinewgame", al cambiar Hash y
+        // al cambiar de evaluacion: si el llamador trae otra, hay que soltar
+        // la vieja (si no, el Arc del hilo la mantendria viva para siempre).
+        let misma = match &self.tt {
+            TablaTransposicion::Compartida(actual) => Arc::ptr_eq(actual, tt),
+            TablaTransposicion::Local(_) => false,
+        };
+        if !misma {
+            self.tt = TablaTransposicion::Compartida(Arc::clone(tt));
+        }
+        self.tt_mask = tt_mask;
+        self.modo_lmr = modo_lmr;
+        // Estado de reloj/limites: `search_time` los vuelve a fijar, pero un
+        // Searcher recien creado los trae en None y aca tiene que quedar igual
+        // (en particular tiempo_maximo_ms, que el camino SMP nunca escribe).
+        self.nodes = 0;
+        self.stop = false;
+        self.deadline = None;
+        self.tiempo_maximo_ms = None;
+        self.nodes_limit = None;
+        self.blindar_stop = false;
+        // Parametros por hilo y entradas de la busqueda: el llamador los
+        // vuelve a poner justo despues, pero se limpian para que un "None"
+        // del go actual no herede el valor del go anterior.
+        self.salto_smp = None;
+        self.null_move_r_extra = 0;
+        self.root_moves_filtro = None;
+        self.external_stop = None;
+        self.game_history.clear();
+        self.path_len = 0;
+        self.nnue = None;
+        // Contadores de diagnostico (los imprime `bench`): un Searcher nuevo
+        // arranca en cero, asi que aca tambien.
+        self.se_sondas = 0;
+        self.se_nodos = 0;
+        self.lmr_intentos = 0;
+        self.lmr_reintentos = 0;
+        // Pilas indexadas por ply. En teoria todas se escriben antes de
+        // leerse dentro de la misma busqueda (killers los reinicia ademas el
+        // propio search_time), pero dejarlas en su valor neutro cuesta unos
+        // pocos microsegundos y elimina cualquier duda sobre estado colgado
+        // de la busqueda anterior -- que es justo el riesgo nuevo que
+        // introduce reutilizar el Searcher.
+        for k in self.killers.iter_mut() {
+            *k = [None, None];
+        }
+        for e in self.excluded.iter_mut() {
+            *e = None;
+        }
+        for v in self.hindsight_parent_eval.iter_mut() {
+            *v = 0;
+        }
+        for v in self.hindsight_reduction.iter_mut() {
+            *v = 0;
+        }
+        for v in self.eval_stack.iter_mut() {
+            *v = EVAL_INVALIDA;
+        }
     }
 
-    /// Reinstala tablas guardadas de una jugada anterior de ESTE mismo hilo.
-    /// Si algun tamaño no coincide con el que espera este binario (no deberia
-    /// pasar: son constantes de compilacion) se ignora la memoria entera y el
-    /// Searcher se queda con sus tablas en cero, que siempre es correcto.
-    pub fn instalar_memoria(&mut self, m: MemoriaHilo) {
-        let t = match m.0 {
-            Some(t) => t,
-            None => return,
-        };
-        let compatible = t.cont_history.len() == self.cont_history.len()
-            && t.cont_history_2.len() == self.cont_history_2.len()
-            && t.capture_history.len() == self.capture_history.len()
-            && t.counter_moves.len() == self.counter_moves.len()
-            && t.corr_pawn.len() == self.corr_pawn.len()
-            && t.corr_nonpawn[0].len() == self.corr_nonpawn[0].len()
-            && t.corr_nonpawn[1].len() == self.corr_nonpawn[1].len()
-            && t.corr_cont.len() == self.corr_cont.len();
-        if !compatible {
-            return;
-        }
-        self.history = t.history;
-        self.history_amenaza = t.history_amenaza;
-        self.cont_history = t.cont_history;
-        self.cont_history_2 = t.cont_history_2;
-        self.capture_history = t.capture_history;
-        self.counter_moves = t.counter_moves;
-        self.corr_pawn = t.corr_pawn;
-        self.corr_nonpawn = t.corr_nonpawn;
-        self.corr_cont = t.corr_cont;
+    /// Magnitud total del history vivo de este Searcher. Solo diagnostico:
+    /// es lo que consulta `PoolHilosSMP::magnitud_history` para comprobar en
+    /// los tests que la memoria de la partida sobrevive entre jugadas.
+    pub fn magnitud_history(&self) -> i64 {
+        self.history
+            .iter()
+            .flat_map(|f| f.iter())
+            .map(|v| (*v as i64).abs())
+            .sum()
     }
 
     /// Crea un Searcher que comparte la TT (Arc clonado, mismo mask) de otro
@@ -3985,116 +4027,335 @@ pub struct ResultadoHilo {
     pub nodos: u64,
 }
 
-/// Tablas de un Searcher que, por diseño, ACUMULAN informacion entre jugadas
-/// de la misma partida (a diferencia de killers, que solo valen dentro del
-/// arbol de una busqueda). Ver el comentario de `Searcher::history`: "history
-/// SI persiste entre jugadas de la partida, igual que la TT".
-///
-/// Con un solo hilo eso ya ocurria: el loop UCI guarda el Searcher en
-/// `searcher_slot` y lo reutiliza en cada "go". Con Lazy SMP no: cada llamada
-/// a `buscar_lazy_smp` creaba Searchers nuevos y los tiraba al terminar, asi
-/// que con Threads>1 el history/continuation/corrhist arrancaba EN CERO en
-/// cada jugada de la partida. Este tipo es el vehiculo para sacar esas tablas
-/// del Searcher del hilo antes de tirarlo y volver a meterlas en el Searcher
-/// del mismo indice de hilo en la jugada siguiente.
-///
-/// No contiene nada dependiente de la posicion, del reloj ni de la TT, asi
-/// que reinstalarlo nunca puede producir una busqueda invalida: en el peor
-/// caso el ordenamiento de jugadas arranca con estadisticas de la jugada
-/// anterior, que es exactamente el objetivo.
-pub struct TablasPersistentes {
-    history: Box<[[i32; 64]; 64]>,
-    history_amenaza: Box<[[i32; 64]; 64]>,
-    cont_history: Vec<i32>,
-    cont_history_2: Vec<i32>,
-    capture_history: Vec<i32>,
-    counter_moves: Vec<Option<Move>>,
-    corr_pawn: Vec<i32>,
-    corr_nonpawn: [Vec<i32>; 2],
-    corr_cont: Vec<i32>,
+// ---------------------------------------------------------------------------
+// POOL DE HILOS PERSISTENTE PARA LAZY SMP
+// ---------------------------------------------------------------------------
+//
+// ANTES: cada "go" con Threads=N hacia N `std::thread::spawn` y los N hilos
+// morian al terminar esa busqueda. Cada hilo, ademas, construia un `Searcher`
+// entero (~2 MB de tablas en el heap que hay que reservar y poner en cero) y
+// lo tiraba. Con 8 hilos eso son 8 hilos de sistema operativo creados y
+// destruidos, y ~16 MB de memoria reservada y puesta a cero, POR JUGADA.
+//
+// A relojes normales (segundos) ese costo fijo se diluye. A `movetime` de
+// 2-5 ms -- el rango tipico de selfplay/datagen y de las mediciones de
+// candidatos -- NO se diluye: medido en vivo sobre el binario de produccion,
+// con 8 hilos el motor solo llegaba a profundidad 3 mientras que con 1 hilo
+// (sin ese costo) llegaba a 4 en el MISMO presupuesto. Los 8 hilos rendian
+// MENOS que uno solo porque el arranque se comia el tiempo de pensar.
+//
+// AHORA: los N hilos se crean UNA vez (en el primer "go" que los necesite) y
+// se quedan dormidos bloqueados en `Receiver::recv()`. Cada "go" les manda
+// una `TareaSMP` (posicion + parametros) por su canal; el hilo despierta,
+// REUTILIZA su Searcher (ver `Searcher::preparar_reutilizacion`), busca,
+// manda el `ResultadoHilo` por el canal de respuesta y vuelve a dormirse.
+// Es el patron estandar de Stockfish y compañia.
+//
+// POR QUE CANALES Y NO CONDVAR: un `mpsc` ya es exactamente "dormir hasta que
+// llegue trabajo" con la sincronizacion resuelta, y ademas da gratis la
+// deteccion de hilo muerto -- si un ayudante entra en panic, su `Receiver`
+// se destruye y el `send` del principal falla en el acto; si muere DESPUES de
+// aceptar la tarea, su copia del `Sender` de respuestas se destruye al
+// desenrollar y el `recv()` del principal devuelve Err en vez de quedarse
+// colgado para siempre. Un Condvar mal usado ahi es un deadlock silencioso.
+// (En release el perfil es `panic = "abort"`, asi que un panic mata el
+// proceso entero de todos modos; esto importa en debug/tests.)
+
+/// Trabajo que el hilo coordinador manda a un ayudante del pool. Contiene
+/// TODO lo que define una busqueda, porque el ayudante no comparte nada
+/// mutable con el coordinador salvo la TT (atomica) y la bandera de stop.
+struct TareaSMP {
+    indice: usize,
+    board: Board,
+    movetime_ms: Option<u64>,
+    max_depth: i32,
+    tt: Arc<SharedTT>,
+    tt_mask: usize,
+    modo_lmr: bool,
+    qsearch_nnue: bool,
+    nnue_classical_depth: i32,
+    generacion: u8,
+    game_history: Vec<u64>,
+    external_stop: Arc<AtomicBool>,
+    root_moves_filtro: Option<Vec<Move>>,
+    nodes_limit: Option<u64>,
+    salto_smp: Option<(u32, u32)>,
+    null_move_r_extra: i32,
+    /// Por donde el ayudante devuelve su resultado. Es un `Sender` NUEVO por
+    /// busqueda: cuando todos los ayudantes lo sueltan (al terminar o al
+    /// morir), el `recv()` del coordinador devuelve Err y nadie se cuelga.
+    respuesta: std::sync::mpsc::Sender<(usize, ResultadoHilo)>,
 }
 
-/// Memoria persistente de UN hilo de Lazy SMP entre llamadas a "go".
-/// `None` = todavia no hay nada guardado (primera jugada de la partida, o
-/// recien limpiado por "ucinewgame"): el hilo arranca con las tablas en cero
-/// que ya trae un Searcher recien creado.
-#[derive(Default)]
-pub struct MemoriaHilo(Option<TablasPersistentes>);
-
-/// Conjunto de memorias, una por indice de hilo de Lazy SMP.
-///
-/// PROPIEDAD EXCLUSIVA, SIN LOCKS: el pool vive en el loop UCI; en cada "go"
-/// cada `MemoriaHilo` se SACA del pool (mem::take) y se MUEVE al hilo que le
-/// corresponde, que la devuelve al terminar junto con su resultado. Mientras
-/// la busqueda corre, cada memoria tiene un unico dueño (su hilo) y el pool
-/// queda con huecos vacios, asi que no hay dos hilos que puedan tocar la
-/// misma tabla ni hace falta Mutex alguno.
-#[derive(Default)]
-pub struct PoolMemoriaSMP {
-    hilos: Vec<MemoriaHilo>,
+enum MensajeSMP {
+    Buscar(Box<TareaSMP>),
+    /// Diagnostico (tests): devuelve la magnitud del history vivo del hilo.
+    Consultar(std::sync::mpsc::Sender<i64>),
+    /// Fin de vida: el hilo sale del bucle y termina limpio.
+    Terminar,
 }
 
-impl PoolMemoriaSMP {
-    pub fn nuevo() -> PoolMemoriaSMP {
-        PoolMemoriaSMP { hilos: Vec::new() }
+/// Bucle de un hilo ayudante. Vive desde que el pool lo crea hasta que
+/// recibe `Terminar` (o hasta que el pool se destruye y su `Sender` se cae,
+/// lo que hace que `recv()` devuelva Err y el bucle salga igual).
+///
+/// El `Searcher` se crea PEREZOSAMENTE en la primera tarea (asi el tamaño de
+/// la TT y `modo_lmr` salen de la tarea real, no de un valor adivinado al
+/// crear el pool) y de ahi en adelante se reutiliza para siempre: ese es el
+/// punto de todo esto.
+fn bucle_hilo_smp(rx: std::sync::mpsc::Receiver<MensajeSMP>) {
+    let mut searcher: Option<Searcher> = None;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            MensajeSMP::Terminar => break,
+            MensajeSMP::Consultar(tx) => {
+                let m = searcher.as_ref().map(|s| s.magnitud_history()).unwrap_or(0);
+                let _ = tx.send(m);
+            }
+            MensajeSMP::Buscar(tarea) => {
+                let TareaSMP {
+                    indice,
+                    board,
+                    movetime_ms,
+                    max_depth,
+                    tt,
+                    tt_mask,
+                    modo_lmr,
+                    qsearch_nnue,
+                    nnue_classical_depth,
+                    generacion,
+                    game_history,
+                    external_stop,
+                    root_moves_filtro,
+                    nodes_limit,
+                    salto_smp,
+                    null_move_r_extra,
+                    respuesta,
+                } = *tarea;
+                let s = searcher.get_or_insert_with(|| {
+                    Searcher::new_con_tt_compartida(Arc::clone(&tt), tt_mask, modo_lmr)
+                });
+                // Reinicia SOLO el estado de una busqueda; history,
+                // continuation, capture history, counter moves y corrhist
+                // sobreviven a la jugada anterior, que es justo lo que
+                // documenta el campo `history` del Searcher.
+                s.preparar_reutilizacion(&tt, tt_mask, modo_lmr);
+                s.set_tt_generacion(generacion);
+                s.set_qsearch_nnue(qsearch_nnue);
+                s.set_nnue_classical_depth(nnue_classical_depth);
+                s.salto_smp = salto_smp;
+                s.null_move_r_extra = null_move_r_extra;
+                s.root_moves_filtro = root_moves_filtro;
+                s.set_external_stop(Some(external_stop));
+                s.set_game_history(game_history);
+                s.nodes_limit = nodes_limit;
+                let (mv, sc, prof) =
+                    s.search_time(&board, movetime_ms, max_depth, |_, _, _, _, _| {});
+                let nodos = s.nodes;
+                // Si el coordinador ya se fue (imposible en el flujo normal:
+                // siempre espera a todos), el send falla y se ignora.
+                let _ = respuesta.send((
+                    indice,
+                    ResultadoHilo {
+                        mv,
+                        score: sc,
+                        profundidad: prof,
+                        nodos,
+                    },
+                ));
+            }
+        }
+    }
+}
+
+/// Un ayudante vivo: su canal de entrada + el handle para poder unirlo al
+/// cerrar (nada de hilos zombie).
+struct HiloAyudante {
+    tx: std::sync::mpsc::Sender<MensajeSMP>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HiloAyudante {
+    fn nuevo(indice: usize) -> HiloAyudante {
+        let (tx, rx) = std::sync::mpsc::channel::<MensajeSMP>();
+        let handle = std::thread::Builder::new()
+            .name(format!("mittens-smp-{}", indice))
+            .spawn(move || bucle_hilo_smp(rx))
+            .expect("no se pudo crear un hilo de Lazy SMP");
+        HiloAyudante {
+            tx,
+            handle: Some(handle),
+        }
+    }
+}
+
+/// Pool de hilos PERSISTENTE de Lazy SMP.
+///
+/// Vive en el loop UCI (`pool_slot`), viaja al hilo de busqueda de cada "go"
+/// y vuelve por el join, igual que antes: mover el pool es mover un puñado de
+/// `Sender`/`JoinHandle` (y un `Searcher`), no toca los hilos.
+///
+/// Los hilos se crean en la primera busqueda que los necesite y NO se
+/// destruyen entre jugadas. Se destruyen (y se vuelven a crear vacios) solo
+/// en `limpiar()` -- "ucinewgame" o cambio de evaluacion/Hash, donde lo que
+/// se busca justamente es olvidar lo aprendido -- y en `Drop` ("quit").
+///
+/// EL HILO 0 NO ES UN AYUDANTE: lo busca el propio hilo que llama a
+/// `buscar_lazy_smp` (el hilo de busqueda que ya creo el loop UCI para ese
+/// "go"), con el Searcher persistente `local` de este pool. Es el reparto de
+/// Stockfish y compañia, y no es cosmetico: el hilo 0 es el unico SIN
+/// escalonamiento de profundidad -- el que de verdad tiene que llegar a la
+/// jugada -- y asi arranca a buscar en el instante 0, sin esperar a que el
+/// planificador lo despierte. Ademas con Threads=N solo hay que despertar
+/// N-1 hilos, y con Threads=1 no hay ni un hilo ni un canal de por medio.
+#[derive(Default)]
+pub struct PoolHilosSMP {
+    /// Ayudantes: `ayudantes[j]` es el hilo de indice SMP `j + 1`.
+    ayudantes: Vec<HiloAyudante>,
+    /// Searcher persistente del hilo 0, que corre en el hilo llamador.
+    local: Option<Searcher>,
+    /// Ranuras (indice SMP 0..N) que ya completaron al menos una busqueda, o
+    /// sea que tienen un Searcher con memoria de la partida. Diagnostico.
+    usados: Vec<bool>,
+}
+
+impl PoolHilosSMP {
+    pub fn nuevo() -> PoolHilosSMP {
+        PoolHilosSMP {
+            ayudantes: Vec::new(),
+            local: None,
+            usados: Vec::new(),
+        }
     }
 
     /// Olvida todo lo aprendido. Se llama en "ucinewgame": el history de una
-    /// partida no debe contaminar la siguiente.
+    /// partida no debe contaminar la siguiente. Como la memoria ahora vive
+    /// DENTRO del Searcher de cada hilo, olvidar = terminar los hilos (y
+    /// tirar el Searcher local); los siguientes "go" los vuelven a crear con
+    /// las tablas en cero.
+    ///
+    /// Ocurre una vez por partida, no por jugada: el costo de recrear los
+    /// hilos ahi es irrelevante.
     pub fn limpiar(&mut self) {
-        self.hilos.clear();
+        self.apagar();
     }
 
-    /// Asegura que haya una ranura por hilo. Subir Threads con setoption crea
-    /// ranuras vacias (los hilos nuevos arrancan de cero, como siempre);
-    /// bajarlo deja las de mas sin usar, y si se vuelve a subir se reencuentran
-    /// con su historial -- en ningun caso se comparte una ranura entre hilos.
+    /// Pide a todos los ayudantes que terminen y los une. Idempotente.
+    fn apagar(&mut self) {
+        for h in &self.ayudantes {
+            // Falla solo si el hilo ya murio; en ese caso el join de abajo
+            // devuelve en el acto.
+            let _ = h.tx.send(MensajeSMP::Terminar);
+        }
+        for h in self.ayudantes.iter_mut() {
+            if let Some(j) = h.handle.take() {
+                let _ = j.join();
+            }
+        }
+        self.ayudantes.clear();
+        self.local = None;
+        self.usados.clear();
+    }
+
+    /// Asegura que haya ayudantes para los indices SMP 1..n. Subir Threads
+    /// con setoption crea los que falten (arrancan con memoria en cero, como
+    /// siempre); bajarlo deja los de mas dormidos sin trabajo (no cuestan
+    /// CPU) y si se vuelve a subir se reencuentran con su historial.
+    ///
+    /// Ademas reemplaza cualquier ayudante que haya muerto (solo posible por
+    /// un panic, que en release aborta el proceso): un pool con un hueco
+    /// tiene que poder seguir jugando.
     fn reservar(&mut self, n: usize) {
-        while self.hilos.len() < n {
-            self.hilos.push(MemoriaHilo::default());
+        for j in 0..self.ayudantes.len() {
+            let muerto = self.ayudantes[j]
+                .handle
+                .as_ref()
+                .is_some_and(|h| h.is_finished());
+            if muerto {
+                if let Some(h) = self.ayudantes[j].handle.take() {
+                    let _ = h.join();
+                }
+                eprintln!("info string hilo SMP {} murio; se recrea", j + 1);
+                self.ayudantes[j] = HiloAyudante::nuevo(j + 1);
+                self.usados[j + 1] = false;
+            }
+        }
+        while self.ayudantes.len() + 1 < n {
+            let j = self.ayudantes.len();
+            self.ayudantes.push(HiloAyudante::nuevo(j + 1));
+        }
+        while self.usados.len() < n {
+            self.usados.push(false);
         }
     }
 
-    fn tomar(&mut self, i: usize) -> MemoriaHilo {
-        std::mem::take(&mut self.hilos[i])
-    }
-
-    fn devolver(&mut self, i: usize, m: MemoriaHilo) {
-        if i < self.hilos.len() {
-            self.hilos[i] = m;
-        }
+    /// Manda una tarea al AYUDANTE de indice SMP `i` (i >= 1). Devuelve false
+    /// si el hilo esta muerto (su canal cerrado) -- el llamador entonces no
+    /// lo cuenta entre las respuestas que espera, y no se cuelga.
+    fn enviar(&self, i: usize, tarea: TareaSMP) -> bool {
+        self.ayudantes[i - 1]
+            .tx
+            .send(MensajeSMP::Buscar(Box::new(tarea)))
+            .is_ok()
     }
 
     /// Solo para tests: cuantas ranuras tienen algo guardado.
     pub fn ranuras_con_datos(&self) -> usize {
-        self.hilos.iter().filter(|m| m.0.is_some()).count()
+        self.usados.iter().filter(|u| **u).count()
     }
 
     /// Solo para tests: magnitud total del history guardado en todas las
-    /// ranuras. Cero significa "no se aprendio nada" (o se limpio).
+    /// ranuras (la del hilo 0, que vive aca, mas la de cada ayudante, que
+    /// vive dentro de su hilo). Cero significa "no se aprendio nada".
+    ///
+    /// Se llama con el pool en reposo, asi que cada ayudante contesta de
+    /// inmediato; si alguno estuviera ocupado, se lo espera.
     pub fn magnitud_history(&self) -> i64 {
-        self.hilos
+        let mut total = self.local.as_ref().map(|s| s.magnitud_history()).unwrap_or(0);
+        for h in &self.ayudantes {
+            let (tx, rx) = std::sync::mpsc::channel::<i64>();
+            if h.tx.send(MensajeSMP::Consultar(tx)).is_ok()
+                && let Ok(v) = rx.recv()
+            {
+                total += v;
+            }
+        }
+        total
+    }
+
+    /// Cuantos hilos de sistema operativo AYUDANTES tiene vivos ahora mismo
+    /// (el hilo 0 no cuenta: es el llamador). Lo usa la prueba de que muchos
+    /// "go" seguidos NO hacen crecer el numero de hilos.
+    pub fn hilos_vivos(&self) -> usize {
+        self.ayudantes
             .iter()
-            .filter_map(|m| m.0.as_ref())
-            .map(|t| {
-                t.history
-                    .iter()
-                    .flat_map(|f| f.iter())
-                    .map(|v| (*v as i64).abs())
-                    .sum::<i64>()
-            })
-            .sum()
+            .filter(|h| h.handle.as_ref().is_some_and(|j| !j.is_finished()))
+            .count()
+    }
+}
+
+impl Drop for PoolHilosSMP {
+    /// "quit" (o cualquier destruccion del pool) termina los hilos y los une:
+    /// ni hilos zombie ni un proceso que no cierra.
+    fn drop(&mut self) {
+        self.apagar();
     }
 }
 
 /// Busca `b` con `n_hilos` hilos nativos compartiendo TT, con el mismo
 /// presupuesto de reloj que una busqueda de un solo hilo (el paralelismo es
-/// para ver MAS nodos en el mismo tiempo, no para tardar mas). Variacion
-/// entre hilos: los hilos de indice impar arrancan con las dos primeras
-/// jugadas del orden intercambiadas, para que no todos exploren exactamente
-/// la misma linea primero -- ademas de la variacion natural que ya aporta
-/// el timing real de acceso a la TT compartida entre hilos genuinamente
+/// para ver MAS nodos en el mismo tiempo, no para tardar mas).
+///
+/// Los hilos NO se crean aca: salen del `pool` persistente que pasa el
+/// llamador y que sobrevive entre jugadas (ver `PoolHilosSMP`). Esta funcion
+/// solo arma una tarea por hilo, las despacha, y espera las N respuestas.
+///
+/// Variacion entre hilos: escalonamiento de profundidad por hilo
+/// (`salto_smp`, skip arrays estilo Stockfish clasico) + variacion de la
+/// reduccion de null-move, ademas de la variacion natural que aporta el
+/// timing real de acceso a la TT compartida entre hilos genuinamente
 /// concurrentes (el mecanismo clasico detras de Lazy SMP).
+///
 /// `tt` se pasa ya construida (y se espera que el LLAMADOR la guarde y
 /// reutilice entre jugadas de la misma partida, igual que la TT de un
 /// Searcher normal persiste entre llamadas a "go" -- si se reconstruyera
@@ -4115,7 +4376,7 @@ pub fn buscar_lazy_smp(
     game_history: &[u64],
     external_stop: Arc<AtomicBool>,
     root_moves_filtro: Option<Vec<Move>>,
-    pool: &mut PoolMemoriaSMP,
+    pool: &mut PoolHilosSMP,
     nodes_limit: Option<u64>,
 ) -> (Option<Move>, i32, u64, Vec<ResultadoHilo>) {
     // Aging compartido de la TT (ver set_tt_generacion): el contador vive en
@@ -4125,112 +4386,113 @@ pub fn buscar_lazy_smp(
     // DISTINTA a la de jugadas anteriores y la regla de reemplazo de tt_store
     // puede expulsarlas de inmediato (aging vivo en Lazy SMP).
     let generacion = generacion_compartida.fetch_add(1, Ordering::Relaxed) & 0x1F;
-    // Una ranura de memoria persistente por hilo (ver PoolMemoriaSMP).
-    pool.reservar(n_hilos.max(1));
-    if n_hilos <= 1 {
-        let mut s = Searcher::new_con_tt_compartida(Arc::clone(tt), tt_mask, modo_lmr);
-        s.instalar_memoria(pool.tomar(0));
-        s.set_tt_generacion(generacion);
-        s.set_qsearch_nnue(qsearch_nnue);
-        s.set_nnue_classical_depth(nnue_classical_depth);
-        s.set_external_stop(Some(external_stop));
-        s.set_game_history(game_history.to_vec());
-        s.root_moves_filtro = root_moves_filtro;
-        s.nodes_limit = nodes_limit;
-        let (mv, sc, prof) = s.search_time(b, movetime_ms, max_depth, |_, _, _, _, _| {});
-        let nodos = s.nodes;
-        pool.devolver(0, s.extraer_memoria());
-        return (
-            mv,
-            sc,
-            nodos,
-            vec![ResultadoHilo {
-                mv,
-                score: sc,
-                profundidad: prof,
-                nodos,
-            }],
-        );
+    let n = n_hilos.max(1);
+    pool.reservar(n);
+
+    // Escalonamiento de profundidad para los AYUDANTES (i >= 1): tabla de
+    // (size, phase) al estilo de los SkipSize/SkipPhase del Stockfish
+    // clasico. El hilo 0 (principal) nunca salta; los ayudantes se saltean
+    // bloques de iteraciones y quedan 1-2 plies por delante, llenando la TT
+    // compartida con entradas mas profundas que aceleran al principal.
+    const SALTOS: [(u32, u32); 20] = [
+        (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2), (2, 3),
+        (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2),
+        (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 2),
+    ];
+
+    // Canal de respuestas NUEVO por busqueda: el coordinador suelta su copia
+    // del Sender antes de esperar, asi que cuando el ultimo hilo suelta la
+    // suya el recv() corta con Err. Sin esto, un ayudante que muriera dejaria
+    // al motor colgado sin devolver bestmove.
+    let (tx_res, rx_res) = std::sync::mpsc::channel::<(usize, ResultadoHilo)>();
+    let mut esperadas = 0usize;
+    // PRIMERO se despiertan los ayudantes (1..n) y DESPUES busca el hilo 0 en
+    // este mismo hilo: asi los ayudantes ya estan arrancando mientras el
+    // principal hace su propio trabajo, en vez de esperarlos.
+    for i in 1..n {
+        let tarea = TareaSMP {
+            indice: i,
+            board: *b,
+            movetime_ms,
+            max_depth,
+            tt: Arc::clone(tt),
+            tt_mask,
+            modo_lmr,
+            qsearch_nnue,
+            nnue_classical_depth,
+            generacion,
+            game_history: game_history.to_vec(),
+            external_stop: Arc::clone(&external_stop),
+            root_moves_filtro: root_moves_filtro.clone(),
+            // NOTA: en Lazy SMP real cada hilo recibe el MISMO limite N -- no
+            // hay un contador de nodos compartido entre hilos, asi que el
+            // total agregado puede llegar hasta n_hilos * N en el peor caso.
+            nodes_limit,
+            salto_smp: Some(SALTOS[(i - 1) % SALTOS.len()]),
+            null_move_r_extra: match i % 3 {
+                1 => 1,
+                2 => -1,
+                _ => 0,
+            },
+            respuesta: tx_res.clone(),
+        };
+        if pool.enviar(i, tarea) {
+            esperadas += 1;
+        }
     }
+    drop(tx_res);
 
-    let board_copy = *b;
+    // Hilo 0 (el principal, sin escalonamiento) EN ESTE MISMO HILO, con el
+    // Searcher persistente del pool. Con Threads=1 esto es todo lo que pasa:
+    // ni un hilo ni un canal de por medio.
+    let s0 = pool.local.get_or_insert_with(|| {
+        Searcher::new_con_tt_compartida(Arc::clone(tt), tt_mask, modo_lmr)
+    });
+    s0.preparar_reutilizacion(tt, tt_mask, modo_lmr);
+    s0.set_tt_generacion(generacion);
+    s0.set_qsearch_nnue(qsearch_nnue);
+    s0.set_nnue_classical_depth(nnue_classical_depth);
+    s0.set_external_stop(Some(Arc::clone(&external_stop)));
+    s0.set_game_history(game_history.to_vec());
+    s0.root_moves_filtro = root_moves_filtro.clone();
+    s0.nodes_limit = nodes_limit;
+    let (mv0, sc0, prof0) = s0.search_time(b, movetime_ms, max_depth, |_, _, _, _, _| {});
+    let resultado0 = ResultadoHilo {
+        mv: mv0,
+        score: sc0,
+        profundidad: prof0,
+        nodos: s0.nodes,
+    };
 
-    let handles: Vec<_> = (0..n_hilos)
-        .map(|i| {
-            let external_stop = Arc::clone(&external_stop);
-            let tt = Arc::clone(tt);
-            let game_history = game_history.to_vec();
-            let root_moves_filtro = root_moves_filtro.clone();
-            // La memoria del hilo i se MUEVE dentro de su hilo y vuelve con su
-            // resultado: durante la busqueda tiene un unico dueño, sin locks.
-            let memoria = pool.tomar(i);
-            std::thread::spawn(move || {
-                let mut s = Searcher::new_con_tt_compartida(tt, tt_mask, modo_lmr);
-                s.instalar_memoria(memoria);
-                s.set_tt_generacion(generacion);
-                s.set_qsearch_nnue(qsearch_nnue);
-                s.set_nnue_classical_depth(nnue_classical_depth);
-                s.root_moves_filtro = root_moves_filtro;
-                // Escalonamiento de profundidad para los AYUDANTES (i >= 1):
-                // tabla de (size, phase) al estilo de los SkipSize/SkipPhase
-                // del Stockfish clasico. El hilo 0 (principal) nunca salta;
-                // los ayudantes se saltean bloques de iteraciones y quedan
-                // 1-2 plies por delante, llenando la TT compartida con
-                // entradas mas profundas que aceleran al principal. Antes de
-                // esto la unica diversificacion era swap(0,1) en la raiz de
-                // los hilos impares -- medido el 2026-08-20: 8 hilos ganaban
-                // ~0-1 ply sobre 1 hilo (ver HALLAZGOS_SMP_2026-08-20.md).
-                const SALTOS: [(u32, u32); 20] = [
-                    (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2), (2, 3),
-                    (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2),
-                    (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 2),
-                ];
-                s.salto_smp = if i == 0 {
-                    None
-                } else {
-                    Some(SALTOS[(i - 1) % SALTOS.len()])
-                };
-                s.null_move_r_extra = match i % 3 {
-                    1 => 1,
-                    2 => -1,
-                    _ => 0,
-                };
-                s.set_external_stop(Some(external_stop));
-                s.set_game_history(game_history);
-                // NOTA: en Lazy SMP real (n_hilos > 1) cada hilo recibe el
-                // MISMO limite N -- no hay un contador de nodos compartido
-                // entre hilos, asi que el total agregado puede llegar hasta
-                // n_hilos * N en el peor caso, no exactamente N. Sigue
-                // siendo un techo acotado (antes no habia limite alguno);
-                // acotar el TOTAL exacto entre hilos requeriria un contador
-                // atomico compartido, fuera de alcance de este fix.
-                s.nodes_limit = nodes_limit;
-                let (mv, sc, prof) =
-                    s.search_time(&board_copy, movetime_ms, max_depth, |_, _, _, _, _| {});
-                let nodos = s.nodes;
-                (
-                    ResultadoHilo {
-                        mv,
-                        score: sc,
-                        profundidad: prof,
-                        nodos,
-                    },
-                    s.extraer_memoria(),
-                )
-            })
-        })
-        .collect();
+    // Se recogen por INDICE de hilo, no por orden de llegada: el desempate de
+    // `max_by_key` (que se queda con el ultimo maximo) tiene que dar siempre
+    // lo mismo para la misma corrida, no depender de quien conteste primero.
+    let mut por_indice: Vec<Option<ResultadoHilo>> = (0..n).map(|_| None).collect();
+    por_indice[0] = Some(resultado0);
+    let mut recibidas = 0usize;
+    while recibidas < esperadas {
+        match rx_res.recv() {
+            Ok((i, r)) => {
+                if i < por_indice.len() {
+                    por_indice[i] = Some(r);
+                }
+                recibidas += 1;
+            }
+            // Todos los Sender se cayeron sin contestar: hilo(s) muerto(s).
+            // Se sigue con lo que haya en vez de esperar para siempre.
+            Err(_) => break,
+        }
+    }
+    for (i, r) in por_indice.iter().enumerate() {
+        if r.is_some() {
+            pool.usados[i] = true;
+        }
+    }
+    let resultados: Vec<ResultadoHilo> = por_indice.into_iter().flatten().collect();
 
-    let resultados: Vec<ResultadoHilo> = handles
-        .into_iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let (r, memoria) = h.join().expect("hilo de busqueda con panic");
-            pool.devolver(i, memoria);
-            r
-        })
-        .collect();
-
+    // `resultados` nunca puede quedar vacio: el hilo 0 corre en ESTE hilo y
+    // su resultado se mete siempre. Un ayudante que muriera solo resta uno de
+    // los sumandos, no deja al motor sin jugada.
     let nodos_totales: u64 = resultados.iter().map(|r| r.nodos).sum();
     // v12: NO usar score.abs() para desempatar entre hilos con la misma
     // profundidad. Todos buscan la MISMA posicion raiz con el MISMO bando a
@@ -4658,7 +4920,7 @@ mod regression_tests {
         };
 
         // Un solo pool para las dos llamadas, como en el loop UCI real.
-        let mut pool = PoolMemoriaSMP::nuevo();
+        let mut pool = PoolHilosSMP::nuevo();
 
         // Llamada 1 (2 hilos): todos los Searchers siembran generacion 0 y
         // search_time la sube a 1 -- las entradas nuevas llevan generacion 1.
@@ -4724,8 +4986,9 @@ mod regression_tests {
     /// partida") y de lo que ya hacia el camino de un solo hilo, que reutiliza
     /// el Searcher guardado en `searcher_slot`.
     ///
-    /// Antes del arreglo el pool no existia; con el arreglo, tras un "go" cada
-    /// hilo deja su memoria en su ranura y la siguiente llamada la reinstala.
+    /// Antes del arreglo el pool no existia. Con el pool de hilos persistente
+    /// la memoria vive DENTRO del Searcher de cada hilo, que ya no se tira
+    /// nunca -- el test es el mismo y sigue valiendo.
     #[test]
     fn lazy_smp_el_history_sobrevive_entre_llamadas_a_go() {
         let b = Board::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 1")
@@ -4733,7 +4996,7 @@ mod regression_tests {
         let (tt, mask) = construir_tt(16);
         let generacion = AtomicU8::new(0);
         let stop = Arc::new(AtomicBool::new(false));
-        let mut pool = PoolMemoriaSMP::nuevo();
+        let mut pool = PoolHilosSMP::nuevo();
 
         assert_eq!(
             pool.ranuras_con_datos(),
@@ -4741,7 +5004,7 @@ mod regression_tests {
             "un pool nuevo no tiene nada guardado"
         );
 
-        let mut buscar = |pool: &mut PoolMemoriaSMP| {
+        let buscar = |pool: &mut PoolHilosSMP| {
             buscar_lazy_smp(
                 &b,
                 Some(60),
@@ -4790,29 +5053,255 @@ mod regression_tests {
         assert_eq!(pool.magnitud_history(), 0);
     }
 
-    /// Round-trip de las tablas persistentes: lo que sale de un Searcher entra
-    /// intacto en otro. Es el mecanismo que usa el pool entre jugadas.
+    /// La razon de ser del pool persistente: MUCHOS "go" seguidos no pueden
+    /// crear un hilo nuevo cada vez. Antes cada llamada hacia N
+    /// `thread::spawn` y los N morian al terminar (el costo que a movetime de
+    /// 2-5 ms hacia que 8 hilos llegaran menos hondo que 1). Aca se
+    /// comprueban las tres cosas de golpe: la cuenta de hilos vivos se queda
+    /// clavada en N tras el primer "go", ningun hilo muere por el camino, y
+    /// todas las jugadas devueltas son LEGALES en la posicion buscada.
     #[test]
-    fn memoria_de_hilo_va_y_vuelve_intacta() {
-        let mut origen = Searcher::new(1);
-        origen.history[12][34] = 4321;
-        origen.cont_history[7] = -99;
-        let memoria = origen.extraer_memoria();
+    fn el_pool_no_crea_hilos_nuevos_en_cada_go() {
+        let b = Board::from_fen("r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6")
+            .unwrap();
+        let legales = generate_legal(&b).to_vec();
+        let (tt, mask) = construir_tt(8);
+        let generacion = AtomicU8::new(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pool = PoolHilosSMP::nuevo();
+        const HILOS: usize = 4;
 
-        let mut destino = Searcher::new(1);
-        assert_eq!(destino.history[12][34], 0, "arranca en cero");
-        destino.instalar_memoria(memoria);
-        assert_eq!(destino.history[12][34], 4321);
-        assert_eq!(destino.cont_history[7], -99);
+        assert_eq!(pool.hilos_vivos(), 0, "un pool nuevo no tiene hilos");
+        // El hilo 0 lo pone el llamador, asi que con N hilos el pool solo
+        // crea N-1 hilos de sistema operativo.
 
-        // Una memoria vacia (primera jugada / recien limpiada) no toca nada.
-        let mut virgen = Searcher::new(1);
-        virgen.history[12][34] = 7;
-        virgen.instalar_memoria(MemoriaHilo::default());
-        assert_eq!(
-            virgen.history[12][34], 7,
-            "instalar una memoria vacia no debe borrar lo que ya habia"
+        for iteracion in 0..30 {
+            let (mv, _sc, nodos, resultados) = buscar_lazy_smp(
+                &b,
+                Some(3),
+                64,
+                HILOS,
+                &tt,
+                &generacion,
+                mask,
+                true,
+                true,
+                0,
+                &[],
+                Arc::clone(&stop),
+                None,
+                &mut pool,
+                None,
+            );
+            let mv = mv.unwrap_or_else(|| panic!("iteracion {}: sin jugada", iteracion));
+            assert!(
+                legales.contains(&mv),
+                "iteracion {}: devolvio {} que no es legal aqui",
+                iteracion,
+                mv.to_uci()
+            );
+            assert_eq!(
+                resultados.len(),
+                HILOS,
+                "iteracion {}: contestaron {} de {} hilos",
+                iteracion,
+                resultados.len(),
+                HILOS
+            );
+            assert!(nodos > 0, "iteracion {}: no se busco nada", iteracion);
+            assert_eq!(
+                pool.hilos_vivos(),
+                HILOS - 1,
+                "iteracion {}: el pool deberia tener exactamente {} ayudantes vivos (el hilo 0 es el llamador)",
+                iteracion,
+                HILOS - 1
+            );
+        }
+    }
+
+    /// Subir "Threads" a mitad de partida agranda el pool sin tocar los hilos
+    /// que ya estaban (conservan su memoria); bajarlo deja los sobrantes
+    /// dormidos y sigue devolviendo exactamente los resultados pedidos.
+    #[test]
+    fn el_pool_se_adapta_a_cambios_de_threads() {
+        let b = Board::from_fen("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2")
+            .unwrap();
+        let (tt, mask) = construir_tt(8);
+        let generacion = AtomicU8::new(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pool = PoolHilosSMP::nuevo();
+
+        let mut go = |pool: &mut PoolHilosSMP, n: usize| {
+            let (mv, _sc, _nodos, resultados) = buscar_lazy_smp(
+                &b,
+                Some(5),
+                64,
+                n,
+                &tt,
+                &generacion,
+                mask,
+                true,
+                true,
+                0,
+                &[],
+                Arc::clone(&stop),
+                None,
+                pool,
+                None,
+            );
+            assert!(mv.is_some());
+            assert_eq!(resultados.len(), n);
+        };
+
+        go(&mut pool, 2);
+        assert_eq!(pool.hilos_vivos(), 1);
+        // Subir: se crean solo los que faltan.
+        go(&mut pool, 5);
+        assert_eq!(pool.hilos_vivos(), 4);
+        // Bajar: los sobrantes quedan dormidos, no se destruyen ni estorban.
+        go(&mut pool, 3);
+        assert_eq!(pool.hilos_vivos(), 4);
+        assert_eq!(pool.ranuras_con_datos(), 5);
+    }
+
+    /// Un "stop" externo tiene que cortar la busqueda de TODOS los hilos del
+    /// pool y aun asi devolver una jugada legal (profundidad 1 blindada), y
+    /// los hilos tienen que quedar dormidos y utilizables para el "go"
+    /// siguiente -- no muertos.
+    #[test]
+    fn stop_externo_corta_el_pool_y_lo_deja_reutilizable() {
+        let b = Board::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 1")
+            .unwrap();
+        let legales = generate_legal(&b).to_vec();
+        let (tt, mask) = construir_tt(8);
+        let generacion = AtomicU8::new(0);
+        let mut pool = PoolHilosSMP::nuevo();
+
+        // Bandera ya levantada: el caso extremo de "go" + "stop" inmediato.
+        let stop = Arc::new(AtomicBool::new(true));
+        let (mv, _sc, _n, resultados) = buscar_lazy_smp(
+            &b,
+            Some(10_000),
+            64,
+            4,
+            &tt,
+            &generacion,
+            mask,
+            true,
+            true,
+            0,
+            &[],
+            Arc::clone(&stop),
+            None,
+            &mut pool,
+            None,
         );
+        assert!(legales.contains(&mv.expect("siempre debe haber jugada")));
+        assert_eq!(resultados.len(), 4);
+        assert_eq!(pool.hilos_vivos(), 3, "los ayudantes no mueren por un stop");
+
+        // El pool sigue sirviendo para la jugada siguiente.
+        let stop2 = Arc::new(AtomicBool::new(false));
+        let (mv2, _sc, _n, _r) = buscar_lazy_smp(
+            &b,
+            Some(20),
+            64,
+            4,
+            &tt,
+            &generacion,
+            mask,
+            true,
+            true,
+            0,
+            &[],
+            stop2,
+            None,
+            &mut pool,
+            None,
+        );
+        assert!(legales.contains(&mv2.expect("jugada tras reutilizar el pool")));
+        assert_eq!(pool.hilos_vivos(), 3);
+    }
+
+    /// Contrato de `preparar_reutilizacion`, que es lo que permite que un
+    /// hilo del pool persistente use el MISMO Searcher en todas las jugadas:
+    /// la memoria de la partida sobrevive y el estado de la busqueda anterior
+    /// no. Si esto se rompe, el motor arrastra basura de una jugada a la
+    /// siguiente sin fallar ningun otro test.
+    #[test]
+    fn preparar_reutilizacion_conserva_memoria_y_borra_estado_de_busqueda() {
+        let (tt, mask) = construir_tt(1);
+        let mut s = Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, true);
+
+        // Memoria de la partida (tiene que SOBREVIVIR).
+        s.history[12][34] = 4321;
+        s.history_amenaza[5][6] = -77;
+        s.cont_history[7] = -99;
+        s.cont_history_2[11] = 33;
+        s.capture_history[3] = 21;
+        s.counter_moves[9] = Some(Move::new(0, 1, None, MoveFlag::Quiet));
+        s.corr_pawn[13] = 5;
+        s.corr_nonpawn[0][2] = 6;
+        s.corr_nonpawn[1][2] = 7;
+        s.corr_cont[4] = 8;
+
+        // Estado de UNA busqueda (tiene que BORRARSE).
+        s.nodes = 123_456;
+        s.stop = true;
+        s.blindar_stop = true;
+        s.nodes_limit = Some(5);
+        s.tiempo_maximo_ms = Some(500);
+        s.deadline = Some(Instant::now());
+        s.se_sondas = 9;
+        s.se_nodos = 9;
+        s.lmr_intentos = 9;
+        s.lmr_reintentos = 9;
+        s.path_len = 17;
+        s.salto_smp = Some((3, 1));
+        s.null_move_r_extra = 1;
+        s.root_moves_filtro = Some(Vec::new());
+        s.external_stop = Some(Arc::new(AtomicBool::new(true)));
+        s.game_history = vec![1, 2, 3];
+        s.killers[4] = [Some(Move::new(0, 1, None, MoveFlag::Quiet)), None];
+        s.excluded[4] = Some(Move::new(0, 1, None, MoveFlag::Quiet));
+        s.hindsight_parent_eval[4] = 55;
+        s.hindsight_reduction[4] = 2;
+        s.eval_stack[4] = 123;
+
+        s.preparar_reutilizacion(&tt, mask, true);
+
+        assert_eq!(s.history[12][34], 4321, "el history es memoria de partida");
+        assert_eq!(s.history_amenaza[5][6], -77);
+        assert_eq!(s.cont_history[7], -99);
+        assert_eq!(s.cont_history_2[11], 33);
+        assert_eq!(s.capture_history[3], 21);
+        assert!(s.counter_moves[9].is_some());
+        assert_eq!(s.corr_pawn[13], 5);
+        assert_eq!(s.corr_nonpawn[0][2], 6);
+        assert_eq!(s.corr_nonpawn[1][2], 7);
+        assert_eq!(s.corr_cont[4], 8);
+
+        assert_eq!(s.nodes, 0);
+        assert!(!s.stop);
+        assert!(!s.blindar_stop);
+        assert_eq!(s.nodes_limit, None);
+        assert_eq!(s.tiempo_maximo_ms, None);
+        assert!(s.deadline.is_none());
+        assert_eq!(s.se_sondas, 0);
+        assert_eq!(s.se_nodos, 0);
+        assert_eq!(s.lmr_intentos, 0);
+        assert_eq!(s.lmr_reintentos, 0);
+        assert_eq!(s.path_len, 0);
+        assert_eq!(s.salto_smp, None);
+        assert_eq!(s.null_move_r_extra, 0);
+        assert!(s.root_moves_filtro.is_none());
+        assert!(s.external_stop.is_none());
+        assert!(s.game_history.is_empty());
+        assert_eq!(s.killers[4], [None, None]);
+        assert!(s.excluded[4].is_none());
+        assert_eq!(s.hindsight_parent_eval[4], 0);
+        assert_eq!(s.hindsight_reduction[4], 0);
+        assert_eq!(s.eval_stack[4], EVAL_INVALIDA);
     }
 }
 
@@ -4986,7 +5475,7 @@ mod reproduccion_h5c5 {
         let (tt, mask) = construir_tt(64);
         let generacion = std::sync::atomic::AtomicU8::new(0);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut pool = PoolMemoriaSMP::nuevo();
+        let mut pool = PoolHilosSMP::nuevo();
         for movetime in [20u64, 100, 500] {
             let (mv, _sc, _nodos, _res) = buscar_lazy_smp(
                 &b,
@@ -5145,7 +5634,7 @@ mod reproduccion_h5c5 {
         let (tt, mask) = construir_tt(64);
         let generacion = std::sync::atomic::AtomicU8::new(0);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut pool = PoolMemoriaSMP::nuevo();
+        let mut pool = PoolHilosSMP::nuevo();
         let (mv, _sc, _nodos, _res) = buscar_lazy_smp(
             &b,
             Some(100),
