@@ -887,6 +887,26 @@ pub struct Searcher {
     // de tiempo. Necesario para "go infinite" y para cumplir el protocolo
     // UCI que exigen los testers de listas de rating como CCRL.
     external_stop: Option<Arc<AtomicBool>>,
+    /// Bandera de aborto INTERNA de Lazy SMP: la levanta `buscar_lazy_smp`
+    /// en cuanto el hilo PRINCIPAL termina su busqueda, para que los hilos
+    /// ayudantes corten de inmediato en vez de seguir consumiendo reloj.
+    ///
+    /// Sin esto, cada hilo corria su propio corte blando de tiempo y la
+    /// busqueda solo terminaba cuando el ULTIMO hilo decidia parar: el
+    /// tiempo de pared era el MAXIMO de N decisiones independientes, no la
+    /// del principal. Medido el 2026-08-26 con reloj real de 60s
+    /// (presupuesto objetivo 2.0s/jugada): 1 hilo gastaba 2.16s de media
+    /// (justo el objetivo) y 4/8 hilos gastaban 4.16s/4.52s, con el maximo
+    /// clavado en 7.98s = el techo DURO (4x objetivo). O sea: con Threads>1
+    /// la gestion de tiempo quedaba practicamente anulada y el motor jugaba
+    /// al doble de reloj por jugada.
+    stop_ayudantes: Option<Arc<AtomicBool>>,
+    /// True solo en los hilos AYUDANTES de Lazy SMP. Un ayudante no hace
+    /// gestion de tiempo propia (no aplica el corte blando): busca hasta que
+    /// el principal lo corte con `stop_ayudantes` o hasta el deadline duro.
+    /// Es el reparto estandar (estilo Stockfish): el reloj lo administra un
+    /// solo hilo, el principal.
+    ayudante_smp: bool,
     /// Mientras esta en true, `check_time` NO levanta `self.stop`: ni por
     /// deadline ni por la bandera externa. Se usa SOLO durante la primera
     /// iteracion de profundizacion (ver search_time) para garantizar que la
@@ -955,6 +975,8 @@ impl Searcher {
             root_moves_filtro: None,
             null_move_r_extra: 0,
             external_stop: None,
+            stop_ayudantes: None,
+            ayudante_smp: false,
             blindar_stop: false,
         }
     }
@@ -1054,12 +1076,21 @@ impl Searcher {
             root_moves_filtro: None,
             null_move_r_extra: 0,
             external_stop: None,
+            stop_ayudantes: None,
+            ayudante_smp: false,
             blindar_stop: false,
         }
     }
 
     /// Fija (o quita) la bandera compartida de "stop" externo -- se llama
     /// antes de lanzar la busqueda en su propio hilo desde uci_loop.
+    /// Marca este Searcher como hilo AYUDANTE de Lazy SMP: no hace gestion
+    /// de tiempo propia y se aborta cuando el principal levanta `flag`.
+    pub fn set_ayudante_smp(&mut self, flag: Arc<AtomicBool>) {
+        self.ayudante_smp = true;
+        self.stop_ayudantes = Some(flag);
+    }
+
     pub fn set_external_stop(&mut self, flag: Option<Arc<AtomicBool>>) {
         self.external_stop = flag;
     }
@@ -1584,6 +1615,15 @@ impl Searcher {
             }
             if !self.stop
                 && let Some(flag) = &self.external_stop
+                && flag.load(Ordering::Relaxed)
+            {
+                self.stop = true;
+            }
+            // Aborto de los ayudantes de Lazy SMP cuando el hilo principal ya
+            // termino (ver `stop_ayudantes`). Mismo chequeo barato, cada 256
+            // nodos, y sujeto al mismo blindaje de la profundidad 1.
+            if !self.stop
+                && let Some(flag) = &self.stop_ayudantes
                 && flag.load(Ordering::Relaxed)
             {
                 self.stop = true;
@@ -3935,9 +3975,16 @@ impl Searcher {
             }
             // Clamp: nunca menos del 40% ni mas del 200% del objetivo.
             let factor = factor.clamp(40, 200);
+            // CORTE BLANDO: SOLO el hilo principal. Un ayudante de Lazy SMP
+            // no administra el reloj (ver `ayudante_smp`); si lo hiciera, la
+            // busqueda terminaria recien cuando el ULTIMO de los N hilos
+            // decidiera parar -- el maximo de N decisiones ruidosas, que en
+            // la practica se clava en el techo duro y duplica el reloj
+            // gastado por jugada.
             if let Some(ms) = optimo_ms
                 && ms > 25
                 && hay_reloj_real
+                && !self.ayudante_smp
             {
                 let umbral = ms.saturating_mul(fraccion_corte) / 100;
                 let umbral = umbral.saturating_mul(factor) / 100;
@@ -4155,9 +4202,14 @@ pub fn buscar_lazy_smp(
 
     let board_copy = *b;
 
+    // Bandera de aborto de los ayudantes: la levanta este hilo en cuanto el
+    // hilo principal (indice 0) devuelve su resultado. Ver `stop_ayudantes`.
+    let stop_ayudantes = Arc::new(AtomicBool::new(false));
+
     let handles: Vec<_> = (0..n_hilos)
         .map(|i| {
             let external_stop = Arc::clone(&external_stop);
+            let stop_ayudantes = Arc::clone(&stop_ayudantes);
             let tt = Arc::clone(tt);
             let game_history = game_history.to_vec();
             let root_moves_filtro = root_moves_filtro.clone();
@@ -4188,6 +4240,12 @@ pub fn buscar_lazy_smp(
                 s.salto_smp = if i == 0 {
                     None
                 } else {
+                    // Los ayudantes NO administran el reloj: buscan hasta que
+                    // el principal termine (stop_ayudantes) o hasta el
+                    // deadline duro. El corte blando -- que existe para
+                    // guardar reloj para las jugadas siguientes -- es una
+                    // decision UNICA, y la toma el hilo principal.
+                    s.set_ayudante_smp(Arc::clone(&stop_ayudantes));
                     Some(SALTOS[(i - 1) % SALTOS.len()])
                 };
                 s.null_move_r_extra = match i % 3 {
@@ -4221,15 +4279,26 @@ pub fn buscar_lazy_smp(
         })
         .collect();
 
-    let resultados: Vec<ResultadoHilo> = handles
-        .into_iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let (r, memoria) = h.join().expect("hilo de busqueda con panic");
-            pool.devolver(i, memoria);
-            r
-        })
-        .collect();
+    // ORDEN DE JOIN: primero el PRINCIPAL (indice 0), que es el unico que
+    // hace gestion de tiempo. En cuanto devuelve, se levanta la bandera y los
+    // ayudantes cortan en el siguiente chequeo (cada 256 nodos). Antes se
+    // esperaba a los N hilos, cada uno con su propio corte blando: el reloj
+    // gastado por jugada era el MAXIMO de N decisiones y en la practica se
+    // clavaba en el techo duro (medido: 2x el presupuesto con 4 y 8 hilos).
+    let mut handles = handles;
+    let resto: Vec<_> = handles.drain(1..).collect();
+    let principal = handles.pop().expect("al menos el hilo principal");
+
+    let mut resultados: Vec<ResultadoHilo> = Vec::with_capacity(n_hilos);
+    let (r0, memoria0) = principal.join().expect("hilo de busqueda con panic");
+    stop_ayudantes.store(true, Ordering::Relaxed);
+    pool.devolver(0, memoria0);
+    resultados.push(r0);
+    for (i, h) in resto.into_iter().enumerate() {
+        let (r, memoria) = h.join().expect("hilo de busqueda con panic");
+        pool.devolver(i + 1, memoria);
+        resultados.push(r);
+    }
 
     let nodos_totales: u64 = resultados.iter().map(|r| r.nodos).sum();
     // v12: NO usar score.abs() para desempatar entre hilos con la misma
@@ -4788,6 +4857,87 @@ mod regression_tests {
         pool.limpiar();
         assert_eq!(pool.ranuras_con_datos(), 0, "limpiar() olvida todo");
         assert_eq!(pool.magnitud_history(), 0);
+    }
+
+    /// REGRESION: con reloj REAL (objetivo + techo duro), una busqueda Lazy
+    /// SMP no puede gastar el techo duro entero.
+    ///
+    /// El corte blando del reloj lo decide UN solo hilo (el principal) y en
+    /// cuanto ese termina se aborta a los ayudantes. Antes no: cada hilo
+    /// corria su propio corte blando y se hacia join() de los N, asi que la
+    /// busqueda terminaba recien cuando el ULTIMO decidia parar -- el maximo
+    /// de N decisiones independientes, que en la practica se clava en el
+    /// techo duro. Medido el 2026-08-26 con reloj de 60s (objetivo
+    /// 2.0s/jugada): 1 hilo gastaba 2.16s de media y 4/8 hilos 4.16s/4.52s,
+    /// con el maximo en 7.98s = 4x objetivo = el techo duro exacto.
+    ///
+    /// El umbral es deliberadamente flojo (80% del techo duro) para que el
+    /// test no parpadee en una maquina cargada: solo tiene que fallar si los
+    /// ayudantes vuelven a poder estirar la busqueda hasta el techo.
+    #[test]
+    fn lazy_smp_no_gasta_el_techo_duro_del_reloj() {
+        let b = Board::from_fen(
+            "r1bq1rk1/pp2ppbp/2np1np1/2p5/2P1P3/2NP1NP1/PP3PBP/R1BQ1RK1 w - - 0 9",
+        )
+        .unwrap();
+        let (tt, mask) = construir_tt(16);
+        let generacion = AtomicU8::new(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pool = PoolMemoriaSMP::nuevo();
+
+        // Reloj real: objetivo 200ms, techo duro 800ms (la relacion 4x que
+        // arma `calcular_movetime_maximo` en lib.rs).
+        const OBJETIVO_MS: u64 = 200;
+        const TECHO_MS: u64 = 800;
+        fijar_tiempo_maximo(Some(TECHO_MS));
+
+        let inicio = Instant::now();
+        let (mv, _sc, _nodos, _res) = buscar_lazy_smp(
+            &b,
+            Some(OBJETIVO_MS),
+            64,
+            4,
+            &tt,
+            &generacion,
+            mask,
+            true,
+            true,
+            0,
+            &[],
+            Arc::clone(&stop),
+            None,
+            &mut pool,
+            None,
+        );
+        let transcurrido = inicio.elapsed().as_millis() as u64;
+        fijar_tiempo_maximo(None);
+
+        assert!(mv.is_some(), "siempre tiene que devolver una jugada");
+        assert!(
+            transcurrido < TECHO_MS * 80 / 100,
+            "con 4 hilos y reloj real la busqueda gasto {transcurrido}ms de un \
+             techo duro de {TECHO_MS}ms (objetivo {OBJETIVO_MS}ms): los hilos \
+             ayudantes volvieron a estirar el reloj por su cuenta"
+        );
+    }
+
+    /// La bandera de aborto de los ayudantes tiene que CORTAR de verdad la
+    /// busqueda de un ayudante (es el mecanismo con el que el hilo principal
+    /// libera el reloj). Unitario y sin depender de tiempos de pared.
+    #[test]
+    fn la_bandera_de_ayudante_smp_corta_la_busqueda() {
+        let b = Board::from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 0 1")
+            .unwrap();
+        let bandera = Arc::new(AtomicBool::new(true)); // ya levantada
+        let mut s = Searcher::new(16);
+        s.set_ayudante_smp(Arc::clone(&bandera));
+        let (mv, _sc, prof) = s.search_time(&b, Some(60_000), 64, |_, _, _, _, _| {});
+        assert!(mv.is_some(), "la profundidad 1 se completa siempre");
+        assert!(
+            prof <= 2,
+            "con la bandera de ayudante ya levantada la busqueda tenia que \
+             cortar de inmediato, llego a profundidad {prof}"
+        );
     }
 
     /// Round-trip de las tablas persistentes: lo que sale de un Searcher entra
