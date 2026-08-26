@@ -20,6 +20,9 @@ PARTIDAS = int(sys.argv[4]) if len(sys.argv) > 4 else 40
 HILOS = int(sys.argv[5]) if len(sys.argv) > 5 else 4
 BASE_S = float(sys.argv[6]) if len(sys.argv) > 6 else 30.0
 INC_S = float(sys.argv[7]) if len(sys.argv) > 7 else 0.3
+# Desplazamiento del banco de aperturas: permite partir el mismo test en
+# varios trabajadores sobre tramos DISJUNTOS y sumar los W/D/L despues.
+OFFSET = int(sys.argv[8]) if len(sys.argv) > 8 else 0
 
 APER = [l.strip() for l in open(pathlib.Path(__file__).with_name("aperturas.txt")) if l.strip()]
 random.Random(20260826).shuffle(APER)
@@ -34,7 +37,7 @@ def jugar(cand, base, fen, cand_blancas):
     reloj = {chess.WHITE: BASE_S, chess.BLACK: BASE_S}
     tiempos = {"cand": [], "base": []}
     while not tab.is_game_over(claim_draw=True):
-        if len(tab.move_stack) > 300:
+        if len(tab.move_stack) > 200:
             return "1/2-1/2", tiempos, None
         es_cand = (tab.turn == chess.WHITE) == cand_blancas
         motor = cand if es_cand else base
@@ -42,7 +45,7 @@ def jugar(cand, base, fen, cand_blancas):
                                  white_inc=INC_S, black_inc=INC_S)
         t0 = time.time()
         try:
-            res = motor.play(tab, lim)
+            res = motor.play(tab, lim, info=chess.engine.INFO_NONE)
         except Exception as ex:
             return ("0-1" if cand_blancas == (tab.turn == chess.WHITE) else "1-0"), tiempos, f"error {ex}"
         el = time.time() - t0
@@ -64,7 +67,7 @@ def main():
     salida = pathlib.Path(__file__).parent / f"{NOMBRE}_resultado.txt"
     try:
         for i in range(PARTIDAS):
-            fen = APER[i % len(APER)]
+            fen = APER[(OFFSET + i) % len(APER)]
             cand_blancas = (i % 2 == 0)
             r, t, nota = jugar(cand, base, fen, cand_blancas)
             if nota and nota.startswith("bandera"):
@@ -73,7 +76,7 @@ def main():
             if r == "1/2-1/2": d += 1
             elif (r == "1-0") == cand_blancas: w += 1
             else: l += 1
-            if (i + 1) % 4 == 0 or i + 1 == PARTIDAS:
+            if True:
                 n = w + d + l
                 sc = (w + 0.5 * d) / n
                 print(f"[{n:3d}] cand {w}-{d}-{l}  score={sc*100:.1f}%  "
