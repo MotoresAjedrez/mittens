@@ -312,6 +312,36 @@ fn rfp_prof_max() -> i32 {
     *C.get_or_init(|| env_i32("MITTENS_RFP_PROF_MAX", 2, 20, 8))
 }
 
+/// Margen para hacer IIR tambien cuando la entrada de TT existe pero es
+/// demasiado superficial (`entry.depth < depth - N`). 0 = apagado, que es el
+/// comportamiento historico (IIR solo cuando NO hay tt_move).
+fn iir_tt_superficial() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_IIR_TT", 0, 12, 0))
+}
+
+/// Ancho inicial de la ventana de aspiracion, en unidades internas.
+///
+/// Default 50, el historico. Con `peso_bullet` = 1.6 eso son ~31 centipeones
+/// reales, que es ancho para el estandar moderno (Berserk y Viridithas suelen
+/// arrancar en 10-25 cp). Una ventana mas angosta corta mas en toda la
+/// iteracion, a cambio de mas re-busquedas por fallo.
+fn ventana_aspiracion() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_ASPIRACION", 6, 200, 50))
+}
+
+/// Jaques silenciosos en quiescencia. 1 = encendido (historico), 0 = apagado.
+///
+/// Hoy, en cada hoja de la frontera (`qdepth == 0`), se hace una generacion
+/// legal COMPLETA solo para encontrar hasta 5 jaques quietos. Stockfish,
+/// Berserk y Viridithas no generan jaques silenciosos en quiescencia. Apagarlo
+/// es una ganancia de NPS pura; la pregunta es cuanta tactica cuesta.
+fn qsearch_jaques_quietos() -> bool {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_QCHECKS", 0, 1, 1)) == 1
+}
+
 /// Podas de jugada-por-jugada DENTRO de la sonda de singularidad (LMP,
 /// futilidad de frontera y poda de quiets por SEE/historia). APAGADAS por
 /// defecto, y esto se midio, no se supuso:
@@ -2060,7 +2090,7 @@ impl Searcher {
         // ejecuta en qdepth >= 1. Eso es lo que evita la explosion de nodos:
         // sin este freno cada jaque silencioso podria a su vez probar sus
         // propios jaques silenciosos, y los de esos, encadenando sin fin.
-        if qdepth == 0 && alpha < beta && stand_pat + 150 > alpha {
+        if qdepth == 0 && qsearch_jaques_quietos() && alpha < beta && stand_pat + 150 > alpha {
             let mut jaques_probados = 0usize;
             let mut jaques_lista = MoveList::new();
             generate_legal_into_con_jaque(b, &mut jaques_lista, false);
@@ -2585,7 +2615,19 @@ impl Searcher {
         // gestiona la profundidad ahi) ni a profundidad baja (el ahorro no
         // compensa el costo de una pasada extra).
         const IIR_PROF_MIN: i32 = 4;
-        if !en_jaque && tt_move.is_none() && depth >= IIR_PROF_MIN {
+        // Ampliacion opcional (apagada por defecto, ver `iir_tt_superficial`):
+        // Stockfish tambien reduce cuando la entrada de TT SI existe pero es
+        // demasiado superficial para ordenar bien -- `ttData.depth < depth - N`.
+        // Hoy Mittens solo reduce cuando NO hay tt_move, que es una fraccion
+        // chica de los nodos internos: la mayoria tiene entrada, pero muchas
+        // veces de una profundidad que no sirve para ordenar.
+        let iir_sup = iir_tt_superficial();
+        let tt_demasiado_superficial = iir_sup > 0
+            && tt_move.is_some()
+            && tt_entry_full
+                .as_ref()
+                .is_some_and(|e| e.depth < depth - iir_sup);
+        if !en_jaque && (tt_move.is_none() || tt_demasiado_superficial) && depth >= IIR_PROF_MIN {
             depth -= 1;
         }
 
@@ -3543,19 +3585,19 @@ impl Searcher {
             }
             self.order_moves_ply(b, &mut moves, mejor_mv, 0, None, None);
 
-            const VENTANA_INICIAL: i32 = 50;
+            let ventana_inicial: i32 = ventana_aspiracion();
             let (mut vent_alpha, mut vent_beta) = if self.modo_aspiration
                 && d >= 2
                 && mejor_sc.abs() < MATE - 1000
                 && mejor_sc > -INFINITO
             {
-                (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+                (mejor_sc - ventana_inicial, mejor_sc + ventana_inicial)
             } else {
                 (-INFINITO, INFINITO)
             };
             let mut actual_mv;
             let mut actual_sc;
-            let mut ancho = VENTANA_INICIAL;
+            let mut ancho = ventana_inicial;
             loop {
                 let mut alpha = vent_alpha;
                 actual_mv = moves[0];
@@ -3828,10 +3870,10 @@ impl Searcher {
             // mucho mas en las subramas, y si falla (la posicion cambio mas
             // de lo esperado) se ensancha y se repite. Nunca cambia la
             // jugada final elegida, solo cuanto cuesta encontrarla.
-            const VENTANA_INICIAL: i32 = 50;
+            let ventana_inicial: i32 = ventana_aspiracion();
             let (mut vent_alpha, mut vent_beta) =
                 if self.modo_aspiration && d >= 2 && mejor_sc.abs() < MATE - 1000 {
-                    (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+                    (mejor_sc - ventana_inicial, mejor_sc + ventana_inicial)
                 } else {
                     (-INFINITO, INFINITO)
                 };
@@ -3847,7 +3889,7 @@ impl Searcher {
             let mut nodos_mejor: u64;
             let mut nodos_iter: u64;
             let mut timed_out = false;
-            let mut ancho = VENTANA_INICIAL;
+            let mut ancho = ventana_inicial;
 
             loop {
                 let mut alpha = vent_alpha;
