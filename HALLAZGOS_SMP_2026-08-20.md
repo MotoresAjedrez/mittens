@@ -1,5 +1,27 @@
 # Hallazgos SMP — 2026-08-20
 
+> **ESTADO AL 2026-08-26 — LEER ANTES QUE EL RESTO DEL DOCUMENTO.**
+> Los dos problemas de abajo **ya están arreglados en `main`** (commits
+> `6d6fda2` / `d425bc6`). Re-medido el 2026-08-26 sobre `main`:
+>
+> - Con **tiempo de pared igual** (`go movetime 3000`, que no tiene corte
+>   blando) 4 hilos llegan **+1.7 plies** más hondo que 1 hilo, y el tiempo
+>   para alcanzar una profundidad fija baja **2.5x** con 4 hilos. El "8 hilos
+>   ≈ 1 hilo" del punto 1 **ya no reproduce**.
+> - `go depth N` **sí** respeta `Threads` (punto 2 arreglado).
+>
+> Lo que seguía roto era otra cosa: **la gestión de tiempo bajo SMP**. El
+> corte blando del reloj lo corría CADA hilo por su cuenta y se hacía join()
+> de los N, así que el reloj gastado por jugada era el MÁXIMO de N
+> decisiones y se clavaba en el techo duro (medido: 2x el presupuesto con 4
+> y 8 hilos). Arreglado en la rama `cand_smp_escalonado` (2026-08-26): el
+> reloj lo administra sólo el hilo principal.
+>
+> Moraleja de medición: el "8 hilos ≈ 1 hilo en profundidad" de este
+> documento se midió con `go movetime`, que compara profundidades a tiempo
+> igual — está bien. Pero la conclusión "el SMP no rinde" se quedó pegada en
+> la memoria del proyecto mucho después de que el arreglo estuviera fusionado.
+
 Investigación de "peces grandes" con la máquina descargada. Todo medido, no
 estimado. Binario de `main` (pila de acumuladores + red 1024).
 
