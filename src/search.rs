@@ -213,6 +213,135 @@ fn se_prof_min() -> i32 {
     })
 }
 
+/// Techo de `lmr_depth` para la poda por futilidad de jugadas silenciosas.
+///
+/// 0 = comportamiento historico: la futilidad se gatea por la profundidad
+/// CRUDA del nodo (`depth <= FUT_PROF_MAX`, o sea 4) y el margen escala con
+/// esa misma profundidad cruda.
+///
+/// N > 0 = se gatea por la profundidad EFECTIVA post-LMR (`lmr_depth <= N`) y
+/// el margen escala con `lmr_depth`, que es la formulacion de Stockfish
+/// (`lmrDepth < 13` en su version). El bloque vecino de poda por SEE/historia
+/// (mas abajo en esta misma funcion) YA usa `lmr_depth`, asi que hoy los dos
+/// guardas hermanos miden con varas distintas -- esto es la mitad que faltaba.
+///
+/// Motivacion medida (2026-08-26, binarios frescos, profundidad fija 14, 1
+/// hilo, motor fresco por medicion): el arbol de Mittens necesita 2.41x mas
+/// nodos que Reckless para la misma profundidad, pero el exceso NO esta
+/// repartido parejo -- en la posicion tactica Mittens ya GANA (0.77x) y donde
+/// explota es en las tranquilas (inicial 6.47x, final de peones 2.98x, medio
+/// abierto 2.82x). Las posiciones tranquilas son justo las que estan llenas de
+/// jugadas silenciosas tardias, que es lo que este guarda deberia estar
+/// podando y hoy casi no toca: a profundidad 12 con `idx` alto la reduccion
+/// vale 3-4 plies, o sea `lmr_depth` ~8, pero la futilidad ni se consulta
+/// porque 12 > 4.
+fn fut_lmrdepth_max() -> i32 {
+    static CACHE: OnceLock<i32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_FUT_LMRDEPTH")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v >= 0 && *v <= 20)
+            .unwrap_or(0)
+    })
+}
+
+/// Indice de jugada raiz a partir del cual se aplica LMR EN LA RAIZ.
+///
+/// 0 = comportamiento historico: **no hay LMR en la raiz en absoluto**. Los dos
+/// bucles raiz (`search_fixed_depth` y `search_time`) llaman `negamax(..., d-1,
+/// ...)` para TODAS las jugadas, sin reduccion alguna; lo unico que hay es PVS
+/// con ventana nula.
+///
+/// N > 0 = las jugadas raiz con `idx >= N` se sondean reducidas y solo se
+/// re-buscan a profundidad completa si el sondeo supera alfa. Es lo que hacen
+/// Stockfish, Berserk y Viridithas.
+///
+/// Por que puede importar tanto: los hijos de la raiz SON el arbol. Con 30-40
+/// jugadas legales en un medio juego, buscar la jugada raiz #30 a `d-1` en vez
+/// de `d-1-3` no cuesta 3 plies -- cuesta el subarbol entero de esa jugada
+/// multiplicado por EBF^3 (con el EBF 2.37 medido hoy, ~13x para esa rama).
+fn root_lmr_desde() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("MITTENS_ROOT_LMR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v <= 40)
+            .unwrap_or(0)
+    })
+}
+
+/// Perilla generica de entero con rango, para las calibraciones de abajo.
+fn env_i32(nombre: &'static str, min: i32, max: i32, def: i32) -> i32 {
+    std::env::var(nombre)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v >= min && *v <= max)
+        .unwrap_or(def)
+}
+
+/// Terminos de la reduccion de null-move: `R = BASE + depth/DIV + min((eval -
+/// beta)/200, EVAL_MAX)`.
+///
+/// Los defaults (3, 4, 2) son los historicos. Stockfish usa aproximadamente
+/// `4 + depth/3 + min((eval-beta)/202, 6)`: a profundidad 12 eso es R=8-14
+/// contra los R=6-8 de Mittens. El null-move corta SUBARBOLES ENTEROS, asi que
+/// la diferencia de R se paga multiplicada en tamano de arbol -- y el arbol de
+/// Mittens es 2.41x el de Reckless para la misma profundidad (medido 26-ago).
+fn nmp_base() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_NMP_BASE", 1, 8, 3))
+}
+fn nmp_div() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_NMP_DIV", 2, 12, 4))
+}
+fn nmp_eval_max() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_NMP_EVAL_MAX", 0, 10, 2))
+}
+
+/// Profundidad maxima a la que actua Reverse Futility Pruning.
+///
+/// Default 8, el historico. Stockfish lo aplica hasta profundidad ~14. RFP
+/// RETORNA del nodo entero (no salta una jugada), asi que extender su alcance
+/// poda nodos completos, no ramas sueltas.
+fn rfp_prof_max() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_RFP_PROF_MAX", 2, 20, 8))
+}
+
+/// Margen para hacer IIR tambien cuando la entrada de TT existe pero es
+/// demasiado superficial (`entry.depth < depth - N`). 0 = apagado, que es el
+/// comportamiento historico (IIR solo cuando NO hay tt_move).
+fn iir_tt_superficial() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_IIR_TT", 0, 12, 0))
+}
+
+/// Ancho inicial de la ventana de aspiracion, en unidades internas.
+///
+/// Default 50, el historico. Con `peso_bullet` = 1.6 eso son ~31 centipeones
+/// reales, que es ancho para el estandar moderno (Berserk y Viridithas suelen
+/// arrancar en 10-25 cp). Una ventana mas angosta corta mas en toda la
+/// iteracion, a cambio de mas re-busquedas por fallo.
+fn ventana_aspiracion() -> i32 {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_ASPIRACION", 6, 200, 50))
+}
+
+/// Jaques silenciosos en quiescencia. 1 = encendido (historico), 0 = apagado.
+///
+/// Hoy, en cada hoja de la frontera (`qdepth == 0`), se hace una generacion
+/// legal COMPLETA solo para encontrar hasta 5 jaques quietos. Stockfish,
+/// Berserk y Viridithas no generan jaques silenciosos en quiescencia. Apagarlo
+/// es una ganancia de NPS pura; la pregunta es cuanta tactica cuesta.
+fn qsearch_jaques_quietos() -> bool {
+    static C: OnceLock<i32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_QCHECKS", 0, 1, 1)) == 1
+}
+
 /// Podas de jugada-por-jugada DENTRO de la sonda de singularidad (LMP,
 /// futilidad de frontera y poda de quiets por SEE/historia). APAGADAS por
 /// defecto, y esto se midio, no se supuso:
@@ -1961,7 +2090,7 @@ impl Searcher {
         // ejecuta en qdepth >= 1. Eso es lo que evita la explosion de nodos:
         // sin este freno cada jaque silencioso podria a su vez probar sus
         // propios jaques silenciosos, y los de esos, encadenando sin fin.
-        if qdepth == 0 && alpha < beta && stand_pat + 150 > alpha {
+        if qdepth == 0 && qsearch_jaques_quietos() && alpha < beta && stand_pat + 150 > alpha {
             let mut jaques_probados = 0usize;
             let mut jaques_lista = MoveList::new();
             generate_legal_into_con_jaque(b, &mut jaques_lista, false);
@@ -2210,9 +2339,9 @@ impl Searcher {
             anterior != EVAL_INVALIDA && self.eval_stack[p] > anterior
         };
 
-        const RFP_PROF_MAX: i32 = 8;
+        let rfp_prof_max_v: i32 = rfp_prof_max();
         let rfp_margen_base: i32 = rfp_margen_por_ply();
-        if !en_jaque && !es_pv && depth <= RFP_PROF_MAX && beta.abs() < MATE - 1000 {
+        if !en_jaque && !es_pv && depth <= rfp_prof_max_v && beta.abs() < MATE - 1000 {
             let raw =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
             let static_eval =
@@ -2304,10 +2433,10 @@ impl Searcher {
         // del sondeo, no `beta`): da cotas mas informativas a la TT y al
         // padre. Se sigue devolviendo `beta` si el sondeo trae un puntaje de
         // mate, porque un mate "descubierto" pasando el turno no es fiable.
-        const NULL_MOVE_R_BASE: i32 = 3;
-        const NULL_MOVE_DEPTH_DIV: i32 = 4;
+        let null_move_r_base: i32 = nmp_base();
+        let null_move_depth_div: i32 = nmp_div();
         const NULL_MOVE_EVAL_DIV: i32 = 200;
-        const NULL_MOVE_EVAL_MAX: i32 = 2;
+        let null_move_eval_max: i32 = nmp_eval_max();
         const NULL_MOVE_PROF_MIN: i32 = 3;
         // `excluida.is_none()`: en la sonda de singularidad el sondeo nulo
         // contestaria "el rival no aguanta ni pasando el turno", que NO es lo
@@ -2328,8 +2457,8 @@ impl Searcher {
             let eval_nmp =
                 self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref());
             if eval_nmp >= beta {
-                let r_eval = ((eval_nmp - beta) / NULL_MOVE_EVAL_DIV).min(NULL_MOVE_EVAL_MAX);
-                let r_adaptativo = NULL_MOVE_R_BASE + depth / NULL_MOVE_DEPTH_DIV + r_eval;
+                let r_eval = ((eval_nmp - beta) / NULL_MOVE_EVAL_DIV).min(null_move_eval_max);
+                let r_adaptativo = null_move_r_base + depth / null_move_depth_div + r_eval;
                 let r = (r_adaptativo + self.null_move_r_extra).clamp(2, (depth - 1).max(2));
                 let r = r.min(depth - 1).max(1);
                 let next = b.make_null_move();
@@ -2486,7 +2615,19 @@ impl Searcher {
         // gestiona la profundidad ahi) ni a profundidad baja (el ahorro no
         // compensa el costo de una pasada extra).
         const IIR_PROF_MIN: i32 = 4;
-        if !en_jaque && tt_move.is_none() && depth >= IIR_PROF_MIN {
+        // Ampliacion opcional (apagada por defecto, ver `iir_tt_superficial`):
+        // Stockfish tambien reduce cuando la entrada de TT SI existe pero es
+        // demasiado superficial para ordenar bien -- `ttData.depth < depth - N`.
+        // Hoy Mittens solo reduce cuando NO hay tt_move, que es una fraccion
+        // chica de los nodos internos: la mayoria tiene entrada, pero muchas
+        // veces de una profundidad que no sirve para ordenar.
+        let iir_sup = iir_tt_superficial();
+        let tt_demasiado_superficial = iir_sup > 0
+            && tt_move.is_some()
+            && tt_entry_full
+                .as_ref()
+                .is_some_and(|e| e.depth < depth - iir_sup);
+        if !en_jaque && (tt_move.is_none() || tt_demasiado_superficial) && depth >= IIR_PROF_MIN {
             depth -= 1;
         }
 
@@ -2851,9 +2992,23 @@ impl Searcher {
             // los nodos poco profundos, que son la mayoria del arbol.
             let mut da_jaque: Option<bool> = None;
 
+            // Profundidad que gobierna la futilidad. Con la perilla en 0 (por
+            // defecto) es la profundidad CRUDA y el techo es FUT_PROF_MAX, o
+            // sea exactamente el comportamiento historico. Con la perilla > 0
+            // se usa la profundidad EFECTIVA post-LMR y su propio techo, que
+            // es la formulacion de Stockfish. Ver `fut_lmrdepth_max`.
+            let fut_techo_lmr = fut_lmrdepth_max();
+            let fut_depth = if fut_techo_lmr > 0 {
+                let r_est = tabla_lmr()[(depth as usize).min(63)][(idx + 1).min(63)].max(1);
+                (depth - r_est).max(0)
+            } else {
+                depth
+            };
+            let fut_techo = if fut_techo_lmr > 0 { fut_techo_lmr } else { FUT_PROF_MAX };
+
             if !en_jaque
                 && podar_en_este_nodo
-                && depth <= FUT_PROF_MAX
+                && fut_depth <= fut_techo
                 && idx > 0
                 && best_move.is_some()
                 && !mv.is_capture()
@@ -2873,7 +3028,11 @@ impl Searcher {
                 } else {
                     FUT_MARGEN_POR_PLY
                 };
-                if ev + FUT_MARGEN_BASE + margen_ply * depth <= alpha {
+                // El margen escala con la MISMA profundidad que gobierna el
+                // techo: mezclarlas (techo por lmr_depth, margen por depth
+                // cruda) daria a profundidad 14 un margen de 1550 centesimas y
+                // podaria medio arbol de una.
+                if ev + FUT_MARGEN_BASE + margen_ply * fut_depth <= alpha {
                     if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
                         continue;
                     }
@@ -3426,19 +3585,19 @@ impl Searcher {
             }
             self.order_moves_ply(b, &mut moves, mejor_mv, 0, None, None);
 
-            const VENTANA_INICIAL: i32 = 50;
+            let ventana_inicial: i32 = ventana_aspiracion();
             let (mut vent_alpha, mut vent_beta) = if self.modo_aspiration
                 && d >= 2
                 && mejor_sc.abs() < MATE - 1000
                 && mejor_sc > -INFINITO
             {
-                (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+                (mejor_sc - ventana_inicial, mejor_sc + ventana_inicial)
             } else {
                 (-INFINITO, INFINITO)
             };
             let mut actual_mv;
             let mut actual_sc;
-            let mut ancho = VENTANA_INICIAL;
+            let mut ancho = ventana_inicial;
             loop {
                 let mut alpha = vent_alpha;
                 actual_mv = moves[0];
@@ -3711,10 +3870,10 @@ impl Searcher {
             // mucho mas en las subramas, y si falla (la posicion cambio mas
             // de lo esperado) se ensancha y se repite. Nunca cambia la
             // jugada final elegida, solo cuanto cuesta encontrarla.
-            const VENTANA_INICIAL: i32 = 50;
+            let ventana_inicial: i32 = ventana_aspiracion();
             let (mut vent_alpha, mut vent_beta) =
                 if self.modo_aspiration && d >= 2 && mejor_sc.abs() < MATE - 1000 {
-                    (mejor_sc - VENTANA_INICIAL, mejor_sc + VENTANA_INICIAL)
+                    (mejor_sc - ventana_inicial, mejor_sc + ventana_inicial)
                 } else {
                     (-INFINITO, INFINITO)
                 };
@@ -3730,7 +3889,7 @@ impl Searcher {
             let mut nodos_mejor: u64;
             let mut nodos_iter: u64;
             let mut timed_out = false;
-            let mut ancho = VENTANA_INICIAL;
+            let mut ancho = ventana_inicial;
 
             loop {
                 let mut alpha = vent_alpha;
@@ -3753,10 +3912,31 @@ impl Searcher {
                     let next_eval = self.siguiente_estado_busqueda(&root_eval, b, &next, d - 1);
                     let sondeo_alpha = if idx == 0 { -vent_beta } else { -alpha - 1 };
                     let sondeo_beta = -alpha;
+                    // LMR EN LA RAIZ (apagado por defecto, ver `root_lmr_desde`).
+                    // Solo jugadas silenciosas tardias, y nunca con el rey en
+                    // jaque. La reduccion se topa en `d-2` para que el sondeo
+                    // nunca caiga por debajo de profundidad 1.
+                    let r_raiz: i32 = {
+                        let desde = root_lmr_desde();
+                        if desde > 0
+                            && idx >= desde
+                            && d >= 3
+                            && !mv.is_capture()
+                            && mv.promotion.is_none()
+                            && !b.in_check(b.turn)
+                        {
+                            tabla_lmr()[(d as usize).min(63)][(idx + 1).min(63)]
+                                .max(1)
+                                .min(d - 2)
+                                .max(0)
+                        } else {
+                            0
+                        }
+                    };
                     let res_sondeo = self.negamax(
                         &next,
                         &next_eval,
-                        d - 1,
+                        d - 1 - r_raiz,
                         sondeo_alpha,
                         sondeo_beta,
                         1,
@@ -3764,7 +3944,7 @@ impl Searcher {
                         None,
                         false,
                     );
-                    let sondeo = match res_sondeo {
+                    let mut sondeo = match res_sondeo {
                         Ok(v) => -v,
                         Err(_) => {
                             self.salir_hijo(&next_eval, b, &next);
@@ -3772,6 +3952,30 @@ impl Searcher {
                             break;
                         }
                     };
+                    // Si el sondeo REDUCIDO supera alfa, no se puede confiar en
+                    // el: hay que re-verificarlo a profundidad completa antes
+                    // de dejar que compita por ser la mejor jugada de la raiz.
+                    if r_raiz > 0 && sondeo > alpha {
+                        let res_ver = self.negamax(
+                            &next,
+                            &next_eval,
+                            d - 1,
+                            sondeo_alpha,
+                            sondeo_beta,
+                            1,
+                            Some((pt_mv, mv.to as usize)),
+                            None,
+                            false,
+                        );
+                        sondeo = match res_ver {
+                            Ok(v) => -v,
+                            Err(_) => {
+                                self.salir_hijo(&next_eval, b, &next);
+                                timed_out = true;
+                                break;
+                            }
+                        };
+                    }
                     let sc = if idx > 0 && sondeo > alpha && sondeo < vent_beta {
                         let res_full = self.negamax(
                             &next,
