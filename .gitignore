@@ -9,3 +9,4 @@
 # Resultados locales de SPRT (PGN y checkpoints, no son fuente)
 /results_sprt/
 __pycache__/
+target-*/
