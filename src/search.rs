@@ -217,13 +217,17 @@ fn se_prof_min() -> i32 {
 ///
 /// 0 = comportamiento historico: la futilidad se gatea por la profundidad
 /// CRUDA del nodo (`depth <= FUT_PROF_MAX`, o sea 4) y el margen escala con
-/// esa misma profundidad cruda.
+/// esa misma profundidad cruda. DESPLEGADO 2026-08-26: default ahora 8 (antes
+/// 0/apagado), validado con h2h real -- 250 partidas, 59.8% +/-6.1% contra la
+/// version anterior (5s+0.05s, 1 hilo), estable 59-61% desde n=110. Ver
+/// memoria proyecto-mittens-futilidad-lmrdepth-ganador.
 ///
 /// N > 0 = se gatea por la profundidad EFECTIVA post-LMR (`lmr_depth <= N`) y
 /// el margen escala con `lmr_depth`, que es la formulacion de Stockfish
 /// (`lmrDepth < 13` en su version). El bloque vecino de poda por SEE/historia
-/// (mas abajo en esta misma funcion) YA usa `lmr_depth`, asi que hoy los dos
-/// guardas hermanos miden con varas distintas -- esto es la mitad que faltaba.
+/// (mas abajo en esta misma funcion) YA usa `lmr_depth`, asi que hasta ahora
+/// los dos guardas hermanos median con varas distintas -- esto era la mitad
+/// que faltaba.
 ///
 /// Motivacion medida (2026-08-26, binarios frescos, profundidad fija 14, 1
 /// hilo, motor fresco por medicion): el arbol de Mittens necesita 2.41x mas
@@ -232,9 +236,9 @@ fn se_prof_min() -> i32 {
 /// explota es en las tranquilas (inicial 6.47x, final de peones 2.98x, medio
 /// abierto 2.82x). Las posiciones tranquilas son justo las que estan llenas de
 /// jugadas silenciosas tardias, que es lo que este guarda deberia estar
-/// podando y hoy casi no toca: a profundidad 12 con `idx` alto la reduccion
-/// vale 3-4 plies, o sea `lmr_depth` ~8, pero la futilidad ni se consulta
-/// porque 12 > 4.
+/// podando y antes casi no tocaba: a profundidad 12 con `idx` alto la
+/// reduccion vale 3-4 plies, o sea `lmr_depth` ~8, pero la futilidad no se
+/// consultaba porque 12 > 4 (el techo viejo).
 fn fut_lmrdepth_max() -> i32 {
     static CACHE: OnceLock<i32> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -242,7 +246,7 @@ fn fut_lmrdepth_max() -> i32 {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|v| *v >= 0 && *v <= 20)
-            .unwrap_or(0)
+            .unwrap_or(8)
     })
 }
 
