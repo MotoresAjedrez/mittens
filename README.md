@@ -1,7 +1,7 @@
 # 🐱 Mittens 
 
 ![logo](logo.png)
-
+Note: Its ai coded
 **ELO: 1**
 
 Un motor de ajedrez escrito en Rust, con red neuronal NNUE propia — nacido sin saber ni mover un peón en código, y ahora juega solo, piensa solo, y a veces sacrifica piezas sin avisar.
