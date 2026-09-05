@@ -43,7 +43,7 @@ impl MotorUci {
         m.esperar_uciok();
         if ruta.contains("Mittens") {
             m.enviar("setoption name UseNNUE value true");
-            m.enviar(&format!("setoption name NNUEPath value {}", MITTENS_WEIGHTS));
+            m.enviar(&format!("setoption name NNUEPath value {}", std::env::var("MITTENS_H2H_PESOS").unwrap_or_else(|_| MITTENS_WEIGHTS.to_string())));
         }
         m.enviar("isready");
         loop {
@@ -203,15 +203,23 @@ const OPENINGS: [&str; 5] = [
 
 #[test]
 fn duelo_mittens_vs_debil() {
+    // Rutas portables: MITTENS_H2H_DIR (y MITTENS_H2H_PESOS) sobreescriben las
+    // rutas historicas de macOS. Si el directorio no existe, el test se omite
+    // con aviso en vez de fallar: es un duelo informativo, no una prueba unitaria.
+    let dir = std::env::var("MITTENS_H2H_DIR").unwrap_or_else(|_| DIR.to_string());
+    if !std::path::Path::new(&dir).is_dir() {
+        eprintln!("h2h omitido: no existe {dir} (define MITTENS_H2H_DIR)");
+        return;
+    }
     println!("\n=== CONTROL: MITTENS vs Escoba (Apotheosis, motor debil ~2747 CCRL) ===");
     let mut p_mittens = 0.0;
     let mut p_debil = 0.0;
     for (i, ap) in OPENINGS.iter().enumerate() {
         let mit_white = i % 2 == 0;
         let (pb, pn) = if mit_white {
-            (format!("{DIR}Mittens"), format!("{DIR}Escoba"))
+            (format!("{dir}Mittens"), format!("{dir}Escoba"))
         } else {
-            (format!("{DIR}Escoba"), format!("{DIR}Mittens"))
+            (format!("{dir}Escoba"), format!("{dir}Mittens"))
         };
         let r = jugar_partida(&pb, &pn, ap, 200, 220);
         let pts = if r == 1 {

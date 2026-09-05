@@ -48,7 +48,7 @@ impl MotorUci {
         if ruta.contains("Mittens") {
             // Activar la red NNUE de produccion, igual que el harness elite.
             m.enviar("setoption name UseNNUE value true");
-            m.enviar(&format!("setoption name NNUEPath value {}", MITTENS_WEIGHTS));
+            m.enviar(&format!("setoption name NNUEPath value {}", std::env::var("MITTENS_H2H_PESOS").unwrap_or_else(|_| MITTENS_WEIGHTS.to_string())));
         }
         m.enviar("isready");
         loop {
@@ -209,6 +209,14 @@ const OPENINGS: [&str; 4] = [
 
 #[test]
 fn duelo_mittens_vs_termino() {
+    // Rutas portables: MITTENS_H2H_DIR (y MITTENS_H2H_PESOS) sobreescriben las
+    // rutas historicas de macOS. Si el directorio no existe, el test se omite
+    // con aviso en vez de fallar: es un duelo informativo, no una prueba unitaria.
+    let dir = std::env::var("MITTENS_H2H_DIR").unwrap_or_else(|_| DIR.to_string());
+    if !std::path::Path::new(&dir).is_dir() {
+        eprintln!("h2h omitido: no existe {dir} (define MITTENS_H2H_DIR)");
+        return;
+    }
     println!("\n=== DUELO MITTENS vs TERMO (Frozenight) ===");
     let mut p_mittens = 0.0;
     let mut p_termino = 0.0;
@@ -217,15 +225,15 @@ fn duelo_mittens_vs_termino() {
         let (r1, r2) = if mit_white {
             (
                 jugar_partida(
-                    &format!("{DIR}Mittens"),
-                    &format!("{DIR}Termo"),
+                    &format!("{dir}Mittens"),
+                    &format!("{dir}Termo"),
                     ap,
                     300,
                     120,
                 ),
                 jugar_partida(
-                    &format!("{DIR}Termo"),
-                    &format!("{DIR}Mittens"),
+                    &format!("{dir}Termo"),
+                    &format!("{dir}Mittens"),
                     ap,
                     300,
                     120,
@@ -234,15 +242,15 @@ fn duelo_mittens_vs_termino() {
         } else {
             (
                 jugar_partida(
-                    &format!("{DIR}Termo"),
-                    &format!("{DIR}Mittens"),
+                    &format!("{dir}Termo"),
+                    &format!("{dir}Mittens"),
                     ap,
                     300,
                     120,
                 ),
                 jugar_partida(
-                    &format!("{DIR}Mittens"),
-                    &format!("{DIR}Termo"),
+                    &format!("{dir}Mittens"),
+                    &format!("{dir}Termo"),
                     ap,
                     300,
                     120,

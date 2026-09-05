@@ -202,6 +202,9 @@ fn se_margen_mult() -> i32 {
     })
 }
 
+/// DESPLEGADO 2026-09-05 (revision Fable): default 8 -> 6. Medido con
+/// medir/sprt_diverso.py a 25.000 nodos, 200 partidas: 59,3 % (+65 +/- 38 Elo).
+/// Con 5 y 4 la ganancia fue menor (ver REVISION/REVISION_FINAL.md, seccion 7).
 fn se_prof_min() -> i32 {
     static CACHE: OnceLock<i32> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -209,7 +212,7 @@ fn se_prof_min() -> i32 {
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|v| *v >= 3 && *v <= 20)
-            .unwrap_or(8)
+            .unwrap_or(6)
     })
 }
 
@@ -265,6 +268,8 @@ fn fut_lmrdepth_max() -> i32 {
 /// jugadas legales en un medio juego, buscar la jugada raiz #30 a `d-1` en vez
 /// de `d-1-3` no cuesta 3 plies -- cuesta el subarbol entero de esa jugada
 /// multiplicado por EBF^3 (con el EBF 2.37 medido hoy, ~13x para esa rama).
+/// DESPLEGADO 2026-09-05 (revision Fable): default 0 -> 4. Medido a 25.000
+/// nodos, 200 partidas: 54,8 % (+33 +/- 36 Elo). Ver REVISION/REVISION_FINAL.md.
 fn root_lmr_desde() -> usize {
     static CACHE: OnceLock<usize> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -272,7 +277,7 @@ fn root_lmr_desde() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v <= 40)
-            .unwrap_or(0)
+            .unwrap_or(4)
     })
 }
 
@@ -330,9 +335,11 @@ fn iir_tt_superficial() -> i32 {
 /// reales, que es ancho para el estandar moderno (Berserk y Viridithas suelen
 /// arrancar en 10-25 cp). Una ventana mas angosta corta mas en toda la
 /// iteracion, a cambio de mas re-busquedas por fallo.
+/// DESPLEGADO 2026-09-05 (revision Fable): default 50 -> 25 (~16 cp reales).
+/// Medido a 25.000 nodos, 200 partidas: 52,0 % (+14 +/- 38 Elo), neutro-positivo.
 fn ventana_aspiracion() -> i32 {
     static C: OnceLock<i32> = OnceLock::new();
-    *C.get_or_init(|| env_i32("MITTENS_ASPIRACION", 6, 200, 50))
+    *C.get_or_init(|| env_i32("MITTENS_ASPIRACION", 6, 200, 25))
 }
 
 /// Jaques silenciosos en quiescencia. 1 = encendido (historico), 0 = apagado.
@@ -652,8 +659,30 @@ fn prefetch_lectura(p: *const u8) {
     let _ = p;
 }
 
-type SharedTT = Vec<AtomicU64>;
-type LocalTT = Vec<Option<TTEntry>>;
+/// Numero de casilleros por cubeta de la TT.
+pub const TT_VIAS: usize = 4;
+
+/// Cubeta de la TT: 4 casilleros de 8 bytes = 32 bytes, alineados a 32 para
+/// que una cubeta NUNCA cruce una linea de cache de 64 bytes (un probe y un
+/// store tocan exactamente una linea). El reemplazo se decide DENTRO de la
+/// cubeta por (profundidad, edad), estilo Stockfish/Ethereal: una entrada
+/// nueva ya no expulsa a la unica ocupante de un casillero directo (lo que
+/// hacia que la quiescence y los hilos de Lazy SMP se pisaran entradas
+/// profundas entre si), sino a la MENOS valiosa de las cuatro.
+#[repr(align(32))]
+pub struct CubetaTT([AtomicU64; TT_VIAS]);
+
+impl CubetaTT {
+    fn vacia() -> CubetaTT {
+        CubetaTT(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+    /// Casilleros crudos (solo para tests/diagnostico).
+    pub fn casilleros(&self) -> &[AtomicU64; TT_VIAS] {
+        &self.0
+    }
+}
+
+type SharedTT = Vec<CubetaTT>;
 
 const TT_OCUPADO: u64 = 1 << 48;
 
@@ -798,13 +827,6 @@ fn tt_desempaquetar(paquete: u64, key: u64) -> Option<TTEntry> {
     Some(TTEntry { key, depth, score, flag, best: mv, generation, was_pv })
 }
 
-/// Un solo hilo no necesita sincronización para su tabla de transposición.
-/// Lazy SMP conserva el backend compartido con `Mutex` por casillero.
-enum TablaTransposicion {
-    Local(LocalTT),
-    Compartida(Arc<SharedTT>),
-}
-
 fn capacidad_tt(tt_mb: usize, slot_size: usize) -> usize {
     let bytes = tt_mb.saturating_mul(1024 * 1024);
     let objetivo = (bytes / slot_size.max(1)).max(1);
@@ -815,30 +837,25 @@ fn capacidad_tt(tt_mb: usize, slot_size: usize) -> usize {
     n_entries.max(1)
 }
 
+/// Construye la TT (una sola implementacion para 1 y N hilos: cubetas de 4
+/// casilleros de 8 bytes, lockless). "Hash 64" da 64 MiB / 32 = 2M cubetas =
+/// 8M entradas. Devuelve la tabla y la MASCARA DE CUBETA (n_cubetas - 1).
 pub fn construir_tt(tt_mb: usize) -> (Arc<SharedTT>, usize) {
-    // Cada casillero es un AtomicU64 de 8 bytes exactos -- "Hash 64" da
-    // 64MiB/8 = 8M entradas (redondeado a potencia de 2), varias veces mas
-    // que con el TTEntry+Mutex anterior (que ocupaba bastante mas de 8
-    // bytes por casillero).
-    let slot_size = std::mem::size_of::<AtomicU64>();
-    let n_entries = capacidad_tt(tt_mb, slot_size);
-    let tt: SharedTT = (0..n_entries).map(|_| AtomicU64::new(0)).collect();
-    (Arc::new(tt), n_entries - 1)
-}
-
-fn construir_tt_local(tt_mb: usize) -> (LocalTT, usize) {
-    let n_entries = capacidad_tt(tt_mb, std::mem::size_of::<Option<TTEntry>>());
-    (vec![None; n_entries], n_entries - 1)
+    let n_cubetas = capacidad_tt(tt_mb, std::mem::size_of::<CubetaTT>());
+    let tt: SharedTT = (0..n_cubetas).map(|_| CubetaTT::vacia()).collect();
+    (Arc::new(tt), n_cubetas - 1)
 }
 
 pub fn limpiar_tt(tt: &SharedTT) {
-    for slot in tt {
-        slot.store(0, Ordering::Relaxed);
+    for cubeta in tt {
+        for slot in &cubeta.0 {
+            slot.store(0, Ordering::Relaxed);
+        }
     }
 }
 
 pub struct Searcher {
-    tt: TablaTransposicion,
+    tt: Arc<SharedTT>,
     tt_mask: usize,
     pub nodes: u64,
     deadline: Option<Instant>,
@@ -858,7 +875,7 @@ pub struct Searcher {
     /// antes de que el chequeo entre depths llegue a ejecutarse.
     pub nodes_limit: Option<u64>,
     stop: bool,
-    // Generacion de la busqueda actual para aging de la TT (0..31): se
+    // Generacion de la busqueda actual para aging de la TT (0..15): se
     // incrementa al inicio de cada busqueda y las entradas de la generacion
     // anterior se prefieren para reemplazo en tt_store.
     tt_generation: u8,
@@ -1061,9 +1078,13 @@ fn valor_pieza(pt: crate::types::PieceType) -> i32 {
 
 impl Searcher {
     pub fn new(tt_mb: usize) -> Searcher {
-        let (tt, tt_mask) = construir_tt_local(tt_mb);
+        // Misma TT (cubetas lockless) que Lazy SMP: antes el camino de un
+        // hilo tenia su propia tabla `Vec<Option<TTEntry>>` de ~24 bytes por
+        // entrada y politica de reemplazo aparte, o sea dos implementaciones
+        // que divergian (ver REVISION/REVISION_FINAL.md, B1 y seccion 4).
+        let (tt, tt_mask) = construir_tt(tt_mb);
         Searcher {
-            tt: TablaTransposicion::Local(tt),
+            tt,
             tt_mask,
             nodes: 0,
             deadline: None,
@@ -1168,7 +1189,7 @@ impl Searcher {
     /// sentido compartirlos, cada hilo ordena sus propias jugadas).
     pub fn new_con_tt_compartida(tt: Arc<SharedTT>, tt_mask: usize, modo_lmr: bool) -> Searcher {
         Searcher {
-            tt: TablaTransposicion::Compartida(tt),
+            tt,
             tt_mask,
             nodes: 0,
             deadline: None,
@@ -1245,7 +1266,7 @@ impl Searcher {
     /// (Searcher persistente) no la necesita: `search_time` ya la incrementa
     /// en cada "go".
     pub fn set_tt_generacion(&mut self, generacion: u8) {
-        self.tt_generation = generacion & 0x1F;
+        self.tt_generation = generacion & 0xF;
     }
 
     /// Reinicia el acumulador NNUE del hilo a la posicion `b`. Se llama en
@@ -1407,14 +1428,7 @@ impl Searcher {
     }
 
     pub fn clear_hash(&mut self) {
-        match &mut self.tt {
-            TablaTransposicion::Local(tt) => {
-                for slot in tt {
-                    *slot = None;
-                }
-            }
-            TablaTransposicion::Compartida(tt) => limpiar_tt(tt),
-        }
+        limpiar_tt(&self.tt);
     }
 
     /// Decae (no resetea de golpe) las tablas de history/continuation
@@ -1609,6 +1623,8 @@ impl Searcher {
         pv
     }
 
+    /// Indice de CUBETA para `key` (bits bajos). La verificacion usa los 15
+    /// bits ALTOS (ver tt_empaquetar), asi que ambos son independientes.
     fn tt_index(&self, key: u64) -> usize {
         (key as usize) & self.tt_mask
     }
@@ -1629,28 +1645,23 @@ impl Searcher {
     #[inline(always)]
     fn tt_prefetch(&self, key: u64) {
         let idx = self.tt_index(key);
-        let p: *const u8 = match &self.tt {
-            TablaTransposicion::Local(tt) => tt.as_ptr().wrapping_add(idx) as *const u8,
-            TablaTransposicion::Compartida(tt) => tt.as_ptr().wrapping_add(idx) as *const u8,
-        };
+        let p: *const u8 = self.tt.as_ptr().wrapping_add(idx) as *const u8;
         prefetch_lectura(p);
     }
 
     fn tt_probe(&self, key: u64) -> Option<TTEntry> {
-        let idx = self.tt_index(key);
-        match &self.tt {
-            TablaTransposicion::Local(tt) => match tt[idx] {
-                Some(e) if e.key == key => Some(e),
-                _ => None,
-            },
-            // Lectura atomica de un solo u64 -- nunca puede leerse "a
-            // medias" (un procesador de 64 bits lee/escribe un u64 alineado
-            // en una sola operacion), asi que no hace falta ningun candado
-            // para que la lectura sea segura entre hilos.
-            TablaTransposicion::Compartida(tt) => {
-                tt_desempaquetar(tt[idx].load(Ordering::Relaxed), key)
+        // Lectura atomica de un solo u64 por casillero -- nunca puede leerse
+        // "a medias" (un procesador de 64 bits lee/escribe un u64 alineado en
+        // una sola operacion), asi que no hace falta ningun candado para que
+        // la lectura sea segura entre hilos. Se recorren los 4 casilleros de
+        // la cubeta (una sola linea de cache).
+        let cubeta = &self.tt[self.tt_index(key)];
+        for slot in &cubeta.0 {
+            if let Some(e) = tt_desempaquetar(slot.load(Ordering::Relaxed), key) {
+                return Some(e);
             }
         }
+        None
     }
 
     // Reemplazo por profundidad, pero una colision de OTRA clave siempre debe
@@ -1673,33 +1684,20 @@ impl Searcher {
         // `self.tt` esta prestado mutablemente, asi que no puede capturar
         // `self` por referencia.
         let generacion = self.tt_generation;
-        // Antes: una colision de OTRA clave siempre pisaba, sin mirar
-        // profundidad. Eso dejaba que las escrituras masivas de quiescence
-        // (depth=0, en casi todos los nodos) desalojaran constantemente las
-        // entradas profundas de negamax que caian en el mismo casillero,
-        // reduciendo la TT efectiva de la busqueda principal. Ahora una
-        // colision de otra clave se trata igual que una de la MISMA clave:
-        // solo reemplaza si es al menos tan profunda (o si la entrada previa
-        // es de una generacion vieja, que siempre se descarta).
-        //
-        // OJO (bug corregido): esta regla se evaluaba sobre el resultado de
-        // `tt_desempaquetar`, que devuelve None cuando los bits de
-        // verificacion NO coinciden. Es decir: en la TT COMPARTIDA -- la
-        // unica que se usa en produccion -- toda colision de otra clave
-        // parecia un casillero VACIO y se pisaba siempre, sin mirar la
-        // profundidad. La politica descrita arriba solo estaba viva en la TT
-        // Local (un solo hilo, camino de tests). Ahora el ocupante se decodifica
-        // con `tt_ocupante`, que no exige que la clave coincida.
-        let reemplazar = |slot: Option<OcupanteTT>| match slot {
-            None => true,
-            Some(existing) if existing.generation != generacion => true,
-            Some(existing) => {
-                depth > existing.depth
-                    || (depth == existing.depth
-                        && (!existing.misma_clave
-                            || (flag == TTFlag::Exact && existing.flag != TTFlag::Exact)))
-            }
-        };
+        // Politica de reemplazo POR CUBETA (estilo Stockfish):
+        //  * si la MISMA clave ya esta en la cubeta, se sobreescribe salvo que
+        //    la entrada nueva sea claramente mas superficial que la guardada
+        //    (y de la misma generacion, y no Exact);
+        //  * si no, se escribe SIEMPRE en el casillero menos valioso: vacio,
+        //    o el de menor (profundidad - 8 * edad). La edad hace que las
+        //    entradas de busquedas anteriores salgan primero aunque sean
+        //    profundas; entre entradas de esta busqueda sobrevive la mas
+        //    profunda. Asi una escritura de quiescence ya no puede expulsar
+        //    a la unica entrada profunda de un casillero directo: expulsa a
+        //    otra superficial de la cubeta.
+        // Leer-decidir-escribir sin candado: una carrera entre hilos solo
+        // puede producir una decision de reemplazo subotima, nunca un dato
+        // incorrecto (la lectura verifica la clave al leer).
         let entry = TTEntry {
             key,
             depth,
@@ -1709,33 +1707,40 @@ impl Searcher {
             generation: generacion,
             was_pv,
         };
-        let idx = self.tt_index(key);
-        match &mut self.tt {
-            TablaTransposicion::Local(tt) => {
-                let ocupante = tt[idx].map(|e| OcupanteTT {
-                    depth: e.depth,
-                    flag: e.flag,
-                    generation: e.generation,
-                    misma_clave: e.key == key,
-                });
-                if reemplazar(ocupante) {
-                    tt[idx] = Some(entry);
+        let cubeta = &self.tt[self.tt_index(key)];
+        let paquete = tt_empaquetar(&entry, key, generacion);
+        let mut victima = 0usize;
+        let mut peor_prioridad = i32::MAX;
+        for (i, slot) in cubeta.0.iter().enumerate() {
+            match tt_ocupante(slot.load(Ordering::Relaxed), key) {
+                None => {
+                    // Casillero vacio: la mejor victima posible. Se sigue
+                    // recorriendo por si la misma clave esta mas adelante.
+                    if peor_prioridad > i32::MIN {
+                        peor_prioridad = i32::MIN;
+                        victima = i;
+                    }
                 }
-            }
-            TablaTransposicion::Compartida(tt) => {
-                // Leer-decidir-escribir sin candado: una carrera aca en el
-                // peor caso hace una decision de reemplazo subotima (dos
-                // hilos escriben "a la vez" y uno pisa al otro), nunca un
-                // dato incorrecto -- la lectura siempre verifica la clave
-                // completa al leer, asi que un casillero mal reemplazado
-                // simplemente se descarta despues como si fuera una
-                // colision de otra posicion, igual que cualquier TT normal.
-                let actual = tt_ocupante(tt[idx].load(Ordering::Relaxed), key);
-                if reemplazar(actual) {
-                    tt[idx].store(tt_empaquetar(&entry, key, generacion), Ordering::Relaxed);
+                Some(o) if o.misma_clave => {
+                    let sobreescribir = o.generation != generacion
+                        || flag == TTFlag::Exact
+                        || depth + 3 >= o.depth;
+                    if sobreescribir {
+                        slot.store(paquete, Ordering::Relaxed);
+                    }
+                    return;
+                }
+                Some(o) => {
+                    let edad = ((generacion as i32 - o.generation as i32) & 0xF) as i32;
+                    let prioridad = o.depth - 8 * edad;
+                    if prioridad < peor_prioridad {
+                        peor_prioridad = prioridad;
+                        victima = i;
+                    }
                 }
             }
         }
+        cubeta.0[victima].store(paquete, Ordering::Relaxed);
     }
 
     fn check_time(&mut self) -> Result<(), TimeUp> {
@@ -2206,6 +2211,11 @@ impl Searcher {
         prev: Option<(usize, usize)>,
         prev2: Option<(usize, usize)>,
         en_sondeo_se: bool,
+        // Nodo de CORTE esperado (cutNode de Stockfish): un nodo donde, por la
+        // alternancia de PVS, se espera fail-high. Lo usa LMR para reducir un
+        // ply mas las jugadas tardias. Los hijos de un cut-node son all-nodes
+        // (!cut_node) y viceversa; los nodos PV nunca son cut-node.
+        cut_node: bool,
     ) -> Result<i32, TimeUp> {
         self.check_time()?;
 
@@ -2524,6 +2534,7 @@ impl Searcher {
                     None,
                     None,
                     en_sondeo_se,
+                    !cut_node,
                 );
                 self.salir_hijo(&next_eval, b, &next);
                 let sc_null = -res_null?;
@@ -2620,6 +2631,7 @@ impl Searcher {
                     Some((pt_mv2, mv.to as usize)),
                     prev,
                     en_sondeo_se,
+                    !cut_node,
                 );
                 self.salir_hijo(&next_eval, b, &next);
                 let sc_confirmado = -res_confirmado?;
@@ -2802,6 +2814,7 @@ impl Searcher {
                         prev,
                         prev2,
                         true,
+                        cut_node,
                     );
                     // La sonda consume la exclusion al entrar; se limpia igual
                     // por si un corte por tiempo la dejo sin consumir.
@@ -3273,6 +3286,11 @@ impl Searcher {
                 if !improving {
                     r += 1;
                 }
+                // Nodo de corte esperado (ver `cut_node`): se reduce un ply mas,
+                // como hacen Stockfish, Berserk y Ethereal.
+                if cut_node {
+                    r += 1;
+                }
                 if !mv.is_capture() {
                     // AJUSTE PROPORCIONAL (antes era binario: -1 si la suma
                     // daba positivo). Ahora la reduccion se mueve en
@@ -3362,6 +3380,7 @@ impl Searcher {
                     child_prev,
                     child_prev2,
                     en_sondeo_se,
+                    true,
                 ) {
                     Err(e) => Err(e),
                     Ok(v) => {
@@ -3381,6 +3400,7 @@ impl Searcher {
                                 child_prev,
                                 child_prev2,
                                 en_sondeo_se,
+                                if es_pv { false } else { !cut_node },
                             )
                             .map(|v2| -v2)
                         } else {
@@ -3409,6 +3429,7 @@ impl Searcher {
                         child_prev,
                         child_prev2,
                         en_sondeo_se,
+                        if es_pv { false } else { !cut_node },
                     )
                     .map(|v| -v)
                 } else {
@@ -3422,6 +3443,7 @@ impl Searcher {
                         child_prev,
                         child_prev2,
                         en_sondeo_se,
+                        !cut_node,
                     ) {
                         Err(e) => Err(e),
                         Ok(v) => {
@@ -3437,6 +3459,7 @@ impl Searcher {
                                     child_prev,
                                     child_prev2,
                                     en_sondeo_se,
+                                    false,
                                 )
                                 .map(|v2| -v2)
                             } else {
@@ -3592,7 +3615,7 @@ impl Searcher {
         self.stop = false;
         // Nueva generacion: las entradas de la busqueda anterior quedan
         // "viejas" y seran las primeras candidatas a reemplazo (aging).
-        self.tt_generation = (self.tt_generation + 1) & 0x1F;
+        self.tt_generation = (self.tt_generation + 1) & 0xF;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         // Truncamiento del historial de la partida (BUG 1): conservar los
         // ULTIMOS MAX_PATH elementos (los mas recientes), no los primeros --
@@ -3668,6 +3691,7 @@ impl Searcher {
                         Some((pt_mv, mv.to as usize)),
                         None,
                         false,
+                        idx > 0,
                     );
                     let sondeo = match res_sondeo {
                         Ok(v) => -v,
@@ -3687,6 +3711,7 @@ impl Searcher {
                             1,
                             Some((pt_mv, mv.to as usize)),
                             None,
+                            false,
                             false,
                         );
                         match res_full {
@@ -3760,7 +3785,7 @@ impl Searcher {
         self.nodes = 0;
         self.stop = false;
         // Nueva generacion para aging de la TT (ver tt_generation en Searcher).
-        self.tt_generation = (self.tt_generation + 1) & 0x1F;
+        self.tt_generation = (self.tt_generation + 1) & 0xF;
         self.killers = vec![[None, None]; MAX_KILLER_PLY];
         self.decaer_history();
         // Truncamiento del historial de la partida (BUG 1): conservar los
@@ -3987,6 +4012,7 @@ impl Searcher {
                         Some((pt_mv, mv.to as usize)),
                         None,
                         false,
+                        idx > 0,
                     );
                     let mut sondeo = match res_sondeo {
                         Ok(v) => -v,
@@ -4010,6 +4036,7 @@ impl Searcher {
                             Some((pt_mv, mv.to as usize)),
                             None,
                             false,
+                            true,
                         );
                         sondeo = match res_ver {
                             Ok(v) => -v,
@@ -4030,6 +4057,7 @@ impl Searcher {
                             1,
                             Some((pt_mv, mv.to as usize)),
                             None,
+                            false,
                             false,
                         );
                         match res_full {
@@ -4379,7 +4407,7 @@ pub fn buscar_lazy_smp(
     // MISMO valor, asi que las entradas que escriben llevan una generacion
     // DISTINTA a la de jugadas anteriores y la regla de reemplazo de tt_store
     // puede expulsarlas de inmediato (aging vivo en Lazy SMP).
-    let generacion = generacion_compartida.fetch_add(1, Ordering::Relaxed) & 0x1F;
+    let generacion = generacion_compartida.fetch_add(1, Ordering::Relaxed) & 0xF;
     // Una ranura de memoria persistente por hilo (ver PoolMemoriaSMP).
     pool.reservar(n_hilos.max(1));
     if n_hilos <= 1 {
@@ -4518,10 +4546,35 @@ pub fn buscar_lazy_smp(
     // ej. -50), porque |400| > |-50| -- eligiendo la evaluacion equivocada
     // con mas confianza en vez de la correcta. Score crudo (sin abs) elige
     // siempre la mejor evaluacion real entre los hilos empatados en profundidad.
-    let mejor = resultados
-        .iter()
-        .max_by_key(|r| (r.profundidad, r.score))
-        .expect("al menos un hilo");
+    // VOTACION entre hilos (estilo Stockfish): cada hilo vota por su jugada
+    // con peso (score - score_minimo + 14) * profundidad, y gana la jugada
+    // con mas votos. Un solo hilo profundo con un score aislado ya no decide
+    // el solo si la mayoria de los hilos (con profundidades parecidas)
+    // coincide en otra jugada. El score/profundidad reportados son los del
+    // hilo mas profundo entre los que votaron por la ganadora.
+    let score_min = resultados.iter().map(|r| r.score).min().unwrap_or(0);
+    let mut votos: Vec<(Move, i64)> = Vec::with_capacity(resultados.len());
+    for r in &resultados {
+        if let Some(mv) = r.mv {
+            let peso = (r.score - score_min + 14) as i64 * r.profundidad.max(1) as i64;
+            match votos.iter_mut().find(|(m, _)| *m == mv) {
+                Some(v) => v.1 += peso,
+                None => votos.push((mv, peso)),
+            }
+        }
+    }
+    let ganadora = votos.iter().max_by_key(|(_, peso)| *peso).map(|(m, _)| *m);
+    let mejor = match ganadora {
+        Some(mv) => resultados
+            .iter()
+            .filter(|r| r.mv == Some(mv))
+            .max_by_key(|r| (r.profundidad, r.score))
+            .expect("al menos un hilo voto por la ganadora"),
+        None => resultados
+            .iter()
+            .max_by_key(|r| (r.profundidad, r.score))
+            .expect("al menos un hilo"),
+    };
 
     (mejor.mv, mejor.score, nodos_totales, resultados)
 }
@@ -4762,30 +4815,52 @@ mod regression_tests {
             Some(12),
             "una colision menos profunda desalojo la entrada profunda"
         );
-        // Al menos tan profunda: SI debe pisar.
+        // Al menos tan profunda: se sobreescribe la entrada de k2 (que ya
+        // vivia en otro casillero de la cubeta) y k1 sigue intacta: con
+        // cubetas de 4 vias, dos claves distintas conviven.
         s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
-        assert!(s.tt_probe(k1).is_none());
+        assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
     }
 
     #[test]
-    fn tt_colision_de_otra_clave_se_reemplaza() {
-        // Una colision de OTRA clave solo pisa si es al menos tan profunda:
-        // si no, una entrada de quiescence (depth=0) desalojaria
-        // constantemente las entradas profundas de negamax que compartan
-        // casillero, encogiendo la TT efectiva de la busqueda principal.
+    fn tt_cubeta_expulsa_la_menos_valiosa() {
+        // Cinco claves distintas que caen en la MISMA cubeta (mismos bits
+        // bajos, bits de verificacion distintos). Con 4 vias conviven las 4
+        // primeras; la 5a expulsa a la de menor prioridad
+        // (profundidad - 8 * edad), o sea la mas superficial de la misma
+        // generacion, y nunca a las profundas.
         let mut s = Searcher::new(1);
-        let k1 = 0x10u64;
-        let k2 = k1.wrapping_add((s.tt_mask as u64) + 1);
-        s.tt_store(k1, 12, 50, 0, TTFlag::Exact, None, false);
-        // Menos profunda: NO debe pisar.
-        s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
-        assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
-        assert!(s.tt_probe(k2).is_none());
-        // Al menos tan profunda: SI debe pisar.
-        s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
-        assert!(s.tt_probe(k1).is_none());
-        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
+        let mascara = s.tt_mask as u64;
+        let clave = move |v: u64| (0x1234u64 & mascara) | (v << 49);
+        let (k12, k3, k7, k9, k5) = (clave(1), clave(2), clave(3), clave(4), clave(5));
+        s.tt_store(k12, 12, 50, 0, TTFlag::Exact, None, false);
+        s.tt_store(k3, 3, 50, 0, TTFlag::Alpha, None, false);
+        s.tt_store(k7, 7, 50, 0, TTFlag::Beta, None, false);
+        s.tt_store(k9, 9, 50, 0, TTFlag::Alpha, None, false);
+        for (k, d) in [(k12, 12), (k3, 3), (k7, 7), (k9, 9)] {
+            assert_eq!(s.tt_probe(k).map(|e| e.depth), Some(d), "las 4 conviven");
+        }
+        s.tt_store(k5, 5, 20, 0, TTFlag::Alpha, None, false);
+        assert!(s.tt_probe(k3).is_none(), "sale la mas superficial (3)");
+        for (k, d) in [(k12, 12), (k7, 7), (k9, 9), (k5, 5)] {
+            assert_eq!(s.tt_probe(k).map(|e| e.depth), Some(d));
+        }
+        // Misma clave, mas superficial en 4+ plies y misma generacion: NO
+        // se sobreescribe (se conserva la profunda). Exact SI sobreescribe.
+        s.tt_store(k12, 2, 0, 0, TTFlag::Alpha, None, false);
+        assert_eq!(s.tt_probe(k12).map(|e| e.depth), Some(12));
+        s.tt_store(k12, 2, 0, 0, TTFlag::Exact, None, false);
+        assert_eq!(s.tt_probe(k12).map(|e| e.depth), Some(2));
+        // Envejecimiento: tras cambiar de generacion, una entrada vieja
+        // profunda sale antes que una nueva superficial.
+        let (k_nueva, k_extra) = (clave(6), clave(7));
+        s.set_tt_generacion(s.tt_generation + 1);
+        s.tt_store(k_nueva, 1, 0, 0, TTFlag::Alpha, None, false);
+        s.tt_store(k_extra, 1, 0, 0, TTFlag::Alpha, None, false);
+        assert_eq!(s.tt_probe(k_nueva).map(|e| e.depth), Some(1));
+        assert_eq!(s.tt_probe(k_extra).map(|e| e.depth), Some(1));
+        assert_eq!(s.tt_probe(k9).map(|e| e.depth), Some(9), "la mas profunda vieja sobrevive");
     }
 
     // La TT COMPARTIDA (Lazy SMP) es un camino de codigo distinto al Local
@@ -4830,9 +4905,11 @@ mod regression_tests {
         // (antes si lo hacia, ver tt_ocupante); una al menos tan profunda si.
         s.tt_store(k2, 1, 20, 0, TTFlag::Alpha, None, false);
         assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12));
-        assert!(s.tt_probe(k2).is_none());
+        // Con cubetas de 4 vias la entrada superficial ocupa OTRO casillero
+        // de la misma cubeta en vez de perderse: las dos conviven.
+        assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(1));
         s.tt_store(k2, 12, 20, 0, TTFlag::Alpha, None, false);
-        assert!(s.tt_probe(k1).is_none());
+        assert_eq!(s.tt_probe(k1).map(|e| e.depth), Some(12), "conviven en la cubeta");
         assert_eq!(s.tt_probe(k2).map(|e| e.depth), Some(12));
     }
 
@@ -4920,12 +4997,13 @@ mod regression_tests {
         let generaciones_presentes = |tt: &SharedTT| -> Vec<u8> {
             let mut gens: Vec<u8> = tt
                 .iter()
+                .flat_map(|cubeta| cubeta.casilleros().iter())
                 .filter_map(|slot| {
                     let raw = slot.load(Ordering::Relaxed);
                     if raw & TT_OCUPADO == 0 {
                         None
                     } else {
-                        Some(((raw >> 43) & 0x1F) as u8)
+                        Some(((raw >> 43) & 0xF) as u8)
                     }
                 })
                 .collect();
