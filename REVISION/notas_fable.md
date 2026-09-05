@@ -1,0 +1,27 @@
+# Notas de lectura (Fable) — se van acumulando
+## search.rs
+- L1-330: contempt dinamico (draw_score), TT empaquetada u64 lockless (15 bits verif, 4 bits generacion), perillas por env (RFP, NMP, SE, LMR raiz, aspiracion).
+- POSIBLE BUG: set_tt_generacion enmascara con 0x1F (5 bits) pero tt_empaquetar guarda 4 bits (0xF) -> generaciones 16..31 se guardan como 0..15; comparar en tt_store. (search.rs ~1245 y ~745)
+- Comentario del struct dice generacion 0..31, layout dice 0..15 (inconsistente).
+- valor_pieza (search.rs ~1035) duplicado respecto a see.rs probablemente.
+- decaer_history divide todo /2 por cada go (incluye corrhist).
+- eval_cache global por zobrist solo en modo red pura (ver eval_cache.rs: ¿thread-safe en SMP?).
+- tt_store (search.rs ~1650): reemplazar compara existing.generation (4 bits empaquetados) != self.tt_generation (5 bits): con tt_generation>=16 TODA entrada compartida parece vieja -> politica degrada a "siempre reemplazar" la mitad del tiempo. BUG REAL en TT compartida.
+- quiescence: stand_pat>=beta devuelve beta pero guarda stand_pat (menor). Delta pruning usa valor_pieza (100..900) en escala clasica pero eval interna ~1.6x -> margen 250 equivale a ~156cp reales (calibracion).
+- quiescence jaques quietos: genera lista legal completa en cada hoja qdepth==0 (costo; knob MITTENS_QCHECKS).
+- eval_cache.rs: global AtomicU64 48 bits tag + i16, lockless, OK. Cache de 16MB; se comparte entre hilos y persiste entre jugadas. Correcto si la eval es funcion pura (verifica pura()).
+- negamax: extension de jaque incondicional hasta ply 40; hindsight reductions (chequear que hindsight_reduction[p] se resetee); RFP margen 120/ply hasta depth 8; razoring d<=2; MDP ok; repeticion en arbol = 1 sola repeticion cuenta como tablas (estandar).
+- TT cut no aplica en PV (nodo_pv) -> mas nodos en PV pero seguro.
+- NMP: R = 3 + d/4 + min((eval-beta)/200,2), sin busqueda de verificacion; fail-soft. OK.
+- ProbCut d>=5, margen 150, sdepth d-4, qsearch previa. OK. IIR -1 sin tt_move d>=4.
+- SE: entry.depth>=d-3, flag Beta, sbeta=score-2d, sdepth=(d-1)/2; multicut; ext -2; doble ext. Reentra mismo ply con excluded[]. OK (reviso path_len restore).
+- Hindsight: padre guarda eval CORREGIDA+TT (fut_eval) pero hijo compara con evaluar_completo CRUDA -> escalas mezcladas (search.rs ~2277 vs ~3345). Menor.
+- LMR fail-high: re-busca directo a ventana completa (-beta,-alpha) sin paso null-window a prof completa (search.rs ~3375). En PV cuesta algo mas; correcto.
+- Futility usa fut_depth (post-LMR, techo 8); LMP (3+d^2)/(2-improving) hasta d6; SEE-prune capturas -100*d hasta d7; poda quiets por historia < -4000*d o SEE < -23*lmr_d^2 con lmr_d<=6.
+- search_time: gestion de tiempo optimo/maximo, corte blando adaptativo (55-85%) x factores (caida score, inestabilidad, esfuerzo). Solo con reloj real (wtime/btime), no con movetime. Fail-high raiz adopta jugada al instante. OK.
+- Raiz: no hay ordenamiento por conteo de nodos entre iteraciones (solo tt_move+history). Mejora posible.
+- search_fixed_depth no decae history (search_time si). Diferencia menor bench vs juego.
+- Sin verificacion de NMP a profundidad alta (zugzwang solo protegido por solo_peones_y_rey).
+- CONFIRMADO: buscar_lazy_smp usa generacion fetch_add & 0x1F (0..31) y produccion SIEMPRE usa TT compartida (incluso Threads=1, Searcher nuevo por go). tt_empaquetar guarda 4 bits => en generaciones 16..31 (la mitad de la partida) toda entrada parece vieja y tt_store degenera a "siempre reemplazar". El test smp_tt_generacion lee (raw>>43)&0x1F que mezcla el bit was_pv (bit 47): test enmascarado. FIX: usar 0xF en todos lados (search.rs 1248, 3595, 3763, 4378).
+- Lazy SMP: eleccion por (profundidad, score) entre hilos; ayudantes saltan iteraciones (skip table); abort de ayudantes al terminar principal. OK.
+- Threads=1 en produccion: Searcher NUEVO por cada go (asignaciones de ~130x(2x1KB) buffers + killers etc.). Costo pequeno pero evitable.

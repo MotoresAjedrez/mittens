@@ -1,0 +1,4 @@
+c4vc3_reloj: 25W 65D 10L de 100  score=57.50%
+TC=5.0s+0.05s  Threads=8
+t/jugada: cand=0.116s  base=0.115s
+banderas: {"cand": 0, "base": 0}
