@@ -1,0 +1,4 @@
+c8vc4_reloj_100: 13W 69D 18L de 100  score=47.50%
+TC=5.0s+0.05s  Threads=1
+t/jugada: cand=0.119s  base=0.120s
+banderas: {"cand": 0, "base": 0}

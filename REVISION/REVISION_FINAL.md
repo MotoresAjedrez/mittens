@@ -370,3 +370,61 @@ que los 8 hilos escriben.
   iguales.
 - `medir/escalado_smp.py` mide profundidad a tiempo fijo y es muy ruidoso con una
   sola repetición; usar `reps ≥ 3` y, para decidir, `h2h_reloj.py`.
+
+## 10. Ronda 3: podas que faltaban, acumulador perezoso y bugs de escala
+
+Base de esta ronda: la versión publicada en la rama `revision-fable` (candidata 4).
+Todos los cambios nuevos llevan perilla de entorno (por defecto encendidos) para poder
+aislar cada uno en el h2h sin recompilar.
+
+### 10.1 Búsqueda (candidata 5)
+
+| cambio | perilla | qué hace |
+|---|---|---|
+| Futilidad de capturas | `MITTENS_FUT_CAPT` | Fuera de la PV, si eval + 450 + 400·lmr_depth + valor de la víctima ≤ alfa, la captura no se busca (regla de Stockfish, en escala interna). |
+| LMP también en nodos PV | `MITTENS_LMP_PV` | Antes la poda por conteo de jugadas solo actuaba fuera de la PV. |
+| Hindsight coherente (B4) | `MITTENS_HIND_FIX` | Padre e hijo comparan la MISMA eval (corregida por corrhist); antes el padre usaba la corregida y refinada por TT y el hijo la cruda. |
+| Quiescence en escala interna (B5) | `MITTENS_QS_ESCALA` | Valores de pieza y márgenes del delta pruning ×1,6 (la escala real del motor); stand-pat fail-soft. |
+
+### 10.2 Red neuronal (candidata 6 = 5 + esto)
+
+**Actualización perezosa del acumulador** (`bullet_net.rs`, `AcumBullet`): antes cada
+`entrar` a un hijo calculaba las dos perspectivas (2 × 1 KB de sumas NEON) aunque ese
+nodo cortara por TT, estuviera en jaque o acertara en la cache de eval. Ahora `entrar`
+solo anota el delta de features y el acumulador se materializa cuando `evaluar` lo pide,
+encadenando los deltas pendientes desde el último nivel calculado (el mismo truco que
+`update_accumulator` de Stockfish). Resultado **bit-idéntico** (mismos nodos en las 6
+posiciones del bench) y entre +0 % y +20 % de nps según la posición (más en finales, donde
+más nodos se resuelven sin evaluar). Los 20 tests del acumulador (fuzz incremental contra
+recálculo, pila, deshacer) pasan sin cambios de expectativa.
+
+Otras ineficiencias revisadas y descartadas: la capa de salida ya es NEON con cuatro
+acumuladores i64 y una sola pasada; el bucket por material se mantiene incremental; la
+cache de eval evita el producto punto en transposiciones. No queda nada grande en la red
+sin tocar la arquitectura (que sería entrenar otra).
+
+### 10.3 Perillas nuevas para calibrar (candidata 7 = 6 + perillas, mismo árbol)
+
+`MITTENS_HIST_DECAY` (0 = no decaer el history entre jugadas, 1 = /2 histórico),
+`MITTENS_CORR_DECAY` (ídem para el correction history), `MITTENS_EXT_JAQUE` (ply máximo de
+la extensión de jaque; 0 la apaga).
+
+### 10.4 Resultados
+
+| duelo | partidas | resultado |
+|---|---|---|
+| candidata 5 (podas) vs publicada, 25 k nodos | 1 200 | +327 =582 −291, 51,5 %, +10 ± 14 Elo |
+| sin extensión de jaque vs con ella (mismo binario), 25 k nodos | 200 + 600 | +23 ± 35 y +19 ± 21 Elo |
+| cribados negativos o neutros (200 partidas cada uno) | | margen singular 1: −16; margen 3: +5; history sin decaer: −24; corrhist sin decaer: no medido |
+| **candidata 8 (5 + perezoso + sin ext. de jaque) vs publicada, 25 k nodos** | 600 | +168 =297 −135, **52,8 %, +19 ± 20 Elo** |
+| **candidata 8 vs publicada, reloj 5 s + 0,05 s, 1 hilo** | 300 | +52 =209 −39, **52,2 %** (≈ +15 Elo), sin banderas |
+
+Veredicto: la candidata 8 gana a la versión publicada en los dos modos de medición
+(900 partidas en total, ≈ +18 Elo combinados, intervalo que no incluye el cero). La ganancia
+es más modesta que en las rondas anteriores, que es lo normal: las mejoras grandes
+(TT, LMR, aging) ya estaban cobradas. Defaults finales de esta ronda: las cuatro podas
+encendidas, acumulador perezoso, `MITTENS_EXT_JAQUE=0`; el resto de perillas queda como
+estaba. Suite completa: 129 tests en verde (uno adaptado: `la_bandera_de_ayudante_smp`
+ahora mide nodos en vez de profundidad, porque con las podas nuevas la profundidad 3 cabe
+en menos de 256 nodos).
+

@@ -290,6 +290,59 @@ fn env_i32(nombre: &'static str, min: i32, max: i32, def: i32) -> i32 {
         .unwrap_or(def)
 }
 
+/// Perillas de la ronda 5 (revision Fable), 1 = encendido. Existen solo para
+/// poder aislar cada cambio en el h2h sin recompilar; los defaults son los
+/// que se despliegan.
+fn perilla(nombre: &'static str, def: i32) -> bool {
+    env_i32(nombre, 0, 1, def) == 1
+}
+/// Poda de futilidad de CAPTURAS (Stockfish): con la eval estatica muy por
+/// debajo de alfa, una captura de poco valor no remonta ni a profundidad
+/// reducida.
+fn fut_capturas() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| perilla("MITTENS_FUT_CAPT", 1))
+}
+/// LMP tambien en nodos PV (antes solo fuera de la PV).
+fn lmp_en_pv() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| perilla("MITTENS_LMP_PV", 1))
+}
+/// Hindsight con la MISMA eval (corregida por corrhist) en padre e hijo.
+fn hindsight_coherente() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| perilla("MITTENS_HIND_FIX", 1))
+}
+/// Quiescence en la escala interna (x1.6) y stand-pat fail-soft.
+fn qs_escala_interna() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| perilla("MITTENS_QS_ESCALA", 1))
+}
+
+/// Decaimiento de las tablas de history al arrancar cada `go`: 1 = dividir
+/// por 2 (historico), 0 = no decaer (Stockfish confia solo en la gravedad),
+/// 2 = dividir por 4.
+fn hist_decay_shift() -> u32 {
+    static C: OnceLock<u32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_HIST_DECAY", 0, 4, 1) as u32)
+}
+/// Lo mismo para el correction history (que Stockfish tampoco decae).
+fn corr_decay_shift() -> u32 {
+    static C: OnceLock<u32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_CORR_DECAY", 0, 4, 1) as u32)
+}
+/// Ply maximo hasta el que se extiende un ply completo por jaque (40 =
+/// historico; 0 = sin extension de jaque, como Stockfish moderno).
+/// DESPLEGADO 2026-09-06 (revision Fable): default 40 -> 0. Medido a 25.000
+/// nodos contra el mismo binario con la extension puesta: +23 +/- 35 (200
+/// partidas) y +19 +/- 21 (600 partidas de confirmacion, aperturas
+/// distintas). La quiescence ya busca todas las evasiones en jaque, asi que
+/// la extension solo inflaba el arbol en posiciones con jaques baratos.
+fn ext_jaque_ply_max() -> u32 {
+    static C: OnceLock<u32> = OnceLock::new();
+    *C.get_or_init(|| env_i32("MITTENS_EXT_JAQUE", 0, 128, 0) as u32)
+}
+
 /// Terminos de la reduccion de null-move: `R = BASE + depth/DIV + min((eval -
 /// beta)/200, EVAL_MAX)`.
 ///
@@ -1441,35 +1494,43 @@ impl Searcher {
     /// preserva la señal relativa de jugadas que siguen funcionando bien
     /// mientras deja que estadisticas viejas pesen cada vez menos.
     fn decaer_history(&mut self) {
-        for fila in self.history.iter_mut() {
-            for v in fila.iter_mut() {
-                *v /= 2;
+        let h = hist_decay_shift();
+        let c = corr_decay_shift();
+        if h > 0 {
+            let d = 1 << h;
+            for fila in self.history.iter_mut() {
+                for v in fila.iter_mut() {
+                    *v /= d;
+                }
+            }
+            for fila in self.history_amenaza.iter_mut() {
+                for v in fila.iter_mut() {
+                    *v /= d;
+                }
+            }
+            for v in self.cont_history.iter_mut() {
+                *v /= d;
+            }
+            for v in self.cont_history_2.iter_mut() {
+                *v /= d;
+            }
+            for v in self.capture_history.iter_mut() {
+                *v /= d;
             }
         }
-        for fila in self.history_amenaza.iter_mut() {
-            for v in fila.iter_mut() {
-                *v /= 2;
+        if c > 0 {
+            let d = 1 << c;
+            for v in self.corr_pawn.iter_mut() {
+                *v /= d;
             }
-        }
-        for v in self.cont_history.iter_mut() {
-            *v /= 2;
-        }
-        for v in self.cont_history_2.iter_mut() {
-            *v /= 2;
-        }
-        for v in self.capture_history.iter_mut() {
-            *v /= 2;
-        }
-        for v in self.corr_pawn.iter_mut() {
-            *v /= 2;
-        }
-        for tabla in self.corr_nonpawn.iter_mut() {
-            for v in tabla.iter_mut() {
-                *v /= 2;
+            for tabla in self.corr_nonpawn.iter_mut() {
+                for v in tabla.iter_mut() {
+                    *v /= d;
+                }
             }
-        }
-        for v in self.corr_cont.iter_mut() {
-            *v /= 2;
+            for v in self.corr_cont.iter_mut() {
+                *v /= d;
+            }
         }
     }
 
@@ -2036,7 +2097,9 @@ impl Searcher {
         }
         if stand_pat >= beta {
             self.tt_store(key, 0, stand_pat, ply, TTFlag::Beta, None, false);
-            return Ok(beta);
+            // Fail-soft: se devuelve el valor real (lo mismo que se guardo en
+            // la TT), no beta.
+            return Ok(if qs_escala_interna() { stand_pat } else { beta });
         }
         alpha = alpha.max(stand_pat);
 
@@ -2104,7 +2167,17 @@ impl Searcher {
 
             // Nunca podar promociones ni jaques por SEE/delta: una captura
             // materialmente mala puede ser mate o forzar una secuencia tactica.
-            if !da_jaque && mv.promotion.is_none() && see.unwrap_or(0) < -50 {
+            // ESCALA: la eval interna va ~1.6x inflada respecto de 100cp = peon
+            // (peso_bullet), pero valor_pieza y los margenes de aqui estaban
+            // en centipeones clasicos, o sea que el delta pruning podaba con
+            // un margen efectivo un 37% menor del que decia. Con la perilla
+            // encendida todo se lleva a la escala interna.
+            let (esc_num, esc_den, margen_delta, umbral_see) = if qs_escala_interna() {
+                (8, 5, 400, -80)
+            } else {
+                (1, 1, 250, -50)
+            };
+            if !da_jaque && mv.promotion.is_none() && see.unwrap_or(0) < umbral_see {
                 continue;
             }
             let victim = if mv.flag == MoveFlag::EnPassant {
@@ -2113,9 +2186,10 @@ impl Searcher {
                 b.piece_at(mv.to)
                     .map(|(_, pt)| valor_pieza(pt))
                     .unwrap_or(0)
-            };
-            let promo_gain = mv.promotion.map(|pt| valor_pieza(pt) - 100).unwrap_or(0);
-            if !da_jaque && stand_pat + victim + promo_gain + 250 <= alpha {
+            } * esc_num / esc_den;
+            let promo_gain =
+                mv.promotion.map(|pt| valor_pieza(pt) - 100).unwrap_or(0) * esc_num / esc_den;
+            if !da_jaque && stand_pat + victim + promo_gain + margen_delta <= alpha {
                 continue;
             }
 
@@ -2265,7 +2339,7 @@ impl Searcher {
         }
 
         let en_jaque = b.in_check(b.turn);
-        if en_jaque && ply < 40 {
+        if en_jaque && ply < ext_jaque_ply_max() {
             depth += 1; // extension de jaque
         }
 
@@ -2282,8 +2356,15 @@ impl Searcher {
         // realmente llegaron mediante LMR; no cambia nodos PV normales.
         let p = ply as usize;
         if !en_jaque && p > 0 && p < MAX_KILLER_PLY && self.hindsight_reduction[p] > 0 {
-            let eval_actual =
+            let raw_h =
                 *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state));
+            // Misma escala que guardo el padre (ver hindsight_parent_eval):
+            // eval corregida por corrhist, sin el refinamiento por TT.
+            let eval_actual = if hindsight_coherente() {
+                self.eval_corregida(b, raw_h, prev)
+            } else {
+                raw_h
+            };
             let eval_delta = eval_actual + self.hindsight_parent_eval[p - 1];
             if eval_delta < 0 {
                 depth += 1;
@@ -3111,7 +3192,7 @@ impl Searcher {
             // improving: el umbral de conteo se divide por (2 - improving):
             // sin mejora se poda a partir de aprox. la mitad de jugadas.
             let lmp_umbral = ((3 + depth * depth) / (2 - improving as i32)) as usize;
-            if !es_pv
+            if (!es_pv || lmp_en_pv())
                 && !en_jaque
                 && podar_en_este_nodo
                 && depth <= LMP_PROF_MAX
@@ -3170,6 +3251,45 @@ impl Searcher {
                     let see_malo =
                         || crate::see::see(b, mv) < -23 * lmr_depth * lmr_depth;
                     if (hist_mala || see_malo())
+                        && !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv))
+                    {
+                        continue;
+                    }
+                }
+            }
+
+            // FUTILIDAD DE CAPTURAS (Stockfish: futilityValue = staticEval +
+            // 287 + 253*lmrDepth + valor_victima <= alpha). Fuera de la PV, si
+            // la eval estatica mas el valor de lo capturado mas un margen que
+            // crece con la profundidad efectiva post-LMR sigue sin llegar a
+            // alfa, la captura no remonta: se salta sin buscarla. Margenes en
+            // la escala interna (~1.6x cp): 450 base + 400 por ply.
+            if fut_capturas()
+                && !es_pv
+                && !en_jaque
+                && podar_en_este_nodo
+                && best_move.is_some()
+                && mv.is_capture()
+                && mv.promotion.is_none()
+                && beta.abs() < MATE - 1000
+            {
+                let r_est = tabla_lmr()[(depth as usize).min(63)][(idx + 1).min(63)].max(1);
+                let lmr_depth = (depth - r_est).max(0);
+                if lmr_depth <= 6 {
+                    let ev = *fut_eval.get_or_insert_with(|| {
+                        let raw = *static_eval_cache
+                            .get_or_insert_with(|| self.evaluar_completo(b, eval_state));
+                        self.eval_con_tt(self.eval_corregida(b, raw, prev), tt_entry_full.as_ref())
+                    });
+                    let victima = valor_pieza(match victima_de(b, mv) {
+                        0 => PieceType::Pawn,
+                        1 => PieceType::Knight,
+                        2 => PieceType::Bishop,
+                        3 => PieceType::Rook,
+                        4 => PieceType::Queen,
+                        _ => PieceType::King,
+                    }) * 8 / 5;
+                    if ev + 450 + 400 * lmr_depth + victima <= alpha
                         && !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv))
                     {
                         continue;
@@ -3360,9 +3480,16 @@ impl Searcher {
                 let r = r.clamp(1, (depth - 2 + ext.min(0)).max(1));
                 let child_ply = (ply + 1) as usize;
                 if child_ply < MAX_KILLER_PLY {
-                    self.hindsight_parent_eval[ply as usize] = *fut_eval.get_or_insert_with(|| {
-                        *static_eval_cache.get_or_insert_with(|| self.evaluar_completo(b, eval_state))
-                    });
+                    self.hindsight_parent_eval[ply as usize] = if hindsight_coherente() {
+                        let raw_p = *static_eval_cache
+                            .get_or_insert_with(|| self.evaluar_completo(b, eval_state));
+                        self.eval_corregida(b, raw_p, prev)
+                    } else {
+                        *fut_eval.get_or_insert_with(|| {
+                            *static_eval_cache
+                                .get_or_insert_with(|| self.evaluar_completo(b, eval_state))
+                        })
+                    };
                     self.hindsight_reduction[child_ply] = r;
                 }
                 // PVS real: el sondeo reducido usa ventana NULA (-alpha-1,-alpha)
@@ -5219,10 +5346,15 @@ mod regression_tests {
         s.set_ayudante_smp(Arc::clone(&bandera));
         let (mv, _sc, prof) = s.search_time(&b, Some(60_000), 64, |_, _, _, _, _| {});
         assert!(mv.is_some(), "la profundidad 1 se completa siempre");
+        // El contrato real es "corta en el siguiente chequeo", que ocurre
+        // cada 256 nodos: con las podas actuales las profundidades 2 y 3 de
+        // esta posicion caben en menos de 256 nodos, asi que se mide en
+        // NODOS (y una profundidad acotada), no en "profundidad <= 2".
         assert!(
-            prof <= 2,
+            s.nodes < 1024 && prof <= 3,
             "con la bandera de ayudante ya levantada la busqueda tenia que \
-             cortar de inmediato, llego a profundidad {prof}"
+             cortar de inmediato, llego a profundidad {prof} con {} nodos",
+            s.nodes
         );
     }
 

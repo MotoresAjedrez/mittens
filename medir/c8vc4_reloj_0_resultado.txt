@@ -1,0 +1,4 @@
+c8vc4_reloj_0: 20W 74D 6L de 100  score=57.00%
+TC=5.0s+0.05s  Threads=1
+t/jugada: cand=0.117s  base=0.118s
+banderas: {"cand": 0, "base": 0}
