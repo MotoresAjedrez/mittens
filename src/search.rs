@@ -663,6 +663,83 @@ fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
     false
 }
 
+/// Informacion de jaque de UN nodo (estilo `CheckInfo`/`checkSquares` de
+/// Stockfish): se calcula una sola vez y despues responder "¿esta jugada da
+/// jaque?" es un par de AND en vez de reconstruir la posicion virtual.
+/// Respuesta EXACTAMENTE igual a `da_jaque_sin_copiar` (ver test).
+#[derive(Clone, Copy)]
+struct InfoJaque {
+    ksq: crate::types::Square,
+    /// Por tipo de pieza: casillas desde las que esa pieza propia daria jaque
+    /// directo al rey rival (con la ocupacion actual).
+    directo: [u64; 6],
+    /// Piezas propias que tapan la linea entre un deslizante propio y el rey
+    /// rival: si se van de la linea, jaque descubierto.
+    descubridoras: u64,
+}
+
+impl InfoJaque {
+    #[inline]
+    fn nueva(b: &Board) -> InfoJaque {
+        use crate::bitboard::{
+            bishop_attacks, king_attacks, knight_attacks, pawn_attacks, pinned_pieces,
+            rook_attacks,
+        };
+        let us = b.turn;
+        let them = us.opposite();
+        let ksq = b.king_square(them);
+        let occ = b.occupied;
+        let p = &b.pieces[us as usize];
+        let alf = bishop_attacks(ksq, occ);
+        let tor = rook_attacks(ksq, occ);
+        let mut directo = [0u64; 6];
+        directo[PieceType::Pawn as usize] = pawn_attacks(them, ksq);
+        directo[PieceType::Knight as usize] = knight_attacks(ksq);
+        directo[PieceType::Bishop as usize] = alf;
+        directo[PieceType::Rook as usize] = tor;
+        directo[PieceType::Queen as usize] = alf | tor;
+        directo[PieceType::King as usize] = 0;
+        let _ = king_attacks;
+        // Mismo calculo que las clavadas, con los papeles invertidos: piezas
+        // PROPIAS que son la unica pieza entre un deslizante PROPIO y el rey
+        // rival.
+        let descubridoras = pinned_pieces(
+            ksq,
+            b.occupied_co[us as usize],
+            p[PieceType::Rook as usize] | p[PieceType::Queen as usize],
+            p[PieceType::Bishop as usize] | p[PieceType::Queen as usize],
+            occ,
+        );
+        InfoJaque { ksq, directo, descubridoras }
+    }
+
+    #[inline]
+    fn da_jaque(&self, b: &Board, mv: &Move) -> bool {
+        use crate::bitboard::{between, bit};
+        if mv.promotion.is_some()
+            || matches!(
+                mv.flag,
+                MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
+            )
+        {
+            return da_jaque_sin_copiar(b, mv);
+        }
+        let (_, pt) = b.piece_at(mv.from).expect("InfoJaque::da_jaque: no hay pieza en 'from'");
+        if self.directo[pt as usize] & bit(mv.to) != 0 {
+            return true;
+        }
+        if self.descubridoras & bit(mv.from) != 0 {
+            // Descubre salvo que se quede en la misma linea rey-from.
+            let k = self.ksq;
+            let alineada = between(k, mv.to) & bit(mv.from) != 0
+                || between(k, mv.from) & bit(mv.to) != 0
+                || between(mv.from, mv.to) & bit(k) != 0;
+            return !alineada;
+        }
+        false
+    }
+}
+
 // TT compartida entre hilos (Lazy SMP): LOCKLESS de verdad, sin Mutex.
 // Motivacion (analisis comparativo contra Reckless, motor top-3 CCRL): su TT
 // son clusters lockless de pocos bytes por entrada; la nuestra era un
@@ -2160,13 +2237,11 @@ impl Searcher {
 
         let mut best = stand_pat;
         let mut best_mv: Option<Move> = None;
+        let mut info_j: Option<InfoJaque> = None;
         for &(mv, see) in moves.iter() {
-            let next = b.make_move(&mv);
-            self.tt_prefetch(next.zobrist);
-            let da_jaque = next.in_check(next.turn);
-
             // Nunca podar promociones ni jaques por SEE/delta: una captura
             // materialmente mala puede ser mate o forzar una secuencia tactica.
+            //
             // ESCALA: la eval interna va ~1.6x inflada respecto de 100cp = peon
             // (peso_bullet), pero valor_pieza y los margenes de aqui estaban
             // en centipeones clasicos, o sea que el delta pruning podaba con
@@ -2177,7 +2252,14 @@ impl Searcher {
             } else {
                 (1, 1, 250, -50)
             };
-            if !da_jaque && mv.promotion.is_none() && see.unwrap_or(0) < umbral_see {
+            // VELOCIDAD (bit a bit identico): el jaque se consulta solo si
+            // algun filtro lo necesita (InfoJaque, una vez por nodo) y el
+            // tablero se copia recien cuando la jugada de verdad se busca.
+            let mut da_jaque: Option<bool> = None;
+            if mv.promotion.is_none()
+                && see.unwrap_or(0) < umbral_see
+                && !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, &mv))
+            {
                 continue;
             }
             let victim = if mv.flag == MoveFlag::EnPassant {
@@ -2189,9 +2271,13 @@ impl Searcher {
             } * esc_num / esc_den;
             let promo_gain =
                 mv.promotion.map(|pt| valor_pieza(pt) - 100).unwrap_or(0) * esc_num / esc_den;
-            if !da_jaque && stand_pat + victim + promo_gain + margen_delta <= alpha {
+            if stand_pat + victim + promo_gain + margen_delta <= alpha
+                && !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, &mv))
+            {
                 continue;
             }
+            let next = b.make_move(&mv);
+            self.tt_prefetch(next.zobrist);
 
             let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
             let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
@@ -2225,7 +2311,7 @@ impl Searcher {
                 if mv.is_capture() || mv.promotion.is_some() {
                     continue;
                 }
-                if !da_jaque_sin_copiar(b, &mv) {
+                if !info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, &mv) {
                     continue;
                 }
                 // Filtro barato antes del caro: SEE solo sobre las que ya
@@ -3040,6 +3126,7 @@ impl Searcher {
         // (ver se_poda_en_sonda). Fuera de la sonda siempre estan activas.
         let podar_en_este_nodo = excluida.is_none() || se_poda_en_sonda();
         let mut idx_siguiente = 0usize;
+        let mut info_j: Option<InfoJaque> = None;
         'jugadas: loop {
             // Se agotaron las jugadas: fin del bucle.
             if idx_siguiente >= n_moves {
@@ -3171,7 +3258,7 @@ impl Searcher {
                 // cruda) daria a profundidad 14 un margen de 1550 centesimas y
                 // podaria medio arbol de una.
                 if ev + FUT_MARGEN_BASE + margen_ply * fut_depth <= alpha {
-                    if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                    if !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv)) {
                         continue;
                     }
                 }
@@ -3202,7 +3289,7 @@ impl Searcher {
                 && beta.abs() < MATE - 1000
                 && idx >= lmp_umbral
             {
-                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                if !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv)) {
                     continue;
                 }
             }
@@ -3251,7 +3338,7 @@ impl Searcher {
                     let see_malo =
                         || crate::see::see(b, mv) < -23 * lmr_depth * lmr_depth;
                     if (hist_mala || see_malo())
-                        && !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv))
+                        && !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv))
                     {
                         continue;
                     }
@@ -3336,7 +3423,7 @@ impl Searcher {
                     see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth
                 }
             {
-                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                if !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv)) {
                     continue;
                 }
             }
@@ -4759,6 +4846,8 @@ mod regression_tests {
     fn jaque_coincide_con_verdad(b: &Board) {
         for mv in generate_legal(b) {
             let rapido = da_jaque_sin_copiar(b, &mv);
+            let info = InfoJaque::nueva(b).da_jaque(b, &mv);
+            assert_eq!(info, rapido, "InfoJaque difiere en {} {}", b.to_fen(), mv.to_uci());
             // Verdad de fondo: tras la jugada, el bando que ahora mueve
             // (el rival) esta en jaque?
             let despues = b.make_move(&mv);
