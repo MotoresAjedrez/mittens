@@ -106,7 +106,7 @@ pub struct RedBullet {
     l1w: Vec<i16>,
     /// Permite el producto NEON corto solo cuando es exacto para ESTA red.
     /// El formato sigue aceptando todos los pesos i16 mediante el fallback.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     l1w_cortos: bool,
     /// Un sesgo de salida por bucket.
     l1b: [i16; B_MAX],
@@ -169,7 +169,7 @@ impl RedBullet {
             l1w[base..base + h].copy_from_slice(&v[..h]);
             l1w[base + H_MAX..base + H_MAX + h].copy_from_slice(&v[h..]);
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let l1w_cortos = h <= 1024 && l1w.iter().all(|&w| (-128..=128).contains(&w));
         let l1b_v = leer(cursor, buckets);
 
@@ -187,7 +187,7 @@ impl RedBullet {
             l0w,
             l0b,
             l1w,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             l1w_cortos,
             l1b,
         })
@@ -846,6 +846,10 @@ impl AcumBullet {
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
+            #[cfg(target_arch = "x86_64")]
+            if self.red.l1w_cortos {
+                return self.producto_punto_sse2(yo, rival, bucket);
+            }
             self.producto_punto_escalar(yo, rival, bucket)
         }
     }
@@ -887,6 +891,52 @@ impl AcumBullet {
             let a = vaddq_s64(vpaddlq_s32(acc0), vpaddlq_s32(acc1));
             let b = vaddq_s64(vpaddlq_s32(acc2), vpaddlq_s32(acc3));
             let mut suma = vaddvq_s64(vaddq_s64(a, b));
+            let base = bucket * 2 * H_MAX;
+            for k in j..self.red.h {
+                let v = yo[k].clamp(0, QA as i16) as i64;
+                let u = rival[k].clamp(0, QA as i16) as i64;
+                suma += v * v * self.red.l1w[base + k] as i64;
+                suma += u * u * self.red.l1w[base + H_MAX + k] as i64;
+            }
+            suma
+        }
+    }
+
+    /// Equivalente SSE2 (disponible en todas las CPU x86_64). PMADDWD
+    /// suma dos productos por carril: como mucho 1024/4 = 256 terminos,
+    /// 256*65025*128 = 2_130_739_200 < i32::MAX. Las perspectivas se
+    /// acumulan por separado y se ensanchan a i64 antes de reunirlas.
+    /// La condicion de carga es la misma que en NEON; no cambia los pesos.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn producto_punto_sse2(&self, yo: &[i16; H_MAX], rival: &[i16; H_MAX], bucket: usize) -> i64 {
+        debug_assert!(self.red.l1w_cortos);
+        unsafe {
+            use std::arch::x86_64::*;
+            let cero = _mm_setzero_si128();
+            let tope = _mm_set1_epi16(QA as i16);
+            let w = self.red.l1w.as_ptr().add(bucket * 2 * H_MAX);
+            let mut a = cero;
+            let mut b = cero;
+            let mut j = 0;
+            while j + 8 <= self.red.h {
+                let v = _mm_min_epi16(_mm_max_epi16(
+                    _mm_loadu_si128(yo.as_ptr().add(j).cast()), cero), tope);
+                let u = _mm_min_epi16(_mm_max_epi16(
+                    _mm_loadu_si128(rival.as_ptr().add(j).cast()), cero), tope);
+                let vw = _mm_mullo_epi16(v, _mm_loadu_si128(w.add(j).cast()));
+                let uw = _mm_mullo_epi16(u, _mm_loadu_si128(w.add(H_MAX + j).cast()));
+                a = _mm_add_epi32(a, _mm_madd_epi16(vw, v));
+                b = _mm_add_epi32(b, _mm_madd_epi16(uw, u));
+                j += 8;
+            }
+            let signo_a = _mm_srai_epi32::<31>(a);
+            let signo_b = _mm_srai_epi32::<31>(b);
+            let a64 = _mm_add_epi64(_mm_unpacklo_epi32(a, signo_a), _mm_unpackhi_epi32(a, signo_a));
+            let b64 = _mm_add_epi64(_mm_unpacklo_epi32(b, signo_b), _mm_unpackhi_epi32(b, signo_b));
+            let mut carriles = [0i64; 2];
+            _mm_storeu_si128(carriles.as_mut_ptr().cast(), _mm_add_epi64(a64, b64));
+            let mut suma = carriles[0] + carriles[1];
             let base = bucket * 2 * H_MAX;
             for k in j..self.red.h {
                 let v = yo[k].clamp(0, QA as i16) as i64;
@@ -1085,7 +1135,7 @@ mod tests {
     /// Extremos del formato, del clamp y de la suma (incluye totales que
     /// exceden i32). Tambien comprueba que pesos externos grandes conservan
     /// el camino general exacto en todos los buckets y arquitecturas.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn salida_corta_extremos_y_fallback_i16() {
         for (h, buckets) in ARQUITECTURAS_SOPORTADAS {
@@ -1116,7 +1166,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn salida_corta_pesos_y_activaciones_variados() {
         for (h, buckets) in ARQUITECTURAS_SOPORTADAS {
