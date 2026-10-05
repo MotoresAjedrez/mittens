@@ -412,6 +412,129 @@ impl RedBullet {
             self.restar(acc, f as usize);
         }
     }
+
+    /// Kernel de `AcumBullet::evaluar_fusionado`: escribe en `dst` el
+    /// acumulador del hijo (src + cambios, las dos perspectivas) y devuelve
+    /// la suma SCReLU de la capa de salida de ese mismo acumulador, en una
+    /// sola pasada por bloques de 32 neuronas. Devuelve `None` (sin tocar
+    /// `dst`) para formas de cambio poco frecuentes; el llamador cae al
+    /// camino normal.
+    ///
+    /// SAFETY: el llamador garantiza h % 32 == 0, h <= H_MAX, pesos de salida
+    /// en -128..=128 (`l1w_cortos`), features < 768 y bucket < buckets.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn actualizar_y_salida(
+        &self,
+        src: &[[i16; H_MAX]; 2],
+        dst: &mut [[i16; H_MAX]; 2],
+        cambios: &[Cambios; 2],
+        negras_mueven: bool,
+        bucket: usize,
+    ) -> Option<i64> {
+        unsafe {
+            use std::arch::aarch64::*;
+            let h = self.h;
+            let w0 = self.l0w.as_ptr();
+            let wsal = self.l1w.as_ptr().add(bucket * 2 * H_MAX);
+            // La perspectiva del que mueve usa la mitad "stm" (0..H_MAX) de
+            // los pesos de salida; la otra, la mitad "ntm" (H_MAX..).
+            let (ws0, ws1) = if negras_mueven {
+                (wsal.add(H_MAX), wsal)
+            } else {
+                (wsal, wsal.add(H_MAX))
+            };
+            let cero = vdupq_n_s16(0);
+            let tope = vdupq_n_s16(QA as i16);
+            let mut a0 = vdupq_n_s32(0);
+            let mut a1 = vdupq_n_s32(0);
+            let mut a2 = vdupq_n_s32(0);
+            let mut a3 = vdupq_n_s32(0);
+            let s0 = src[0].as_ptr();
+            let s1 = src[1].as_ptr();
+            let d0 = dst[0].as_mut_ptr();
+            let d1 = dst[1].as_mut_ptr();
+            macro_rules! combinar {
+                (+ $a:expr, $b:expr) => { vaddq_s16($a, $b) };
+                (- $a:expr, $b:expr) => { vsubq_s16($a, $b) };
+            }
+            // SCReLU de 8 neuronas, identica a `producto_punto_corto`.
+            macro_rules! screlu {
+                ($v:expr, $w:expr, $lo:ident, $hi:ident) => {{
+                    let c = vminq_s16(vmaxq_s16($v, cero), tope);
+                    let vw = vmulq_s16(c, vld1q_s16($w));
+                    $lo = vmlal_s16($lo, vget_low_s16(vw), vget_low_s16(c));
+                    $hi = vmlal_high_s16($hi, vw, c);
+                }};
+            }
+            // 32 neuronas de UNA perspectiva: src + columnas -> dst, y su
+            // aporte a la salida mientras siguen en registros.
+            macro_rules! bloque {
+                ($t:expr, $s:expr, $d:expr, $ws:expr, $lo:ident, $hi:ident,
+                 [$($signo:tt $col:expr),+]) => {{
+                    let ps = $s.add($t);
+                    let mut r0 = vld1q_s16(ps);
+                    let mut r1 = vld1q_s16(ps.add(8));
+                    let mut r2 = vld1q_s16(ps.add(16));
+                    let mut r3 = vld1q_s16(ps.add(24));
+                    $(
+                        {
+                            let w = $col.add($t);
+                            r0 = combinar!($signo r0, vld1q_s16(w));
+                            r1 = combinar!($signo r1, vld1q_s16(w.add(8)));
+                            r2 = combinar!($signo r2, vld1q_s16(w.add(16)));
+                            r3 = combinar!($signo r3, vld1q_s16(w.add(24)));
+                        }
+                    )+
+                    let pd = $d.add($t);
+                    vst1q_s16(pd, r0);
+                    vst1q_s16(pd.add(8), r1);
+                    vst1q_s16(pd.add(16), r2);
+                    vst1q_s16(pd.add(24), r3);
+                    let ws = $ws.add($t);
+                    screlu!(r0, ws, $lo, $hi);
+                    screlu!(r1, ws.add(8), $lo, $hi);
+                    screlu!(r2, ws.add(16), $lo, $hi);
+                    screlu!(r3, ws.add(24), $lo, $hi);
+                }};
+            }
+            macro_rules! pasada {
+                ([$($s0:tt $c0:expr),+], [$($s1:tt $c1:expr),+]) => {{
+                    let mut t = 0;
+                    while t < h {
+                        bloque!(t, s0, d0, ws0, a0, a1, [$($s0 $c0),+]);
+                        bloque!(t, s1, d1, ws1, a2, a3, [$($s1 $c1),+]);
+                        t += 32;
+                    }
+                }};
+            }
+            let col = |f: u16| w0.add(f as usize * h);
+            let (c0, c1) = (&cambios[0], &cambios[1]);
+            match (c0.add.len(), c0.sub.len(), c1.add.len(), c1.sub.len()) {
+                (1, 1, 1, 1) => {
+                    let (p0a, p0s) = (col(c0.add[0]), col(c0.sub[0]));
+                    let (p1a, p1s) = (col(c1.add[0]), col(c1.sub[0]));
+                    pasada!([+ p0a, - p0s], [+ p1a, - p1s]);
+                }
+                (1, 2, 1, 2) => {
+                    let (p0a, p0s, p0t) = (col(c0.add[0]), col(c0.sub[0]), col(c0.sub[1]));
+                    let (p1a, p1s, p1t) = (col(c1.add[0]), col(c1.sub[0]), col(c1.sub[1]));
+                    pasada!([+ p0a, - p0s, - p0t], [+ p1a, - p1s, - p1t]);
+                }
+                (2, 2, 2, 2) => {
+                    let (p0a, p0b) = (col(c0.add[0]), col(c0.add[1]));
+                    let (p0s, p0t) = (col(c0.sub[0]), col(c0.sub[1]));
+                    let (p1a, p1b) = (col(c1.add[0]), col(c1.add[1]));
+                    let (p1s, p1t) = (col(c1.sub[0]), col(c1.sub[1]));
+                    pasada!([+ p0a, + p0b, - p0s, - p0t], [+ p1a, + p1b, - p1s, - p1t]);
+                }
+                _ => return None,
+            }
+            let p = vaddq_s64(vpaddlq_s32(a0), vpaddlq_s32(a1));
+            let q = vaddq_s64(vpaddlq_s32(a2), vpaddlq_s32(a3));
+            Some(vaddvq_s64(vaddq_s64(p, q)))
+        }
+    }
 }
 
 /// Buffer de features que cambian en una jugada. Cota holgada: el maximo
@@ -556,16 +679,22 @@ impl AcumBullet {
     /// porque `entrar` lo marca pendiente cada vez que se reutiliza.
     fn materializar(&self) {
         let mut pila = self.pila.borrow_mut();
-        if pila[self.nivel].calculado {
+        Self::materializar_hasta(&mut pila, self.red, self.nivel);
+    }
+
+    /// Materializa el nivel `objetivo` (y los pendientes entre el ultimo
+    /// calculado y el). Misma logica que tenia `materializar`, separada para
+    /// que la evaluacion fusionada pueda materializar solo hasta el PADRE.
+    fn materializar_hasta(pila: &mut [Nivel], red: &RedBullet, objetivo: usize) {
+        if pila[objetivo].calculado {
             return;
         }
-        let mut desde = self.nivel;
+        let mut desde = objetivo;
         while !pila[desde].calculado {
             debug_assert!(desde > 0, "el nivel 0 siempre esta calculado");
             desde -= 1;
         }
-        let red = self.red;
-        for i in (desde + 1)..=self.nivel {
+        for i in (desde + 1)..=objetivo {
             let (izq, der) = pila.split_at_mut(i);
             let padre = &izq[i - 1];
             let hijo = &mut der[0];
@@ -719,6 +848,11 @@ impl AcumBullet {
     /// Salida en centipeones desde la perspectiva del lado que mueve
     /// (misma convencion que la evaluacion clasica del motor).
     pub fn evaluar(&self) -> f32 {
+        #[cfg(target_arch = "aarch64")]
+        if let Some((suma, bk)) = self.evaluar_fusionado() {
+            let salida = suma / QA as i64 + self.red.l1b[bk] as i64;
+            return (salida * scale() as i64) as f32 / (QA * QB) as f32;
+        }
         self.materializar();
         let pila = self.pila.borrow();
         let n = &pila[self.nivel];
@@ -731,6 +865,50 @@ impl AcumBullet {
         let suma = self.producto_punto(yo, rival, bk);
         let salida = suma / QA as i64 + self.red.l1b[bk] as i64;
         (salida * scale() as i64) as f32 / (QA * QB) as f32
+    }
+
+    /// VELOCIDAD (bit-exacta): si el nivel vigente esta PENDIENTE (lo normal:
+    /// la actualizacion es perezosa y casi siempre se materializa justo para
+    /// evaluar), calcula el acumulador del hijo Y la capa de salida en UNA
+    /// pasada: cada bloque de neuronas recien sumado se usa para la SCReLU
+    /// mientras sigue en registros, en vez de escribir 4 KB y volver a
+    /// leerlos en `producto_punto`. La pasada del acumulador esta limitada por
+    /// memoria (columnas de pesos en L2) y la SCReLU por calculo, asi que al
+    /// fusionarlas se solapan.
+    ///
+    /// Exactitud: el acumulador escrito es el mismo (mismas sumas i16
+    /// envolventes, mismas features). La suma de la salida usa el MISMO
+    /// esquema que `producto_punto_corto` (v*w en i16 + SMLAL a carriles i32,
+    /// un par de acumuladores por perspectiva, cada carril recibe h/8 <= 128
+    /// terminos de magnitud <= 65025*128: 1_065_369_600 < i32::MAX) y se
+    /// ensancha a i64 antes de reunir: la suma entera es exacta, el i64 es
+    /// identico. Solo se usa con pesos de salida cortos (l1w_cortos) y
+    /// h multiplo de 32; si no, `None` y se sigue el camino de siempre.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn evaluar_fusionado(&self) -> Option<(i64, usize)> {
+        let red = self.red;
+        let nivel = self.nivel;
+        if !red.l1w_cortos || red.h % 32 != 0 || nivel == 0 {
+            return None;
+        }
+        let mut pila = self.pila.borrow_mut();
+        if pila[nivel].calculado {
+            return None;
+        }
+        Self::materializar_hasta(&mut pila, red, nivel - 1);
+        let (izq, der) = pila.split_at_mut(nivel);
+        let padre = &izq[nivel - 1];
+        let hijo = &mut der[0];
+        let bk = self.bucket(hijo.piezas);
+        // SAFETY: aarch64 (NEON siempre disponible), h % 32 == 0 y
+        // h <= H_MAX (garantizado por ARQUITECTURAS_SOPORTADAS), pesos de
+        // salida en -128..=128 (l1w_cortos), features < 768 (calcular_cambios).
+        let suma = unsafe {
+            red.actualizar_y_salida(&padre.persp, &mut hijo.persp, &hijo.cambios, hijo.negras_mueven, bk)
+        }?;
+        hijo.calculado = true;
+        Some((suma, bk))
     }
 
     /// Indice del output bucket segun el material. Misma formula que
@@ -1561,6 +1739,91 @@ mod tests {
                 assert_eq!(acum.piezas(), raiz_piezas, "pila: salir no restauro piezas");
                 assert_eq!(acum.negras_mueven(), raiz_turno, "pila: salir no restauro turno");
             }
+        }
+    }
+
+    /// VELOCIDAD bit-exacta (evaluacion fusionada acumulador+salida): en
+    /// recorridos aleatorios con entrar/salir, jugadas nulas, cadenas de
+    /// niveles pendientes de distinta longitud (se evalua solo a veces) y
+    /// slots de la pila reutilizados con basura de otras ramas, `evaluar()`
+    /// tiene que dar EXACTAMENTE lo mismo que recalcular el acumulador desde
+    /// el tablero y evaluarlo por el camino escalar, y el acumulador que deja
+    /// escrito tiene que ser el recalculado. Las posiciones tienen enroques,
+    /// al paso y promociones (con y sin captura) para cubrir todas las formas
+    /// de cambio (1/1, 1/2, 2/2 y la de la jugada nula, sin cambios).
+    #[test]
+    fn evaluacion_fusionada_igual_que_recalculo_escalar() {
+        let Some(red) = red() else { return };
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ];
+        let mut semilla = 0xD1B5_4A32_D192_ED03u64;
+        let mut azar = move || {
+            semilla ^= semilla << 13;
+            semilla ^= semilla >> 7;
+            semilla ^= semilla << 17;
+            semilla
+        };
+        let mut evaluaciones = 0u32;
+        let mut formas = std::collections::BTreeSet::new();
+        for fen in fens {
+            for _partida in 0..60 {
+                let raiz = Board::from_fen(fen).unwrap();
+                let mut acum = AcumBullet::desde_tablero(red, &raiz);
+                let mut linea = vec![raiz];
+                for _paso in 0..90 {
+                    let b = *linea.last().unwrap();
+                    let r = azar();
+                    // Subir a veces (reutiliza slots con datos de otra rama).
+                    if linea.len() > 1 && r % 5 == 0 {
+                        linea.pop();
+                        acum.salir();
+                    } else {
+                        let jugadas = generate_legal(&b);
+                        let hijo = if jugadas.is_empty() || r % 17 == 0 {
+                            if b.in_check(b.turn) || jugadas.is_empty() {
+                                if linea.len() > 1 {
+                                    linea.pop();
+                                    acum.salir();
+                                }
+                                continue;
+                            }
+                            b.make_null_move()
+                        } else {
+                            b.make_move(&jugadas[(azar() % jugadas.len() as u64) as usize])
+                        };
+                        acum.entrar(&b, &hijo);
+                        {
+                            let pila = acum.pila.borrow();
+                            let c = &pila[acum.nivel].cambios[0];
+                            formas.insert((c.add.len(), c.sub.len()));
+                        }
+                        linea.push(hijo);
+                    }
+                    // Evaluar solo a veces: deja cadenas de pendientes.
+                    if azar() % 3 == 0 {
+                        let actual = linea.last().unwrap();
+                        let re = AcumBullet::desde_tablero(red, actual);
+                        let esperado = re.evaluar_escalar();
+                        let obtenido = acum.evaluar();
+                        assert_eq!(obtenido.to_bits(), esperado.to_bits(),
+                            "evaluacion distinta en {fen} nivel {}", acum.nivel);
+                        assert_eq!(acum.persp(), re.persp(), "acumulador distinto en {fen}");
+                        // Evaluar de nuevo (ya calculado) da lo mismo.
+                        assert_eq!(acum.evaluar().to_bits(), esperado.to_bits());
+                        evaluaciones += 1;
+                    }
+                }
+            }
+        }
+        assert!(evaluaciones > 5000, "muy pocas evaluaciones: {evaluaciones}");
+        for forma in [(0, 0), (1, 1), (1, 2), (2, 2)] {
+            assert!(formas.contains(&forma), "forma de cambio {forma:?} sin cubrir: {formas:?}");
         }
     }
 
