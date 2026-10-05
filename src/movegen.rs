@@ -464,31 +464,49 @@ pub fn generate_legal_into_con_jaque(b: &Board, moves: &mut MoveList, en_jaque: 
         !after.in_check(us)
     };
 
-    if en_jaque {
-        // Evasion de jaque (posibles jaques dobles, bloqueos, etc.). Las
-        // jugadas del REY -- que son la mayoria de las evasiones y las mas
-        // caras de legalizar por el camino lento -- se resuelven con el test
-        // directo de casilla segura; el resto (bloqueos y capturas del
-        // atacante) sigue por el camino lento, siempre correcto.
-        // gen_castling no produce nada estando en jaque, asi que aqui no hay
-        // enroques que considerar.
-        generate_pseudo_legal_into_con_jaque(b, moves, true);
-        moves.retain(|mv| {
-            if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
-                casilla_segura_para_rey(b, king_sq, mv.to, us)
-            } else {
-                camino_lento(mv)
-            }
-        });
-        return;
-    }
-
     let own = b.occupied_co[us as usize];
     let enemy_rook_like = b.pieces[them as usize][PieceType::Rook as usize]
         | b.pieces[them as usize][PieceType::Queen as usize];
     let enemy_bishop_like = b.pieces[them as usize][PieceType::Bishop as usize]
         | b.pieces[them as usize][PieceType::Queen as usize];
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
+
+    if en_jaque {
+        // Evasion de jaque (posibles jaques dobles, bloqueos, etc.). Las
+        // jugadas del REY se resuelven con el test directo de casilla segura.
+        // gen_castling no produce nada estando en jaque, asi que aqui no hay
+        // enroques que considerar.
+        //
+        // VELOCIDAD (exacto): el resto de las jugadas (bloqueos y capturas
+        // del atacante) antes iban TODAS por el camino lento (copiar el
+        // tablero + in_check), ~6% del tiempo de busqueda. Con jaque, una
+        // jugada que no es de rey ni al paso es legal si y solo si:
+        //   * hay UN solo atacante (en jaque doble solo puede mover el rey),
+        //   * la pieza no esta clavada (una clavada no puede salir de su
+        //     linea, y su linea solo corta la del jaque en el rey), y
+        //   * el destino captura al atacante o se interpone entre el y el
+        //     rey (`between` es 0 si no estan alineados: caballo/peon solo se
+        //     resuelven capturando).
+        // Al paso sigue por el camino lento. Equivalencia comprobada contra
+        // el camino lento en `legalidad_rapida_recorridos_aleatorios` y perft.
+        let atacantes = b.attackers_to(king_sq, b.occupied) & b.occupied_co[them as usize];
+        let resuelven = if atacantes.count_ones() == 1 {
+            atacantes | crate::bitboard::between(king_sq, atacantes.trailing_zeros() as Square)
+        } else {
+            0
+        };
+        generate_pseudo_legal_into_con_jaque(b, moves, true);
+        moves.retain(|mv| {
+            if mv.flag == MoveFlag::EnPassant {
+                camino_lento(mv)
+            } else if mv.from == king_sq {
+                casilla_segura_para_rey(b, king_sq, mv.to, us)
+            } else {
+                bit(mv.from) & pinned == 0 && bit(mv.to) & resuelven != 0
+            }
+        });
+        return;
+    }
 
     generate_pseudo_legal_into_con_jaque(b, moves, false);
     moves.retain(|mv| {
@@ -516,10 +534,20 @@ pub fn generate_legal_into_con_jaque(b: &Board, moves: &mut MoveList, en_jaque: 
             // de la misma fila; no lo cubre el mapa de clavadas.
             MoveFlag::EnPassant => camino_lento(mv),
             _ if mv.from == king_sq => casilla_segura_para_rey(b, king_sq, mv.to, us),
-            _ => camino_lento(mv),
+            // VELOCIDAD (exacto): pieza CLAVADA sin jaque. Es legal si y solo
+            // si se queda en la linea de la clavada: el destino esta entre el
+            // rey y el origen, o el origen esta entre el rey y el destino (se
+            // aleja por el mismo rayo; el generador ya garantiza camino libre,
+            // asi que como mucho llega a capturar al que clava). Antes:
+            // copiar el tablero + in_check.
+            _ => {
+                crate::bitboard::between(king_sq, mv.from) & bit(mv.to) != 0
+                    || crate::bitboard::between(king_sq, mv.to) & bit(mv.from) != 0
+            }
         }
     });
 }
+
 
 /// ¿Existe al menos UNA jugada legal? Equivalente a
 /// `!generate_legal(b).is_empty()` pero con salida temprana: no legaliza la
@@ -763,6 +791,80 @@ mod equivalencia_legal_tests {
         for mv in generate_legal_referencia(b) {
             explorar(&b.make_move(&mv), profundidad - 1);
         }
+    }
+
+    /// VELOCIDAD bit-exacta (evasiones sin make_move y clavadas por linea):
+    /// recorridos aleatorios largos desde posiciones con muchos jaques,
+    /// clavadas, al paso y promociones; en CADA posicion la lista legal debe
+    /// ser identica (mismo orden) a la referencia lenta. Ademas cuenta que se
+    /// hayan visto bastantes posiciones en jaque, jaques dobles y clavadas.
+    #[test]
+    fn legalidad_rapida_recorridos_aleatorios() {
+        let fens = [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "rnbqk2r/pppp1ppp/5n2/4p3/1bB1P3/2N5/PPPP1PPP/R1BQK1NR w KQkq - 4 4",
+            "4k3/8/8/2b5/8/4r3/3PN3/4K3 w - - 0 1",
+            "3qk3/8/8/8/2B5/8/3R4/r2NK2r w - - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            // Jaques dobles (torre+caballo, alfil+torre) con piezas que
+            // podrian "resolver" uno de los dos jaques.
+            "4r1k1/8/8/8/8/3n4/2B3N1/R3K3 w Q - 0 1",
+            "6k1/8/8/8/1b6/8/4N3/r3K2R w K - 0 1",
+        ];
+        let mut semilla = 0x2545_F491_4F6C_DD1Du64;
+        let mut azar = move || {
+            semilla ^= semilla << 13;
+            semilla ^= semilla >> 7;
+            semilla ^= semilla << 17;
+            semilla
+        };
+        let (mut n, mut en_jaque, mut dobles, mut con_clavadas) = (0u32, 0u32, 0u32, 0u32);
+        for fen in fens {
+            for _ in 0..150 {
+                let mut b = Board::from_fen(fen).unwrap();
+                for _ in 0..60 {
+                    let rapido = generate_legal(&b);
+                    let lento = generate_legal_referencia(&b);
+                    assert_eq!(rapido, lento, "lista legal distinta en {}", b.to_fen());
+                    n += 1;
+                    let us = b.turn;
+                    let ksq = b.king_square(us);
+                    let atac = b.attackers_to(ksq, b.occupied) & b.occupied_co[us.opposite() as usize];
+                    en_jaque += (atac != 0) as u32;
+                    dobles += (atac.count_ones() > 1) as u32;
+                    let them = us.opposite();
+                    let p = &b.pieces[them as usize];
+                    let clav = crate::bitboard::pinned_pieces(
+                        ksq,
+                        b.occupied_co[us as usize],
+                        p[PieceType::Rook as usize] | p[PieceType::Queen as usize],
+                        p[PieceType::Bishop as usize] | p[PieceType::Queen as usize],
+                        b.occupied,
+                    );
+                    con_clavadas += (clav != 0) as u32;
+                    if rapido.is_empty() {
+                        break;
+                    }
+                    // Preferir jaques (si hay) para visitar muchas evasiones.
+                    let jaques: Vec<_> = rapido
+                        .iter()
+                        .filter(|m| b.make_move(m).in_check(b.turn.opposite()))
+                        .collect();
+                    let mv = if !jaques.is_empty() && azar() % 2 == 0 {
+                        *jaques[(azar() % jaques.len() as u64) as usize]
+                    } else {
+                        rapido[(azar() % rapido.len() as u64) as usize]
+                    };
+                    b = b.make_move(&mv);
+                }
+            }
+        }
+        assert!(n > 20000, "pocas posiciones: {n}");
+        assert!(en_jaque > 3000, "pocas posiciones en jaque: {en_jaque}");
+        assert!(dobles > 250, "pocos jaques dobles: {dobles}");
+        assert!(con_clavadas > 2000, "pocas posiciones con clavadas: {con_clavadas}");
     }
 
     #[test]
