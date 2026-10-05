@@ -2201,6 +2201,7 @@ impl Searcher {
             for &mv in evasiones.iter() {
                 let next = b.make_move(&mv);
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
                 // Ligar el resultado ANTES de deshacer, y recien despues
                 // aplicar el `?`: asi ningun retorno temprano se salta el
@@ -2348,6 +2349,7 @@ impl Searcher {
             }
             let next = b.make_move(&mv);
             self.tt_prefetch(next.zobrist);
+            crate::eval_cache::prefetch(next.zobrist);
 
             let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
             let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
@@ -2394,6 +2396,7 @@ impl Searcher {
 
                 let next = b.make_move(&mv);
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
                 let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
                 self.salir_hijo(&next_eval, b, &next);
@@ -2754,6 +2757,7 @@ impl Searcher {
                 let r = r.min(depth - 1).max(1);
                 let next = b.make_null_move();
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, depth - 1 - r);
                 // El hijo NO llega por LMR: limpiar el estado hindsight del
                 // ply hijo para que no lea la reduccion de otro subarbol.
@@ -2833,6 +2837,7 @@ impl Searcher {
                 }
                 let next = b.make_move(mv);
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 if next.in_check(next.turn) {
                     continue;
                 }
@@ -3515,6 +3520,7 @@ impl Searcher {
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
             self.tt_prefetch(next.zobrist);
+            crate::eval_cache::prefetch(next.zobrist);
             let child_prev = Some((pt_mv, mv.to as usize));
             let child_prev2 = prev;
             // ext puede valer -2, 0, +1 o +2 (ver ext_singular arriba). El
