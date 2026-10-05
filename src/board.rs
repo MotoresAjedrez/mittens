@@ -56,6 +56,33 @@ pub struct Board {
     /// pruebas de consistencia pasan por ahi), y `make_move` lo comprueba con
     /// debug_assert en cada jugada.
     pub corr_hash: u64,
+    /// VELOCIDAD: buzon (mailbox) de la pieza en cada casilla, redundante con
+    /// los bitboards: 0 = vacia, 1 + color*6 + tipo. Hace `piece_at` una sola
+    /// carga en vez de 5-6 pruebas de bitboard con saltos (era ~4% de las
+    /// muestras: lo llaman make_move, el orden de jugadas, InfoJaque y SEE).
+    /// Solo lo escriben `add_piece`/`remove_piece` y `from_fen` (las UNICAS
+    /// escrituras de `pieces`), asi que siempre coincide con los bitboards;
+    /// el test `buzon_coincide_con_bitboards` lo verifica casilla por casilla
+    /// en miles de posiciones. Cuesta 64 bytes mas en la copia de make_move.
+    pub buzon: [u8; 64],
+}
+
+/// Decodificacion del buzon (indice 0 = vacia). 16 entradas para indexar con
+/// `& 15` sin chequeo de limites.
+const DECODIFICAR_BUZON: [Option<(Color, PieceType)>; 16] = {
+    let mut t: [Option<(Color, PieceType)>; 16] = [None; 16];
+    let mut i = 0;
+    while i < 6 {
+        t[1 + i] = Some((Color::White, ALL_PIECE_TYPES[i]));
+        t[7 + i] = Some((Color::Black, ALL_PIECE_TYPES[i]));
+        i += 1;
+    }
+    t
+};
+
+#[inline(always)]
+const fn codigo_buzon(color: Color, pt: PieceType) -> u8 {
+    1 + color as u8 * 6 + pt as u8
 }
 
 /// Cuanto hay que XOR-ear en `Board::corr_hash` cuando aparece o desaparece
@@ -98,6 +125,7 @@ impl Board {
             fullmove_number: 1,
             zobrist: 0,
             corr_hash: 0,
+            buzon: [0; 64],
         }
     }
 
@@ -117,8 +145,18 @@ impl Board {
     /// Mismo resultado exacto que el bucle, sin saltos condicionales.
     /// `piece_at` es de las funciones mas llamadas del motor (make_move la usa
     /// dos veces por jugada, mas SEE, evaluacion y NNUE).
-    #[inline]
+    #[inline(always)]
     pub fn piece_at(&self, sq: Square) -> Option<(Color, PieceType)> {
+        // `sq & 63` reproduce lo que hacia `bit(sq)` en release con una
+        // casilla fuera de rango (desplazamiento enmascarado) y evita el
+        // chequeo de limites; el `& 15` idem en la tabla.
+        DECODIFICAR_BUZON[(self.buzon[(sq & 63) as usize] & 15) as usize]
+    }
+
+    /// `piece_at` original, derivado SOLO de los bitboards. Referencia de los
+    /// tests de consistencia del buzon.
+    #[inline]
+    pub fn piece_at_bitboards(&self, sq: Square) -> Option<(Color, PieceType)> {
         let b = bit(sq);
         if self.occupied & b == 0 {
             return None;
@@ -230,6 +268,7 @@ impl Board {
                         .ok_or_else(|| format!("carácter de pieza inválido: {}", ch))?;
                     let sq = make_square(file, rank);
                     b.pieces[color as usize][pt as usize] |= bit(sq);
+                    b.buzon[sq as usize] = codigo_buzon(color, pt);
                     file += 1;
                 }
             }
@@ -566,6 +605,7 @@ impl Board {
     fn remove_piece(&mut self, color: Color, pt: PieceType, sq: Square) {
         let b = bit(sq);
         self.pieces[color as usize][pt as usize] &= !b;
+        self.buzon[(sq & 63) as usize] = 0;
         self.occupied_co[color as usize] &= !b;
         self.occupied &= !b;
         let k = keys().piece_square[color as usize][pt as usize][sq as usize];
@@ -577,6 +617,7 @@ impl Board {
     fn add_piece(&mut self, color: Color, pt: PieceType, sq: Square) {
         let b = bit(sq);
         self.pieces[color as usize][pt as usize] |= b;
+        self.buzon[(sq & 63) as usize] = codigo_buzon(color, pt);
         self.occupied_co[color as usize] |= b;
         self.occupied |= b;
         let k = keys().piece_square[color as usize][pt as usize][sq as usize];
@@ -728,6 +769,55 @@ impl Board {
 #[cfg(test)]
 mod tests {
     use super::Board;
+
+    /// VELOCIDAD bit-exacta: el buzon tiene que coincidir con los bitboards
+    /// en las 64 casillas de cada posicion visitada (from_fen, make_move con
+    /// capturas/al paso/enroques/promociones y jugada nula).
+    #[test]
+    fn buzon_coincide_con_bitboards() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ];
+        let comprobar = |b: &Board| {
+            for sq in 0..64u8 {
+                assert_eq!(b.piece_at(sq), b.piece_at_bitboards(sq),
+                    "buzon distinto en casilla {sq} de {}", b.to_fen());
+            }
+        };
+        let mut semilla = 0x5DEE_CE66_D1CE_4E5Bu64;
+        let mut azar = move || {
+            semilla ^= semilla << 13;
+            semilla ^= semilla >> 7;
+            semilla ^= semilla << 17;
+            semilla
+        };
+        let mut n = 0u32;
+        for fen in fens {
+            for _ in 0..100 {
+                let mut b = Board::from_fen(fen).unwrap();
+                comprobar(&b);
+                for _ in 0..80 {
+                    let jugadas = crate::movegen::generate_legal(&b);
+                    if jugadas.is_empty() {
+                        break;
+                    }
+                    if azar() % 13 == 0 && !b.in_check(b.turn) {
+                        b = b.make_null_move();
+                    } else {
+                        b = b.make_move(&jugadas[(azar() % jugadas.len() as u64) as usize]);
+                    }
+                    comprobar(&b);
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 20_000, "pocas posiciones: {n}");
+    }
 
     #[test]
     fn rechaza_fila_fen_de_mas_de_ocho_casillas() {
