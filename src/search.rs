@@ -379,7 +379,7 @@ fn rfp_prof_max() -> i32 {
 /// comportamiento historico (IIR solo cuando NO hay tt_move).
 fn iir_tt_superficial() -> i32 {
     static C: OnceLock<i32> = OnceLock::new();
-    *C.get_or_init(|| env_i32("MITTENS_IIR_TT", 0, 12, 0))
+    *C.get_or_init(|| env_i32("MITTENS_IIR_TT", 0, 12, 4))
 }
 
 /// Ancho inicial de la ventana de aspiracion, en unidades internas.
@@ -1864,6 +1864,11 @@ impl Searcher {
         if Some(*mv) == tt_move {
             return -1_000_000;
         }
+        if let Some(promo) = mv.promotion {
+            if promo != PieceType::Queen {
+                return 15_000;
+            }
+        }
         if mv.is_capture() {
             let see = see_precalculado.unwrap_or_else(|| crate::see::see(b, mv));
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
@@ -3226,9 +3231,11 @@ impl Searcher {
                 let lmr_depth = (depth - r_est).max(0);
                 if lmr_depth <= 6 {
                     let pt_q = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
-                    // (b) Historia claramente negativa: esta jugada ya fallo
-                    //     repetidas veces en contextos parecidos.
-                    let h = self.history[mv.from as usize][mv.to as usize];
+                    let h = if casilla_amenazada(b, mv.to) {
+                        self.history_amenaza[mv.from as usize][mv.to as usize]
+                    } else {
+                        self.history[mv.from as usize][mv.to as usize]
+                    };
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
                             self.cont_history[cont_idx(p_pt, p_to, pt_q, mv.to as usize)]
@@ -3422,7 +3429,11 @@ impl Searcher {
                     // el history principal pesa el doble que cada
                     // continuation history. Se suma tambien cont_history_2
                     // (follow-up a 2 plies), que antes no se usaba aca.
-                    let h = self.history[mv.from as usize][mv.to as usize];
+                    let h = if casilla_amenazada(b, mv.to) {
+                        self.history_amenaza[mv.from as usize][mv.to as usize]
+                    } else {
+                        self.history[mv.from as usize][mv.to as usize]
+                    };
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
                             self.cont_history[cont_idx(p_pt, p_to, pt_mv, mv.to as usize)]
@@ -3877,6 +3888,15 @@ impl Searcher {
                 if actual_sc >= vent_beta && vent_beta < INFINITO {
                     ancho = ancho.saturating_mul(2);
                     vent_beta = mejor_sc.saturating_add(ancho).min(INFINITO);
+                    mejor_mv = Some(actual_mv);
+                    mejor_sc = actual_sc;
+                    if let Some(pos) = moves.iter().position(|m| *m == actual_mv) {
+                        if pos > 0 {
+                            let m = moves[pos];
+                            moves.remove(pos);
+                            moves.insert(0, m);
+                        }
+                    }
                     continue;
                 }
                 break;
