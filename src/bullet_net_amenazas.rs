@@ -407,7 +407,7 @@ impl RedBulletAmenazas {
                 j += 8;
             }
             for k in j..H {
-                acc[k] += col[k] as i32;
+                acc[k] = acc[k].wrapping_add(col[k] as i32);
             }
             return;
         }
@@ -435,7 +435,7 @@ impl RedBulletAmenazas {
                 j += 8;
             }
             for k in j..H {
-                acc[k] -= col[k] as i32;
+                acc[k] = acc[k].wrapping_sub(col[k] as i32);
             }
             return;
         }
@@ -452,7 +452,7 @@ impl RedBulletAmenazas {
     fn sumar_escalar(&self, acc: &mut [i32; H], feature: usize) {
         let col = self.columna(feature);
         for (a, &w) in acc.iter_mut().zip(col) {
-            *a += w as i32;
+            *a = a.wrapping_add(w as i32);
         }
     }
 
@@ -461,7 +461,7 @@ impl RedBulletAmenazas {
     fn restar_escalar(&self, acc: &mut [i32; H], feature: usize) {
         let col = self.columna(feature);
         for (a, &w) in acc.iter_mut().zip(col) {
-            *a -= w as i32;
+            *a = a.wrapping_sub(w as i32);
         }
     }
 

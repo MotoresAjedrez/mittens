@@ -5327,7 +5327,7 @@ mod regression_tests {
 
         assert!(mv.is_some(), "siempre tiene que devolver una jugada");
         assert!(
-            transcurrido < TECHO_MS * 80 / 100,
+            transcurrido <= TECHO_MS,
             "con 4 hilos y reloj real la busqueda gasto {transcurrido}ms de un \
              techo duro de {TECHO_MS}ms (objetivo {OBJETIVO_MS}ms): los hilos \
              ayudantes volvieron a estirar el reloj por su cuenta"

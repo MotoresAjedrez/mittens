@@ -147,9 +147,20 @@ fn empaquetar(b: &Board, score: i32, resultado_stm: f32, salida: &mut Vec<u8>) {
     salida.extend_from_slice(&[0u8; 3]); // relleno hasta 32 bytes
 }
 
+/// Limite de busqueda para datagen: profundidad fija (comportamiento
+/// historico) o nodos fijos. Con nodos fijos se deja `search_fixed_depth`
+/// corriendo hasta MAX_PLY (128, tope real de la profundizacion iterativa) y
+/// se le pone `nodes_limit` al Searcher -- el mismo mecanismo que ya usa
+/// `go nodes N` por UCI (`search.rs:1595-1600`), revisado cada 256 nodos.
+#[derive(Clone, Copy)]
+pub enum LimiteDatagen {
+    Profundidad(i32),
+    Nodos(u64),
+}
+
 /// Juega una partida completa contra si mismo y devuelve sus posiciones ya
 /// etiquetadas con score Y resultado real.
-fn jugar_partida(s: &mut Searcher, rng: &mut Rng, profundidad: i32, buf: &mut Vec<u8>) -> usize {
+fn jugar_partida(s: &mut Searcher, rng: &mut Rng, limite: LimiteDatagen, buf: &mut Vec<u8>) -> usize {
     let mut b = Board::startpos();
 
     // Apertura aleatoria (no se guarda: son posiciones sin evaluar).
@@ -204,7 +215,16 @@ fn jugar_partida(s: &mut Searcher, rng: &mut Rng, profundidad: i32, buf: &mut Ve
         // picos en +-200 (que es CONTEMPT_PENALIZACION, no una evaluacion
         // real). O sea, la mitad del dataset eran scores inventados.
         s.set_game_history(historial.clone());
-        let (mv, score, _) = s.search_fixed_depth(&b, profundidad);
+        // Con nodos fijos: tope de profundidad alto (la profundizacion
+        // iterativa nunca lo alcanza porque `check_time` corta antes al ver
+        // `nodes_limit`, cada 256 nodos) y `nodes_limit` puesto; con
+        // profundidad fija, sin limite de nodos, igual que antes.
+        let (tope_prof, nodes_limit) = match limite {
+            LimiteDatagen::Profundidad(d) => (d, None),
+            LimiteDatagen::Nodos(n) => (100, Some(n)),
+        };
+        s.nodes_limit = nodes_limit;
+        let (mv, score, _) = s.search_fixed_depth(&b, tope_prof);
         let Some(mv) = mv else {
             resultado_blancas = 0.5;
             break;
@@ -232,7 +252,11 @@ fn jugar_partida(s: &mut Searcher, rng: &mut Rng, profundidad: i32, buf: &mut Ve
     muestras.len()
 }
 
-/// `mittens datagen --salida F [--partidas N] [--prof D] [--hilos T] [--semilla S]`
+/// `mittens datagen --salida F [--partidas N] [--prof D | --nodos N] [--hilos T] [--semilla S]`
+///
+/// `--prof` y `--nodos` son mutuamente excluyentes; si se pasan los dos gana
+/// `--nodos` (mas especifico). Sin ninguno, default profundidad 7 (igual que
+/// antes de agregar el modo nodos).
 pub fn run_datagen(args: &[String]) {
     let leer = |nombre: &str| -> Option<String> {
         args.iter()
@@ -242,7 +266,11 @@ pub fn run_datagen(args: &[String]) {
     };
     let salida = leer("--salida").unwrap_or_else(|| "datagen.data".to_string());
     let partidas: u64 = leer("--partidas").and_then(|v| v.parse().ok()).unwrap_or(1000);
-    let profundidad: i32 = leer("--prof").and_then(|v| v.parse().ok()).unwrap_or(7);
+    let nodos: Option<u64> = leer("--nodos").and_then(|v| v.parse().ok());
+    let limite = match nodos {
+        Some(n) => LimiteDatagen::Nodos(n),
+        None => LimiteDatagen::Profundidad(leer("--prof").and_then(|v| v.parse().ok()).unwrap_or(7)),
+    };
     let hilos: usize = leer("--hilos").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
     let semilla: u64 = leer("--semilla")
         .and_then(|v| v.parse().ok())
@@ -251,10 +279,16 @@ pub fn run_datagen(args: &[String]) {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15));
 
-    println!(
-        "datagen: {} partidas, profundidad {}, {} hilos -> {}",
-        partidas, profundidad, hilos, salida
-    );
+    match limite {
+        LimiteDatagen::Profundidad(d) => println!(
+            "datagen: {} partidas, profundidad {}, {} hilos -> {}",
+            partidas, d, hilos, salida
+        ),
+        LimiteDatagen::Nodos(n) => println!(
+            "datagen: {} partidas, {} nodos fijos, {} hilos -> {}",
+            partidas, n, hilos, salida
+        ),
+    }
 
     let hechas = Arc::new(AtomicU64::new(0));
     let posiciones = Arc::new(AtomicU64::new(0));
@@ -297,7 +331,7 @@ pub fn run_datagen(args: &[String]) {
                         break;
                     }
                     buf.clear();
-                    let n = jugar_partida(&mut s, &mut rng, profundidad, &mut buf);
+                    let n = jugar_partida(&mut s, &mut rng, limite, &mut buf);
                     if out.write_all(&buf).is_err() || out.flush().is_err() {
                         eprintln!("error escribiendo {}", ruta);
                         parar.store(true, Ordering::Relaxed);
@@ -413,7 +447,7 @@ mod tests {
         let mut n = 0;
         // Varias partidas para tener muestra suficiente.
         for _ in 0..6 {
-            n += jugar_partida(&mut s, &mut rng, 4, &mut buf);
+            n += jugar_partida(&mut s, &mut rng, LimiteDatagen::Profundidad(4), &mut buf);
         }
         assert!(n > 50, "muestra demasiado chica para concluir: {}", n);
         let scores: Vec<i32> = (0..n)
@@ -447,7 +481,7 @@ mod tests {
         let mut s = Searcher::new(8);
         let mut rng = Rng::nuevo(12345);
         let mut buf = Vec::new();
-        let n = jugar_partida(&mut s, &mut rng, 4, &mut buf);
+        let n = jugar_partida(&mut s, &mut rng, LimiteDatagen::Profundidad(4), &mut buf);
         assert!(n > 0, "la partida no produjo ninguna posicion");
         assert_eq!(buf.len(), n * 32, "algun registro no mide 32 bytes");
         for i in 0..n {
