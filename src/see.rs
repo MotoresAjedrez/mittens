@@ -159,6 +159,45 @@ pub fn see(b: &Board, mv: &Move) -> i32 {
     gain0 - resto
 }
 
+/// Evalua si la ganancia estatica de `mv` es mayor o igual a `threshold`.
+/// Aprovecha cotas matematicas exactas para podar el calculo de rayos y
+/// atacantes en la mayoria de las llamadas:
+/// - Ganancia maxima posible es `gain0` (el rival solo puede restar).
+/// - Si `gain0 < threshold`, es imposible alcanzarlo -> `false`.
+/// - Si `gain0 - valor(atacante) >= threshold` (y no es rey), aun perdiendo la
+///   pieza inmediatamente la ganancia no bajara de ahi -> `true`.
+#[inline]
+pub fn see_ge(b: &Board, mv: &Move, threshold: i32) -> bool {
+    let to_sq = mv.to;
+    let from_sq = mv.from;
+    let es_al_paso = mv.flag == MoveFlag::EnPassant;
+
+    let victima_tipo = if es_al_paso {
+        Some(PieceType::Pawn)
+    } else {
+        b.piece_at(to_sq).map(|(_, pt)| pt)
+    };
+    let (_color_atacante, atacante_tipo) = b.piece_at(from_sq).expect("see_ge: no hay pieza en 'from'");
+
+    let mut gain0 = victima_tipo.map(valor).unwrap_or(0);
+    let valor_en_to = if let Some(promo) = mv.promotion {
+        gain0 += valor(promo) - valor(PieceType::Pawn);
+        valor(promo)
+    } else {
+        valor(atacante_tipo)
+    };
+
+    if gain0 < threshold {
+        return false;
+    }
+
+    if atacante_tipo != PieceType::King && gain0 - valor_en_to >= threshold {
+        return true;
+    }
+
+    see(b, mv) >= threshold
+}
+
 /// VELOCIDAD (exacto): misma funcion que `see_recurse`, sin recursion y sin
 /// recalcular los rayos deslizantes en cada nivel.
 ///
@@ -192,6 +231,10 @@ fn see_iterativo(
     let mut rayos_o = rook_attacks(to_sq, occupied);
     let fijos_rey = king_attacks(to_sq);
     let fijos_caballo = knight_attacks(to_sq);
+    let fijos_peones = [
+        pawn_attacks(Color::Black, to_sq),
+        pawn_attacks(Color::White, to_sq),
+    ];
     let fuera = !bit(to_sq);
     loop {
         let idx = color as usize;
@@ -200,8 +243,11 @@ fn see_iterativo(
             | (fijos_caballo & p[PieceType::Knight as usize])
             | (rayos_d & (p[B] | p[Q]))
             | (rayos_o & (p[R] | p[Q]))
-            | (pawn_attacks(color.opposite(), to_sq) & p[PieceType::Pawn as usize]))
+            | (fijos_peones[idx] & p[PieceType::Pawn as usize]))
             & fuera;
+        if atacantes == 0 {
+            break;
+        }
         let mut elegido = None;
         for &pt in &ORDEN_POR_VALOR {
             let disponibles = atacantes & bb[idx][pt as usize];
@@ -427,5 +473,35 @@ mod tests {
         let b = Board::from_fen("k6r/6P1/8/8/8/8/8/K7 w - - 0 1").unwrap();
         let mv = move_uci(&b, "g7h8q");
         assert_eq!(see(&b, &mv), 1_300);
+    }
+
+    #[test]
+    fn see_ge_coincide_con_see_en_recorridos_aleatorios() {
+        let fens = [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "2rq1rk1/pp1bppbp/2np1np1/8/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 0 11",
+            "r2q1rk1/ppp2ppp/2n1bn2/2b1p3/4P3/2NP1N2/PPP1BPPP/R1BQ1RK1 w - - 4 8",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "8/4k3/4p3/3K4/8/8/8/4R3 w - - 0 1",
+        ];
+        let umbrales = [-1500, -500, -200, -50, -1, 0, 1, 50, 200, 500, 1500];
+        for fen in fens {
+            let b = Board::from_fen(fen).unwrap();
+            for mv in generate_legal(&b) {
+                let real = see(&b, &mv);
+                for &u in &umbrales {
+                    assert_eq!(
+                        see_ge(&b, &mv, u),
+                        real >= u,
+                        "Divergencia see_ge({u}) para {} en {}: real={}",
+                        mv.to_uci(),
+                        b.to_fen(),
+                        real
+                    );
+                }
+            }
+        }
     }
 }

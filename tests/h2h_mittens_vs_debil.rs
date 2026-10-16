@@ -202,6 +202,7 @@ const OPENINGS: [&str; 5] = [
 ];
 
 #[test]
+#[ignore = "prueba informativa: requiere motores externos; ejecutar con --ignored"]
 fn duelo_mittens_vs_debil() {
     // Rutas portables: MITTENS_H2H_DIR (y MITTENS_H2H_PESOS) sobreescriben las
     // rutas historicas de macOS. Si el directorio no existe, el test se omite

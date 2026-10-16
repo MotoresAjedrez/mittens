@@ -25,7 +25,12 @@ struct Motor {
 
 impl Motor {
     fn nuevo() -> Motor {
+        Self::con_entorno(&[])
+    }
+
+    fn con_entorno(vars: &[(&str, &str)]) -> Motor {
         let mut child = Command::new(BIN)
+            .envs(vars.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -78,6 +83,23 @@ impl Motor {
             }
         }
     }
+}
+
+#[cfg(feature = "ccrl")]
+#[test]
+fn ccrl_arranca_sin_libro_aunque_el_entorno_lo_solicite() {
+    let mut m = Motor::con_entorno(&[("MITTENS_CON_LIBRO", "1"), ("MITTENS_SIN_LIBRO", "0")]);
+    m.enviar("uci");
+    let (_, opciones) = m.esperar("uciok", Duration::from_secs(10));
+    assert!(opciones.iter().any(|s| s == "option name Hash type spin default 256 min 1 max 131072"));
+    assert!(opciones.iter().any(|s| s == "option name UseNNUE type check default true"));
+    assert!(opciones.iter().any(|s| s == "option name OwnBook type check default false"));
+    m.enviar("position startpos");
+    m.enviar("go movetime 150");
+    let (best, lineas) = m.esperar("bestmove", Duration::from_secs(10));
+    assert_ne!(best.trim(), "bestmove 0000");
+    assert!(lineas.iter().any(|s| s.starts_with("info depth ")), "el motor debe buscar por si mismo: {lineas:?}");
+    assert!(!lineas.iter().any(|s| s.contains("libro de aperturas embebido activo")), "el libro no debe activarse: {lineas:?}");
 }
 
 impl Drop for Motor {
@@ -287,6 +309,130 @@ fn go_acepta_depth_movetime_y_reloj() {
         assert_ne!(jugada, "0000", "'{}' devolvio jugada nula", cmd);
         if cmd.contains("searchmoves") {
             assert_eq!(jugada, "g1f3", "searchmoves no se respeto: {}", best);
+        }
+    }
+}
+
+fn motor_con_hilos(hilos: usize) -> Motor {
+    let mut m = Motor::nuevo();
+    m.enviar("uci");
+    m.esperar("uciok", Duration::from_secs(10));
+    m.enviar("setoption name Hash value 16");
+    m.enviar(&format!("setoption name Threads value {hilos}"));
+    m.enviar("setoption name OwnBook value false");
+    m.enviar("isready");
+    m.esperar("readyok", Duration::from_secs(10));
+    m
+}
+
+#[test]
+fn depth_respeta_searchmoves_y_no_hereda_el_filtro() {
+    for hilos in [1, 4] {
+        let mut m = motor_con_hilos(hilos);
+        for cmd in ["go depth 4 searchmoves a2a3", "go searchmoves a2a3 depth 4"] {
+            m.enviar("position startpos");
+            m.enviar(cmd);
+            let (best, _) = m.esperar("bestmove", Duration::from_secs(10));
+            assert_eq!(best.trim(), "bestmove a2a3", "{hilos} hilos; {cmd}");
+        }
+        m.enviar("position startpos");
+        m.enviar("go movetime 30 searchmoves a2a3");
+        m.esperar("bestmove", Duration::from_secs(10));
+        m.enviar("position startpos moves e2e4");
+        m.enviar("go depth 4");
+        let (best, _) = m.esperar("bestmove", Duration::from_secs(10));
+        assert_ne!(
+            best.trim(),
+            "bestmove 0000",
+            "filtro heredado con {hilos} hilos"
+        );
+    }
+}
+
+#[test]
+fn depth_y_tiempo_se_aplican_juntos() {
+    for hilos in [1, 4] {
+        let mut m = motor_con_hilos(hilos);
+        for cmd in [
+            "go depth 128 movetime 50",
+            "go depth 128 wtime 1500 btime 1500 movestogo 30",
+        ] {
+            m.enviar("ucinewgame");
+            m.enviar("position startpos");
+            m.enviar("isready");
+            m.esperar("readyok", Duration::from_secs(10));
+            m.enviar(cmd);
+            let (best, _) = m.esperar("bestmove", Duration::from_millis(900));
+            assert_ne!(best.trim(), "bestmove 0000", "{hilos} hilos; {cmd}");
+        }
+        // Con limites combinados tambien debe poder detenerse por profundidad.
+        m.enviar("ucinewgame");
+        m.enviar("position startpos");
+        m.enviar("go depth 2 movetime 5000");
+        let (_, lineas) = m.esperar("bestmove", Duration::from_secs(2));
+        assert!(lineas.iter().any(|l| l.starts_with("info depth 2 ")));
+        assert!(!lineas.iter().any(|l| l.starts_with("info depth 3 ")));
+    }
+}
+
+#[test]
+fn mate_en_el_limite_de_cincuenta_y_terminales_tienen_score_correcto() {
+    for hilos in [1, 4] {
+        let mut m = motor_con_hilos(hilos);
+        m.enviar("position fen 7k/8/5KQ1/8/8/8/8/8 w - - 99 1");
+        m.enviar("go depth 4");
+        let (best, lineas) = m.esperar("bestmove", Duration::from_secs(10));
+        assert_eq!(best.trim(), "bestmove g6g7");
+        assert!(lineas.iter().any(|l| l.contains("score mate 1")));
+
+        for (fen, esperado) in [
+            ("1n6/1P6/1P6/1P6/1P6/1P5p/1P3k1P/7K w - - 0 1", "score cp 0"),
+            ("7k/6Q1/5K2/8/8/8/8/8 b - - 100 1", "score mate -0"),
+        ] {
+            m.enviar(&format!("position fen {fen}"));
+            m.enviar("go depth 4");
+            let (best, lineas) = m.esperar("bestmove", Duration::from_secs(10));
+            assert_eq!(best.trim(), "bestmove 0000");
+            assert!(lineas.iter().any(|l| l.contains(esperado)), "{lineas:?}");
+        }
+    }
+}
+
+#[test]
+fn pv_smp_empieza_con_la_jugada_elegida() {
+    let mut m = motor_con_hilos(4);
+    for _ in 0..8 {
+        m.enviar("position startpos");
+        m.enviar("go depth 5");
+        let (best, lineas) = m.esperar("bestmove", Duration::from_secs(10));
+        let elegida = best.split_whitespace().nth(1).unwrap();
+        let pv = lineas
+            .iter()
+            .rev()
+            .find_map(|l| l.split_once(" pv ").map(|(_, pv)| pv));
+        assert_eq!(
+            pv.and_then(|pv| pv.split_whitespace().next()),
+            Some(elegida)
+        );
+    }
+}
+
+#[test]
+fn contempt_cero_desactiva_la_preferencia_en_tablas() {
+    for hilos in [1, 4] {
+        let mut m = motor_con_hilos(hilos);
+        for contempt in [200, 0] {
+            m.enviar(&format!("setoption name Contempt value {contempt}"));
+            m.enviar("position fen 4k3/8/8/8/3Q4/8/8/4K3 w - - 100 1");
+            m.enviar("go depth 2");
+            let (best, lineas) = m.esperar("bestmove", Duration::from_secs(10));
+            assert_ne!(best.trim(), "bestmove 0000");
+            let info = lineas.iter().rev().find(|l| l.starts_with("info depth ")).unwrap();
+            if contempt == 0 {
+                assert!(info.contains("score cp 0 "), "{info}");
+            } else {
+                assert!(info.contains("score cp -"), "el control debe aplicar contempt: {info}");
+            }
         }
     }
 }

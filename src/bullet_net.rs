@@ -92,6 +92,13 @@ const ARQUITECTURAS_SOPORTADAS: [(usize, usize); 4] =
 /// Maximo de output buckets soportado.
 pub const B_MAX: usize = 8;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod avx2;
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+mod sse2;
+#[cfg(all(target_arch = "aarch64", target_feature = "i8mm"))]
+mod neon_i8mm;
+
 pub struct RedBullet {
     /// Neuronas de la capa oculta de ESTA red (256, 512 o 1024; ver
     /// ARQUITECTURAS_SOPORTADAS).
@@ -104,6 +111,10 @@ pub struct RedBullet {
     /// Capa de salida: `buckets` bloques de 2*H_MAX pesos. Dentro de cada
     /// bloque, la mitad "stm" empieza en 0 y la mitad "ntm" en H_MAX.
     l1w: Vec<i16>,
+    /// Copia exacta de salida para USDOT. No requantiza: solo se usa cuando
+    /// TODOS los pesos originales caben en i8; otras redes conservan i16.
+    #[cfg(all(target_arch = "aarch64", target_feature = "i8mm"))]
+    l1w_i8: Option<Vec<i8>>,
     /// Permite el producto NEON corto solo cuando es exacto para ESTA red.
     /// El formato sigue aceptando todos los pesos i16 mediante el fallback.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -171,6 +182,8 @@ impl RedBullet {
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let l1w_cortos = h <= 1024 && l1w.iter().all(|&w| (-128..=128).contains(&w));
+        #[cfg(all(target_arch = "aarch64", target_feature = "i8mm"))]
+        let l1w_i8 = l1w.iter().map(|&w| i8::try_from(w)).collect::<Result<Vec<_>, _>>().ok();
         let l1b_v = leer(cursor, buckets);
 
         let mut l0b = [0i16; H_MAX];
@@ -187,6 +200,8 @@ impl RedBullet {
             l0w,
             l0b,
             l1w,
+            #[cfg(all(target_arch = "aarch64", target_feature = "i8mm"))]
+            l1w_i8,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             l1w_cortos,
             l1b,
@@ -245,6 +260,11 @@ impl RedBullet {
             add.iter().chain(sub).all(|&f| (f as usize) < N_ENTRADA),
             "feature fuera de rango en aplicar_features_desde"
         );
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if self.h % 32 == 0 {
+            self.aplicar_features_desde_avx2(src, dst, add, sub);
+            return;
+        }
         #[cfg(target_arch = "aarch64")]
         if self.h % 32 == 0 {
             unsafe {
@@ -369,6 +389,11 @@ impl RedBullet {
         // Bloques de 32 i16 = 4 registros NEON. Las redes reales tienen
         // h = 256, 512 o 1024 (todas multiplos de 32); si algun dia hubiera
         // otra, se cae al camino escalar, que da exactamente lo mismo.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if self.h % 32 == 0 {
+            self.aplicar_features_avx2(acc, add, sub);
+            return;
+        }
         #[cfg(target_arch = "aarch64")]
         if self.h % 32 == 0 {
             unsafe {
@@ -433,6 +458,10 @@ impl RedBullet {
         bucket: usize,
     ) -> Option<i64> {
         unsafe {
+            #[cfg(target_feature = "i8mm")]
+            if self.l1w_i8.is_some() {
+                return self.actualizar_y_salida_i8mm(src, dst, cambios, negras_mueven, bucket);
+            }
             use std::arch::aarch64::*;
             let h = self.h;
             let w0 = self.l0w.as_ptr();
@@ -848,7 +877,7 @@ impl AcumBullet {
     /// Salida en centipeones desde la perspectiva del lado que mueve
     /// (misma convencion que la evaluacion clasica del motor).
     pub fn evaluar(&self) -> f32 {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         if let Some((suma, bk)) = self.evaluar_fusionado() {
             let salida = suma / QA as i64 + self.red.l1b[bk] as i64;
             return (salida * scale() as i64) as f32 / (QA * QB) as f32;
@@ -884,7 +913,7 @@ impl AcumBullet {
     /// ensancha a i64 antes de reunir: la suma entera es exacta, el i64 es
     /// identico. Solo se usa con pesos de salida cortos (l1w_cortos) y
     /// h multiplo de 32; si no, `None` y se sigue el camino de siempre.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline]
     fn evaluar_fusionado(&self) -> Option<(i64, usize)> {
         let red = self.red;
@@ -901,7 +930,7 @@ impl AcumBullet {
         let padre = &izq[nivel - 1];
         let hijo = &mut der[0];
         let bk = self.bucket(hijo.piezas);
-        // SAFETY: aarch64 (NEON siempre disponible), h % 32 == 0 y
+        // SAFETY: NEON, AVX2 o SSE2 disponibles para este target, h % 32 == 0 y
         // h <= H_MAX (garantizado por ARQUITECTURAS_SOPORTADAS), pesos de
         // salida en -128..=128 (l1w_cortos), features < 768 (calcular_cambios).
         let suma = unsafe {
@@ -921,6 +950,12 @@ impl AcumBullet {
         if b == 1 {
             return 0;
         }
+        // Las redes actuales tienen 1 u 8 buckets. Para 8, ceil(32/8)=4:
+        // una resta saturada y un desplazamiento sustituyen dos divisiones
+        // dinamicas en cada evaluacion, sin cambiar la asignacion de material.
+        if b == 8 {
+            return ((piezas.saturating_sub(2) as usize) >> 2).min(7);
+        }
         let divisor = 32usize.div_ceil(b);
         let idx = (piezas.max(2) as usize - 2) / divisor;
         idx.min(b - 1)
@@ -936,6 +971,10 @@ impl AcumBullet {
         unsafe {
             use std::arch::aarch64::*;
             if self.red.l1w_cortos {
+                #[cfg(target_feature = "i8mm")]
+                if let Some(suma) = self.red.producto_punto_i8mm(yo, rival, bucket) {
+                    return suma;
+                }
                 return self.producto_punto_corto(yo, rival, bucket);
             }
             // RANGOS (verificados sobre los pesos reales y razonados para el
@@ -1026,6 +1065,9 @@ impl AcumBullet {
         {
             #[cfg(target_arch = "x86_64")]
             if self.red.l1w_cortos {
+                #[cfg(target_feature = "avx2")]
+                return self.producto_punto_avx2(yo, rival, bucket);
+                #[cfg(not(target_feature = "avx2"))]
                 return self.producto_punto_sse2(yo, rival, bucket);
             }
             self.producto_punto_escalar(yo, rival, bucket)
@@ -1377,6 +1419,24 @@ mod tests {
                     assert_eq!(acc.producto_punto(&rival, &yo, bk),
                                acc.producto_punto_escalar(&rival, &yo, bk));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn buckets_material_coinciden_en_todo_el_rango_u8() {
+        let tablero = Board::from_fen(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        ).unwrap();
+        for (h, buckets) in ARQUITECTURAS_SOPORTADAS {
+            let bytes = vec![0u8; bytes_utiles(h, buckets)];
+            let red = Box::leak(Box::new(RedBullet::cargar_de_bytes(&bytes).unwrap()));
+            let acc = AcumBullet::desde_tablero(red, &tablero);
+            for piezas in 0..=u8::MAX {
+                let grupo = 32usize.div_ceil(buckets);
+                let esperado = ((piezas.max(2) as usize - 2) / grupo).min(buckets - 1);
+                assert_eq!(acc.bucket(piezas), esperado,
+                    "h={h} buckets={buckets} piezas={piezas}");
             }
         }
     }

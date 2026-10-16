@@ -8,7 +8,7 @@
 use crate::board::Board;
 use crate::types::{ALL_PIECE_TYPES, Color};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 
 // N_ENTRADA=5378: 770 base (igual que antes) + 4608 de amenazas (quien
 // ataca a cual pieza, ver features_threat.py: 2 colores x 6 tipos

@@ -606,6 +606,21 @@ pub fn existe_jugada_legal_con_jaque(b: &Board, en_jaque: bool) -> bool {
         )
     };
 
+    // Fuera de jaque, un peon no clavado que puede avanzar prueba que la
+    // posicion no es ahogado. Evita generar la lista completa en las hojas
+    // donde el rey esta encerrado detras de sus propias piezas.
+    if !en_jaque {
+        let peones = b.pieces[us as usize][PieceType::Pawn as usize] & !pinned;
+        let avances = if us == Color::White {
+            peones << 8
+        } else {
+            peones >> 8
+        };
+        if avances & !b.occupied != 0 {
+            return true;
+        }
+    }
+
     let mut pseudo = MoveList::new();
     generate_pseudo_legal_into_con_jaque(b, &mut pseudo, en_jaque);
     for mv in &pseudo {
@@ -782,6 +797,12 @@ mod equivalencia_legal_tests {
             generate_legal(b),
             generate_legal_referencia(b),
             "orden de jugadas divergente: {}",
+            b.to_fen()
+        );
+        assert_eq!(
+            existe_jugada_legal(b),
+            !generate_legal_referencia(b).is_empty(),
+            "existencia de jugada divergente: {}",
             b.to_fen()
         );
         let mut rapido: Vec<String> = generate_legal(b).iter().map(|m| m.to_uci()).collect();
