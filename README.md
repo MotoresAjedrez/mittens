@@ -190,50 +190,81 @@ incluidos pesos extremos y actualizaciones incrementales. La emulación
 verifica corrección; la velocidad debe medirse en el Ryzen real.
 
 
-## Mittens CCRL: Intel, Windows y Linux
+## Mittens CCRL: Windows and Linux
 
-Las features `ccrl,intel-bmi2` preparan el motor para pruebas CCRL 40/15:
-`Mittens CCRL Windows` o `Mittens CCRL Linux`, `Hash=256` MiB, `Threads=1`,
-`Contempt=0`, `OwnBook=false` y `UseNNUE=true` al arrancar. En este perfil,
-`MITTENS_CON_LIBRO=1` no activa el libro por entorno; el operador conserva
-el control mediante UCI. NNUE de 1024 neuronas y 8 buckets embebida.
+The `ccrl` feature provides the tournament preset: UCI name `Mittens CCRL
+Windows` or `Mittens CCRL Linux`, `Hash=256` MiB, `Threads=1`, `Contempt=0`,
+`OwnBook=false` and `UseNNUE=true` at startup. The environment variable
+`MITTENS_CON_LIBRO=1` does not enable the book in this preset. The GUI can
+still configure options through UCI. The 1024-neuron, 8-output-bucket NNUE
+is embedded in the executable and enabled by default.
 
-Compilar para Intel Haswell, incluido el i7-4770K de referencia:
+Two CPU variants are available:
+
+| Variant | CPU requirements | NNUE and sliding attacks |
+|---|---|---|
+| Portable | x86-64 baseline with SSE2 | SSE2 NNUE; magic bitboards |
+| AVX2/BMI2 | x86-64-v3 and operating-system AVX support | AVX2 NNUE; PEXT/BMI2 attack lookup |
+
+Choose Portable when unsure which CPU extensions are available. The optimized
+variant uses the generic x86-64-v3 target, which includes AVX2, BMI1/BMI2,
+F16C, FMA, LZCNT, MOVBE, POPCNT and the preceding x86-64 feature levels.
+Both variants use the same source, network, settings and UCI name.
+
+Example Linux builds (musl target and linker must be installed):
 
 ```sh
-RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+bmi1,+bmi2,+lzcnt,+popcnt,+fma" \
+RUSTFLAGS="-C target-cpu=x86-64" \
+cargo build --release --locked --features ccrl --target x86_64-unknown-linux-musl --bin mittens
+
+RUSTFLAGS="-C target-cpu=x86-64-v3" \
 cargo build --release --locked --features ccrl,intel-bmi2 --target x86_64-unknown-linux-musl --bin mittens
 ```
 
-En Windows PowerShell, con MinGW disponible:
+For Windows PowerShell with a configured MinGW toolchain:
 
 ```powershell
-$env:RUSTFLAGS = "-C target-cpu=haswell -C target-feature=+avx2,+bmi1,+bmi2,+lzcnt,+popcnt,+fma"
+$env:RUSTFLAGS = "-C target-cpu=x86-64"
+cargo build --release --locked --features ccrl --target x86_64-pc-windows-gnu --bin mittens
+
+$env:RUSTFLAGS = "-C target-cpu=x86-64-v3"
 cargo build --release --locked --features ccrl,intel-bmi2 --target x86_64-pc-windows-gnu --bin mittens
 ```
 
-AVX2 ejecuta los kernels enteros de la NNUE. La feature `intel-bmi2` usa
-PEXT para indexar ataques de torres y alfiles; la tabla se construye con
-el mismo índice PEXT y se verifica contra ray-casting para todos los
-subconjuntos de bloqueos. POPCNT, TZCNT/BMI1 y LZCNT permiten al compilador
-especializar las operaciones de bitboards. FMA queda disponible al compilador;
-la NNUE Bullet usa aritmética entera. Los binarios requieren una CPU y un
-sistema operativo compatibles con Haswell/AVX2/BMI2. Las compilaciones sin
-`intel-bmi2` o sin BMI2 conservan magic bitboards. No se usa AVX-512.
+The internal feature name `intel-bmi2` enables PEXT whenever the x86-64
+build also enables BMI2. It is not a CPU-brand check. The attack table is
+built in PEXT order and exhaustively compared against independent ray
+casting. Other builds retain magic bitboards. The NNUE uses integer
+arithmetic; no speedup is attributed to unused floating-point instructions.
+AVX-512, VNNI and AMX are not enabled.
 
-Configurar la GUI con control **repetido** de 40 jugadas en 15 minutos,
-ajustado a la máquina con el benchmark de Stockfish 10 indicado por CCRL.
-Pondering OFF, `OwnBook=false`, aprendizaje de libro/posiciones OFF.
-Usar el mismo libro genérico para todos, máximo 12 jugadas por bando.
-Hash de 256 o 512 MiB por motor según el torneo; en la categoría de 4 CPU,
-hasta cuatro veces ese valor. El operador configura `Threads=1` o `Threads=4`.
-Las tablas Syzygy se indican en `SyzygyPath` y no se incluyen. El motor no
-expone un hash EGTB independiente: no confundir el hash de búsqueda con el
-ajuste EGTB de 32/64 MiB de las condiciones CCRL.
+### Portable NNUE: fused SSE2 evaluation
 
-Fuentes técnicas y condiciones:
+The portable x86-64 build fuses common accumulator updates with SCReLU and
+output evaluation, using SSE2 PADDW/PSUBW, PMULLW and PMADDWD instructions.
+It consumes updated neurons directly from registers while storing the child
+accumulator, avoiding a separate copy and output pass. Integer results remain
+exact: the two perspectives are reduced separately into i64. Null moves and
+less common update shapes retain the general fallback. The AVX2 and NEON
+paths remain available on their respective targets. No different network
+or additional CPU extensions are required for the SSE2 path.
 
-- [Intel i7-4770K / Haswell y AVX2](https://www.intel.com/content/www/us/en/products/sku/75123/intel-core-i74770k-processor-8m-cache-up-to-3-90-ghz/specifications.html)
-- [PEXT y BMI2 en Rust](https://doc.rust-lang.org/stable/core/arch/x86_64/fn._pext_u64.html)
-- [Manual de optimización Intel](https://cdrdv2-public.intel.com/814199/356477-Optimization-Reference-Manual-V2-002.pdf)
-- [Condiciones CCRL 40/15](https://computerchess.org.uk/4040/about.html)
+### CCRL 40/15 setup
+
+Configure a REPEATING time control of 40 moves in 15 minutes, calibrated for
+the tester's machine using Stockfish 10 as specified by CCRL. Pondering OFF,
+`OwnBook=false`, book and position learning OFF. Use the same generic book
+for all engines, with at most 12 moves per side. Set 256 or 512 MiB of search
+hash per single-CPU engine; for a 4-CPU entry, up to four times that amount.
+The operator selects `Threads=1` or `Threads=4`.
+
+Provide external Syzygy tables through `SyzygyPath`; no tablebases or opening
+book are included. There is no separate EGTB hash option: search Hash does
+not replace the 32/64 MiB EGTB setting in the CCRL conditions. Coordinate that
+requirement with the tester/controller. A package does not imply CCRL acceptance.
+
+References:
+
+- [PEXT/BMI2 in Rust](https://doc.rust-lang.org/stable/core/arch/x86_64/fn._pext_u64.html)
+- [SSE2 PMADDWD](https://doc.rust-lang.org/core/arch/x86_64/fn._mm_madd_epi16.html)
+- [CCRL 40/15 conditions](https://computerchess.org.uk/4040/about.html)
