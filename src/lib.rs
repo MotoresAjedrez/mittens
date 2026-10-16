@@ -1155,7 +1155,8 @@ fn aplicar_tope_operador(
 pub fn uci_loop() {
     let stdin = io::stdin();
     let mut board = Board::from_fen(STARTPOS).unwrap();
-    let mut tt_mb: usize = 64;
+    let hash_default: usize = if cfg!(feature = "ccrl") { 256 } else { 64 };
+    let mut tt_mb = hash_default;
     let mut move_overhead_ms: u64 = 75;
     // Tope duro de tiempo por jugada en ms; 0 = sin limite (comportamiento
     // historico). Pensado para partidas online donde interesa mover rapido.
@@ -1216,7 +1217,8 @@ pub fn uci_loop() {
     // equivalente por entorno de "setoption name OwnBook value true", para
     // scripts y puentes que no mandan setoption; MITTENS_SIN_LIBRO=1 se sigue
     // aceptando (ya era el comportamiento por defecto) y gana si estan las dos.
-    let usar_libro_inicial: bool = std::env::var("MITTENS_CON_LIBRO").as_deref() == Ok("1")
+    let usar_libro_inicial: bool = !cfg!(feature = "ccrl")
+        && std::env::var("MITTENS_CON_LIBRO").as_deref() == Ok("1")
         && std::env::var("MITTENS_SIN_LIBRO").as_deref() != Ok("1");
     polyglot::set_activo(usar_libro_inicial);
     // El camino de un hilo usa una TT local sin Mutex. Solo Lazy SMP necesita
@@ -1305,12 +1307,13 @@ pub fn uci_loop() {
                     } else {
                         std::env::consts::OS
                     };
-                    println!("id name Mittens CEDR {sistema}");
+                    let perfil = if cfg!(feature = "ccrl") { "CCRL" } else { "CEDR" };
+                    println!("id name Mittens {perfil} {sistema}");
                 } else {
                     println!("id name Mittens{}", if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) { " AVX2" } else { "" });
                 }
                 println!("id author Tavito y Claude");
-                println!("option name Hash type spin default 64 min 1 max 131072");
+                println!("option name Hash type spin default {hash_default} min 1 max 131072");
                 println!("option name Clear Hash type button");
                 println!("option name Move Overhead type spin default 75 min 0 max 5000");
                 println!("option name Contempt type spin default {} min 0 max 2000", search::CONTEMPT_DEFAULT);

@@ -1,8 +1,7 @@
 // Bitboards de 64 bits y tablas de ataques precalculadas.
-// Piezas deslizantes: ray-casting clásico (no magic bitboards) -- documentado
-// así explícitamente por decisión de tiempo: es más simple de verificar
-// correctamente con perft, al costo de menos nodos/s que magic bitboards.
-// Si hace falta más velocidad más adelante, este es el punto a optimizar.
+// Piezas deslizantes: magic bitboards, o PEXT en compilaciones Intel/BMI2.
+// El ray-casting se conserva como referencia independiente para construir
+// las tablas y verificar los ataques con todos los bloqueos relevantes.
 
 use crate::types::{Square, file_of, make_square, rank_of};
 use std::sync::OnceLock;
@@ -391,15 +390,17 @@ fn xorshift(state: &mut u64) -> u64 {
 
 fn build_magics() -> Magics {
     let mut table: Vec<Bitboard> = Vec::new();
+    #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut rook: Vec<MagicEntry> = Vec::with_capacity(64);
     let mut bishop: Vec<MagicEntry> = Vec::with_capacity(64);
 
-    for (es_torre, (dirs, out)) in [(true, (&ROOK_RAYS, &mut rook)), (false, (&BISHOP_RAYS, &mut bishop))] {
+    for (_es_torre, (dirs, out)) in [(true, (&ROOK_RAYS, &mut rook)), (false, (&BISHOP_RAYS, &mut bishop))] {
         for sq in 0..64u8 {
             let mask = relevant_mask(sq, dirs);
             let bits = popcount(mask);
             let size = 1usize << bits;
+            #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
             let shift = 64 - bits;
 
             // Todos los subconjuntos de la máscara (truco Carry-Rippler) con
@@ -418,42 +419,57 @@ fn build_magics() -> Magics {
 
             let offset = table.len();
             table.resize(offset + size, 0);
+            // PEXT empaqueta exactamente los bits relevantes en [0, size).
+            // La tabla debe construirse con el MISMO índice que el lookup;
+            // una tabla en orden mágico no puede consultarse con PEXT.
+            #[cfg(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2"))]
+            {
+                for (i, &occ) in occs.iter().enumerate() {
+                    // SAFETY: esta ruta solo se compila con target_feature=bmi2.
+                    let idx = unsafe { core::arch::x86_64::_pext_u64(occ, mask) } as usize;
+                    table[offset + idx] = refs[i];
+                }
+                out.push(MagicEntry { mask, magic: 0, shift: 0, offset });
+            }
             // Se toma el magico ya resuelto para esta casilla en vez de
             // buscarlo (ver la nota de MAGICOS_TORRE/MAGICOS_ALFIL arriba).
             // El bucle se conserva porque si algun magico precalculado no
             // sirviera, cae a la busqueda de siempre en vez de romperse.
-            let mut precalculado = Some(if es_torre { MAGICOS_TORRE[sq as usize] } else { MAGICOS_ALFIL[sq as usize] });
-            'busqueda: loop {
-                let magic = match precalculado.take() {
-                    Some(m) => m,
-                    // Candidato disperso (AND de tres aleatorios) -- converge rápido.
-                    None => xorshift(&mut rng) & xorshift(&mut rng) & xorshift(&mut rng),
-                };
-                if popcount(mask.wrapping_mul(magic) & 0xFF00_0000_0000_0000) < 6 {
-                    continue;
-                }
-                for e in table[offset..offset + size].iter_mut() {
-                    *e = 0;
-                }
-                let mut usado = vec![false; size];
-                for (i, &occ) in occs.iter().enumerate() {
-                    let idx = (occ.wrapping_mul(magic) >> shift) as usize;
-                    if usado[idx] {
-                        if table[offset + idx] != refs[i] {
-                            continue 'busqueda; // colisión destructiva: probar otro
-                        }
-                    } else {
-                        usado[idx] = true;
-                        table[offset + idx] = refs[i];
+            #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
+            {
+                let mut precalculado = Some(if _es_torre { MAGICOS_TORRE[sq as usize] } else { MAGICOS_ALFIL[sq as usize] });
+                'busqueda: loop {
+                    let magic = match precalculado.take() {
+                        Some(m) => m,
+                        // Candidato disperso (AND de tres aleatorios) -- converge rápido.
+                        None => xorshift(&mut rng) & xorshift(&mut rng) & xorshift(&mut rng),
+                    };
+                    if popcount(mask.wrapping_mul(magic) & 0xFF00_0000_0000_0000) < 6 {
+                        continue;
                     }
+                    for e in table[offset..offset + size].iter_mut() {
+                        *e = 0;
+                    }
+                    let mut usado = vec![false; size];
+                    for (i, &occ) in occs.iter().enumerate() {
+                        let idx = (occ.wrapping_mul(magic) >> shift) as usize;
+                        if usado[idx] {
+                            if table[offset + idx] != refs[i] {
+                                continue 'busqueda; // colisión destructiva: probar otro
+                            }
+                        } else {
+                            usado[idx] = true;
+                            table[offset + idx] = refs[i];
+                        }
+                    }
+                    out.push(MagicEntry {
+                        mask,
+                        magic,
+                        shift,
+                        offset,
+                    });
+                    break;
                 }
-                out.push(MagicEntry {
-                    mask,
-                    magic,
-                    shift,
-                    offset,
-                });
-                break;
             }
         }
     }
@@ -478,17 +494,30 @@ fn magics() -> &'static Magics {
 }
 
 #[inline(always)]
+fn slider_index(m: &MagicEntry, occupied: Bitboard) -> usize {
+    #[cfg(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        // SAFETY: esta ruta solo se compila con target_feature=bmi2.
+        unsafe { core::arch::x86_64::_pext_u64(occupied, m.mask) as usize }
+    }
+    #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        ((occupied & m.mask).wrapping_mul(m.magic) >> m.shift) as usize
+    }
+}
+
+#[inline(always)]
 pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let ms = magics();
     let m = &ms.rook[sq as usize];
-    ms.table[m.offset + ((occupied & m.mask).wrapping_mul(m.magic) >> m.shift) as usize]
+    ms.table[m.offset + slider_index(m, occupied)]
 }
 
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let ms = magics();
     let m = &ms.bishop[sq as usize];
-    ms.table[m.offset + ((occupied & m.mask).wrapping_mul(m.magic) >> m.shift) as usize]
+    ms.table[m.offset + slider_index(m, occupied)]
 }
 
 pub fn queen_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
@@ -707,6 +736,29 @@ mod pin_tests {
 #[cfg(test)]
 mod magic_tests {
     use super::*;
+
+    #[test]
+    fn todos_los_bloqueos_relevantes_coinciden_con_ray_casting() {
+        for (dirs, ataques) in [
+            (&ROOK_RAYS, rook_attacks as fn(Square, Bitboard) -> Bitboard),
+            (&BISHOP_RAYS, bishop_attacks as fn(Square, Bitboard) -> Bitboard),
+        ] {
+            for sq in 0..64u8 {
+                let mask = relevant_mask(sq, dirs);
+                let mut sub = 0u64;
+                loop {
+                    // Ocupación mínima y máxima fuera de la máscara: los
+                    // bits irrelevantes tampoco deben alterar el resultado.
+                    for occ in [sub, sub | !mask] {
+                        assert_eq!(ataques(sq, occ), slider_attacks_ref(sq, occ, dirs),
+                                   "sq={sq} occ={occ:#018x}");
+                    }
+                    sub = sub.wrapping_sub(mask) & mask;
+                    if sub == 0 { break; }
+                }
+            }
+        }
+    }
 
     #[test]
     fn magias_equivalen_a_ray_casting() {

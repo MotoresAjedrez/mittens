@@ -188,3 +188,52 @@ Syzygy de hasta 5 piezas, indicar la carpeta en `SyzygyPath`.
 Las pruebas de AVX2 comparan los resultados con el cálculo escalar exacto,
 incluidos pesos extremos y actualizaciones incrementales. La emulación
 verifica corrección; la velocidad debe medirse en el Ryzen real.
+
+
+## Mittens CCRL: Intel, Windows y Linux
+
+Las features `ccrl,intel-bmi2` preparan el motor para pruebas CCRL 40/15:
+`Mittens CCRL Windows` o `Mittens CCRL Linux`, `Hash=256` MiB, `Threads=1`,
+`Contempt=0`, `OwnBook=false` y `UseNNUE=true` al arrancar. En este perfil,
+`MITTENS_CON_LIBRO=1` no activa el libro por entorno; el operador conserva
+el control mediante UCI. NNUE de 1024 neuronas y 8 buckets embebida.
+
+Compilar para Intel Haswell, incluido el i7-4770K de referencia:
+
+```sh
+RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+bmi1,+bmi2,+lzcnt,+popcnt,+fma" \
+cargo build --release --locked --features ccrl,intel-bmi2 --target x86_64-unknown-linux-musl --bin mittens
+```
+
+En Windows PowerShell, con MinGW disponible:
+
+```powershell
+$env:RUSTFLAGS = "-C target-cpu=haswell -C target-feature=+avx2,+bmi1,+bmi2,+lzcnt,+popcnt,+fma"
+cargo build --release --locked --features ccrl,intel-bmi2 --target x86_64-pc-windows-gnu --bin mittens
+```
+
+AVX2 ejecuta los kernels enteros de la NNUE. La feature `intel-bmi2` usa
+PEXT para indexar ataques de torres y alfiles; la tabla se construye con
+el mismo índice PEXT y se verifica contra ray-casting para todos los
+subconjuntos de bloqueos. POPCNT, TZCNT/BMI1 y LZCNT permiten al compilador
+especializar las operaciones de bitboards. FMA queda disponible al compilador;
+la NNUE Bullet usa aritmética entera. Los binarios requieren una CPU y un
+sistema operativo compatibles con Haswell/AVX2/BMI2. Las compilaciones sin
+`intel-bmi2` o sin BMI2 conservan magic bitboards. No se usa AVX-512.
+
+Configurar la GUI con control **repetido** de 40 jugadas en 15 minutos,
+ajustado a la máquina con el benchmark de Stockfish 10 indicado por CCRL.
+Pondering OFF, `OwnBook=false`, aprendizaje de libro/posiciones OFF.
+Usar el mismo libro genérico para todos, máximo 12 jugadas por bando.
+Hash de 256 o 512 MiB por motor según el torneo; en la categoría de 4 CPU,
+hasta cuatro veces ese valor. El operador configura `Threads=1` o `Threads=4`.
+Las tablas Syzygy se indican en `SyzygyPath` y no se incluyen. El motor no
+expone un hash EGTB independiente: no confundir el hash de búsqueda con el
+ajuste EGTB de 32/64 MiB de las condiciones CCRL.
+
+Fuentes técnicas y condiciones:
+
+- [Intel i7-4770K / Haswell y AVX2](https://www.intel.com/content/www/us/en/products/sku/75123/intel-core-i74770k-processor-8m-cache-up-to-3-90-ghz/specifications.html)
+- [PEXT y BMI2 en Rust](https://doc.rust-lang.org/stable/core/arch/x86_64/fn._pext_u64.html)
+- [Manual de optimización Intel](https://cdrdv2-public.intel.com/814199/356477-Optimization-Reference-Manual-V2-002.pdf)
+- [Condiciones CCRL 40/15](https://computerchess.org.uk/4040/about.html)

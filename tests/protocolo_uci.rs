@@ -25,7 +25,12 @@ struct Motor {
 
 impl Motor {
     fn nuevo() -> Motor {
+        Self::con_entorno(&[])
+    }
+
+    fn con_entorno(vars: &[(&str, &str)]) -> Motor {
         let mut child = Command::new(BIN)
+            .envs(vars.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -78,6 +83,23 @@ impl Motor {
             }
         }
     }
+}
+
+#[cfg(feature = "ccrl")]
+#[test]
+fn ccrl_arranca_sin_libro_aunque_el_entorno_lo_solicite() {
+    let mut m = Motor::con_entorno(&[("MITTENS_CON_LIBRO", "1"), ("MITTENS_SIN_LIBRO", "0")]);
+    m.enviar("uci");
+    let (_, opciones) = m.esperar("uciok", Duration::from_secs(10));
+    assert!(opciones.iter().any(|s| s == "option name Hash type spin default 256 min 1 max 131072"));
+    assert!(opciones.iter().any(|s| s == "option name UseNNUE type check default true"));
+    assert!(opciones.iter().any(|s| s == "option name OwnBook type check default false"));
+    m.enviar("position startpos");
+    m.enviar("go movetime 150");
+    let (best, lineas) = m.esperar("bestmove", Duration::from_secs(10));
+    assert_ne!(best.trim(), "bestmove 0000");
+    assert!(lineas.iter().any(|s| s.starts_with("info depth ")), "el motor debe buscar por si mismo: {lineas:?}");
+    assert!(!lineas.iter().any(|s| s.contains("libro de aperturas embebido activo")), "el libro no debe activarse: {lineas:?}");
 }
 
 impl Drop for Motor {

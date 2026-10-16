@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [features]
 # Preset para torneos donde todas las tablas se valoran sin contempt.
 tournament = []
+# Perfil CCRL: nombre propio y Hash=256 MiB al arrancar.
+ccrl = ["tournament"]
+# Lookup PEXT para Intel con BMI2; otras arquitecturas conservan magic bitboards.
+intel-bmi2 = []
 
 [dependencies]
 arrayvec = "0.7.8"
