@@ -150,7 +150,7 @@ fn push_pawn_move(moves: &mut MoveList, from: Square, to: Square, is_promo: bool
     }
 }
 
-fn gen_castling(b: &Board, us: Color, moves: &mut MoveList, en_jaque: bool) {
+pub(crate) fn gen_castling(b: &Board, us: Color, moves: &mut MoveList, en_jaque: bool) {
     // Primero lo mas barato: si el bando ya perdio los dos derechos de
     // enroque no hay NADA que generar. Antes se llamaba a in_check() -- un
     // barrido completo de ataques al rey -- en cada nodo aunque los derechos
@@ -344,21 +344,6 @@ pub fn generate_captures_legal_into_con_jaque(b: &Board, moves: &mut MoveList, e
         !after.in_check(us)
     };
 
-    if en_jaque {
-        // No deberia llamarse en jaque (quiescence usa generate_legal para
-        // evasiones, que incluyen bloqueos silenciosos), pero se deja
-        // correcto por si se reutiliza en otro contexto.
-        generate_pseudo_legal_captures_into(b, moves);
-        moves.retain(|mv| {
-            if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
-                casilla_segura_para_rey(b, king_sq, mv.to, us)
-            } else {
-                camino_lento(mv)
-            }
-        });
-        return;
-    }
-
     let own = b.occupied_co[us as usize];
     let enemy_rook_like = b.pieces[them as usize][PieceType::Rook as usize]
         | b.pieces[them as usize][PieceType::Queen as usize];
@@ -366,15 +351,41 @@ pub fn generate_captures_legal_into_con_jaque(b: &Board, moves: &mut MoveList, e
         | b.pieces[them as usize][PieceType::Queen as usize];
     let pinned = pinned_pieces(king_sq, own, enemy_rook_like, enemy_bishop_like, b.occupied);
 
+    if en_jaque {
+        // No deberia llamarse en jaque (quiescence usa generate_legal para
+        // evasiones, que incluyen bloqueos silenciosos), pero se deja
+        // correcto por si se reutiliza en otro contexto.
+        let atacantes = b.attackers_to(king_sq, b.occupied) & b.occupied_co[them as usize];
+        let resuelven = if atacantes.count_ones() == 1 {
+            atacantes | crate::bitboard::between(king_sq, atacantes.trailing_zeros() as Square)
+        } else {
+            0
+        };
+        generate_pseudo_legal_captures_into(b, moves);
+        moves.retain(|mv| {
+            if mv.flag == MoveFlag::EnPassant {
+                camino_lento(mv)
+            } else if mv.from == king_sq {
+                casilla_segura_para_rey(b, king_sq, mv.to, us)
+            } else {
+                bit(mv.from) & pinned == 0 && bit(mv.to) & resuelven != 0
+            }
+        });
+        return;
+    }
+
     generate_pseudo_legal_captures_into(b, moves);
     moves.retain(|mv| {
         if bit(mv.from) & pinned == 0 && mv.from != king_sq && mv.flag != MoveFlag::EnPassant {
             return true;
         }
-        if mv.from == king_sq && mv.flag != MoveFlag::EnPassant {
+        if mv.flag == MoveFlag::EnPassant {
+            camino_lento(mv)
+        } else if mv.from == king_sq {
             casilla_segura_para_rey(b, king_sq, mv.to, us)
         } else {
-            camino_lento(mv)
+            crate::bitboard::between(king_sq, mv.from) & bit(mv.to) != 0
+                || crate::bitboard::between(king_sq, mv.to) & bit(mv.from) != 0
         }
     });
 }
@@ -395,7 +406,7 @@ pub fn generate_captures_legal_into_con_jaque(b: &Board, moves: &mut MoveList, e
 /// Vale igual estando en jaque o no: la única fuente de verdad es "¿`to` está
 /// atacada con el rey fuera del tablero?".
 #[inline]
-fn casilla_segura_para_rey(b: &Board, king_sq: Square, to: Square, us: Color) -> bool {
+pub(crate) fn casilla_segura_para_rey(b: &Board, king_sq: Square, to: Square, us: Color) -> bool {
     let them = us.opposite();
     let p = &b.pieces[them as usize];
     let sin_victima = !bit(to);

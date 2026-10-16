@@ -560,14 +560,6 @@ fn victima_de(b: &Board, mv: &Move) -> usize {
     }
 }
 
-/// Si el rival ya ataca `sq` ANTES de jugar el movimiento (tablero en la
-/// posicion actual). Usado para elegir la tabla de historial: una jugada
-/// silenciosa hacia una casilla amenazada tiene un significado tactico
-/// distinto de una hacia una casilla segura.
-#[inline]
-fn casilla_amenazada(b: &Board, sq: crate::types::Square) -> bool {
-    b.is_square_attacked_by(sq, b.turn.opposite())
-}
 
 /// Insertion sort ESTABLE de `moves[inicio..n]` por `claves[inicio..n]`
 /// (las dos listas se mueven en paralelo). Estable = claves iguales conservan
@@ -807,6 +799,159 @@ impl InfoJaque {
             return !alineada;
         }
         false
+    }
+
+    /// Genera en `moves` UNICAMENTE las jugadas legales silenciosas (sin captura
+    /// ni promocion) que dan jaque al rey rival, en el MISMO orden exacto que
+    /// `generate_legal_into_con_jaque(b, moves, false)` filtrado por
+    /// `!mv.is_capture() && mv.promotion.is_none() && self.da_jaque(b, &mv)`.
+    ///
+    /// Ahorra en cada nodo `qdepth == 0` de quiescence:
+    ///  - generar capturas y promociones que ya fueron probadas;
+    ///  - iterar casillas destino de piezas no descubridoras fuera de `directo[pt]`;
+    ///  - generar y legalizar jugadas de rey cuando el rey no es descubridor;
+    ///  - calcular `pinned_pieces` cuando no existe ningun jaque silencioso.
+    #[inline]
+    fn generar_jaques_quietos_legales_into(&self, b: &Board, moves: &mut MoveList) {
+        use crate::bitboard::{
+            between, bishop_attacks, bit, king_attacks, knight_attacks, pinned_pieces, pop_lsb,
+            queen_attacks, rook_attacks,
+        };
+        use crate::types::{Color, file_of, make_square, rank_of};
+
+        let us = b.turn;
+        let them = us.opposite();
+        let occ = b.occupied;
+        let king_sq = b.king_square(us);
+        let mut pinned: Option<u64> = None;
+
+        let mut es_legal_pieza = |from: u8, to: u8| -> bool {
+            let pin = *pinned.get_or_insert_with(|| {
+                pinned_pieces(
+                    king_sq,
+                    b.occupied_co[us as usize],
+                    b.pieces[them as usize][PieceType::Rook as usize]
+                        | b.pieces[them as usize][PieceType::Queen as usize],
+                    b.pieces[them as usize][PieceType::Bishop as usize]
+                        | b.pieces[them as usize][PieceType::Queen as usize],
+                    occ,
+                )
+            });
+            bit(from) & pin == 0
+                || between(king_sq, from) & bit(to) != 0
+                || between(king_sq, to) & bit(from) != 0
+        };
+
+        let da_jaque_pieza = |pt: PieceType, from: u8, to: u8| -> bool {
+            if self.directo[pt as usize] & bit(to) != 0 {
+                return true;
+            }
+            if self.descubridoras & bit(from) != 0 {
+                let k = self.ksq;
+                let alineada = between(k, to) & bit(from) != 0
+                    || between(k, from) & bit(to) != 0
+                    || between(from, to) & bit(k) != 0;
+                return !alineada;
+            }
+            false
+        };
+
+        // 1. Peones (solo avances simples sin coronar y dobles)
+        let dir_peon = self.directo[PieceType::Pawn as usize];
+        let (push_dir, start_rank, promo_rank, mask_dir): (i32, u8, u8, u64) = match us {
+            Color::White => (1, 1, 7, (dir_peon >> 8) | (dir_peon >> 16)),
+            Color::Black => (-1, 6, 0, (dir_peon << 8) | (dir_peon << 16)),
+        };
+        let mut pawns =
+            b.pieces[us as usize][PieceType::Pawn as usize] & (self.descubridoras | mask_dir);
+        while pawns != 0 {
+            let from = pop_lsb(&mut pawns);
+            let f = file_of(from) as i32;
+            let r = rank_of(from) as i32;
+            let one_rank = r + push_dir;
+            if (0..8).contains(&one_rank) {
+                let to = make_square(f as u8, one_rank as u8);
+                if bit(to) & occ == 0 {
+                    if promo_rank != one_rank as u8
+                        && da_jaque_pieza(PieceType::Pawn, from, to)
+                        && es_legal_pieza(from, to)
+                    {
+                        moves.push(Move::new(from, to, None, MoveFlag::Quiet));
+                    }
+                    if rank_of(from) == start_rank {
+                        let two_rank = r + 2 * push_dir;
+                        let to2 = make_square(f as u8, two_rank as u8);
+                        if bit(to2) & occ == 0
+                            && da_jaque_pieza(PieceType::Pawn, from, to2)
+                            && es_legal_pieza(from, to2)
+                        {
+                            moves.push(Move::new(from, to2, None, MoveFlag::DoublePush));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Caballos, alfiles, torres y damas
+        let mut gen_pieza = |pt: PieceType, attacks_fn: fn(u8, u64) -> u64| {
+            let dir_pt = self.directo[pt as usize] & !occ;
+            let mut pieces = b.pieces[us as usize][pt as usize];
+            if pieces & self.descubridoras == 0 && dir_pt == 0 {
+                return;
+            }
+            while pieces != 0 {
+                let from = pop_lsb(&mut pieces);
+                if self.descubridoras & bit(from) == 0 {
+                    let mut targets = attacks_fn(from, occ) & dir_pt;
+                    while targets != 0 {
+                        let to = pop_lsb(&mut targets);
+                        if es_legal_pieza(from, to) {
+                            moves.push(Move::new(from, to, None, MoveFlag::Quiet));
+                        }
+                    }
+                } else {
+                    let mut targets = attacks_fn(from, occ) & !occ;
+                    while targets != 0 {
+                        let to = pop_lsb(&mut targets);
+                        if da_jaque_pieza(pt, from, to) && es_legal_pieza(from, to) {
+                            moves.push(Move::new(from, to, None, MoveFlag::Quiet));
+                        }
+                    }
+                }
+            }
+        };
+        gen_pieza(PieceType::Knight, |sq, _| knight_attacks(sq));
+        gen_pieza(PieceType::Bishop, bishop_attacks);
+        gen_pieza(PieceType::Rook, rook_attacks);
+        gen_pieza(PieceType::Queen, queen_attacks);
+
+        // 3. Rey (solo puede dar jaque si es pieza descubridora)
+        if self.descubridoras & bit(king_sq) != 0 {
+            let mut targets = king_attacks(king_sq) & !occ;
+            while targets != 0 {
+                let to = pop_lsb(&mut targets);
+                if da_jaque_pieza(PieceType::King, king_sq, to)
+                    && crate::movegen::casilla_segura_para_rey(b, king_sq, to, us)
+                {
+                    moves.push(Move::new(king_sq, to, None, MoveFlag::Quiet));
+                }
+            }
+        }
+
+        // 4. Enroque (ya sale legalizado de gen_castling)
+        if b.castling_rights != 0 {
+            let antes = moves.len();
+            crate::movegen::gen_castling(b, us, moves, false);
+            let mut w = antes;
+            for i in antes..moves.len() {
+                let mv = moves[i];
+                if self.da_jaque(b, &mv) {
+                    moves[w] = mv;
+                    w += 1;
+                }
+            }
+            moves.truncate(w);
+        }
     }
 }
 
@@ -1748,6 +1893,7 @@ impl Searcher {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn registrar_corte(
         &mut self,
         b: &Board,
@@ -1757,6 +1903,7 @@ impl Searcher {
         prev: Option<(usize, usize)>,
         prev2: Option<(usize, usize)>,
         pt_mv: usize,
+        dest_amenazada: bool,
     ) {
         if mv.is_capture() {
             // Las capturas tienen su propia tabla: el orden grueso lo sigue
@@ -1775,7 +1922,7 @@ impl Searcher {
                 k[0] = Some(mv);
             }
         }
-        if casilla_amenazada(b, mv.to) {
+        if dest_amenazada {
             hist_update(
                 &mut self.history_amenaza[mv.from as usize][mv.to as usize],
                 hist_bonus(depth),
@@ -2276,7 +2423,8 @@ impl Searcher {
         // debe asignar un Vec por nodo solo para conservar el SEE calculado.
         let mut moves: ArrayVec<(Move, Option<i32>), MAX_MOVES> = ArrayVec::new();
         for mv in capturas.iter().copied() {
-            let see = mv.is_capture().then(|| crate::see::see(b, &mv));
+            let see = (mv.is_capture() && !mv.promotion.is_some_and(|p| p != PieceType::Queen))
+                .then(|| crate::see::see(b, &mv));
             moves.push((mv, see));
         }
         // En quiescence la poda SEE se aplica despues del ordenamiento. Llevar
@@ -2379,17 +2527,12 @@ impl Searcher {
         if qdepth == 0 && qsearch_jaques_quietos() && alpha < beta && stand_pat + 150 > alpha {
             let mut jaques_probados = 0usize;
             let mut jaques_lista = MoveList::new();
-            generate_legal_into_con_jaque(b, &mut jaques_lista, false);
+            info_j
+                .get_or_insert_with(|| InfoJaque::nueva(b))
+                .generar_jaques_quietos_legales_into(b, &mut jaques_lista);
             for mv in jaques_lista.iter().copied() {
                 if jaques_probados >= 5 {
                     break;
-                }
-                // Las capturas/promociones ya se probaron arriba.
-                if mv.is_capture() || mv.promotion.is_some() {
-                    continue;
-                }
-                if !info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, &mv) {
-                    continue;
                 }
                 // Filtro barato antes del caro: SEE solo sobre las que ya
                 // dan jaque. Descarta jaques que regalan material sin
@@ -2819,33 +2962,31 @@ impl Searcher {
             let saltar_probcut = tt_entry_full
                 .as_ref()
                 .is_some_and(|e| e.depth >= sdepth_guarda && e.score < probcut_beta);
-            let mut capturas = MoveList::new();
-            generate_captures_legal_into_con_jaque(b, &mut capturas, false);
-            if saltar_probcut {
-                capturas.clear();
-            }
-            // Igual que en quiescence: calcular el SEE una sola vez por
-            // captura y llevarlo junto a la jugada evita recalcularlo para
-            // ordenar y de nuevo para el filtro de abajo.
-            let mut capturas_see: ArrayVec<(Move, i32), MAX_MOVES> = ArrayVec::new();
-            for mv in &capturas {
-                capturas_see.push((*mv, crate::see::see(b, mv)));
-            }
-            capturas_see.sort_by_key(|(_, see)| -see);
-            let sdepth = (depth - 4).max(1);
-            let mut probcut_corto = false;
-            let mut probcut_score = 0;
-            let mut probcut_move: Option<Move> = None;
-            for (mv, see) in &capturas_see {
-                if *see < 0 {
-                    continue;
+            if !saltar_probcut {
+                let mut capturas = MoveList::new();
+                generate_captures_legal_into_con_jaque(b, &mut capturas, false);
+                // Igual que en quiescence: calcular el SEE una sola vez por
+                // captura y llevarlo junto a la jugada evita recalcularlo para
+                // ordenar y de nuevo para el filtro de abajo.
+                let mut capturas_see: ArrayVec<(Move, i32), MAX_MOVES> = ArrayVec::new();
+                for mv in &capturas {
+                    let see = crate::see::see(b, mv);
+                    if see >= 0 {
+                        capturas_see.push((*mv, see));
+                    }
                 }
-                let next = b.make_move(mv);
-                self.tt_prefetch(next.zobrist);
-                crate::eval_cache::prefetch(next.zobrist);
-                if next.in_check(next.turn) {
-                    continue;
-                }
+                capturas_see.sort_by_key(|(_, see)| -see);
+                let sdepth = (depth - 4).max(1);
+                let mut probcut_corto = false;
+                let mut probcut_score = 0;
+                let mut probcut_move: Option<Move> = None;
+                for (mv, _) in &capturas_see {
+                    let next = b.make_move(mv);
+                    self.tt_prefetch(next.zobrist);
+                    crate::eval_cache::prefetch(next.zobrist);
+                    if next.in_check(next.turn) {
+                        continue;
+                    }
                 let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, sdepth);
                 let res_rapido =
                     self.quiescence(&next, &next_eval, -probcut_beta, -probcut_beta + 1, ply + 1, 0);
@@ -2904,6 +3045,7 @@ impl Searcher {
                 );
                 self.path_len = self.path_len.saturating_sub(1);
                 return Ok(probcut_score);
+            }
             }
         }
 
@@ -3135,21 +3277,24 @@ impl Searcher {
         // que la sonda las pise. Como efecto lateral, las claves salen con el
         // history/killers ya actualizados por la sonda, que es informacion mas
         // fresca.
-        {
-            let mut amenazas: Option<u64> = None;
-            for j in 0..n_moves {
-                let mv_j = &moves[j];
-                // SEE calculado UNA sola vez aca (paso 2 del SEE deduplicado)
-                // y reutilizado tanto por clave_orden_movimiento como por el
-                // SEE-prune mas abajo en el bucle principal. Centinela
-                // i32::MIN para jugadas que no son capturas.
-                let see_j = mv_j.is_capture().then(|| crate::see::see(b, mv_j));
-                let k = self.clave_orden_movimiento(
-                    b, mv_j, tt_move, ply, prev, prev2, see_j, &mut amenazas,
-                );
-                self.claves_negamax[pl_claves][j] = k;
-                self.see_negamax[pl_claves][j] = see_j.unwrap_or(i32::MIN);
-            }
+        let mut amenazas: Option<u64> = None;
+        for j in 0..n_moves {
+            let mv_j = &moves[j];
+            // SEE calculado UNA sola vez aca (paso 2 del SEE deduplicado)
+            // y reutilizado tanto por clave_orden_movimiento como por el
+            // SEE-prune mas abajo en el bucle principal. Centinela
+            // i32::MIN para jugadas que no son capturas, para tt_move
+            // (siempre queda en idx 0 donde nunca se lee see_negamax) y
+            // para sub-promociones (tampoco leen see_negamax).
+            let see_j = (mv_j.is_capture()
+                && Some(*mv_j) != tt_move
+                && !mv_j.promotion.is_some_and(|p| p != PieceType::Queen))
+            .then(|| crate::see::see(b, mv_j));
+            let k = self.clave_orden_movimiento(
+                b, mv_j, tt_move, ply, prev, prev2, see_j, &mut amenazas,
+            );
+            self.claves_negamax[pl_claves][j] = k;
+            self.see_negamax[pl_claves][j] = see_j.unwrap_or(i32::MIN);
         }
         let mut lista_ordenada = false;
 
@@ -3393,7 +3538,8 @@ impl Searcher {
                 let lmr_depth = (depth - r_est).max(0);
                 if lmr_depth <= 6 {
                     let pt_q = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
-                    let h = if casilla_amenazada(b, mv.to) {
+                    let mapa = *amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
+                    let h = if crate::bitboard::bit(mv.to) & mapa != 0 {
                         self.history_amenaza[mv.from as usize][mv.to as usize]
                     } else {
                         self.history[mv.from as usize][mv.to as usize]
@@ -3459,7 +3605,7 @@ impl Searcher {
                         _ => PieceType::King,
                     }) * 8 / 5;
                     if ev + 450 + 400 * lmr_depth + victima <= alpha
-                        && !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv))
+                        && !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv))
                     {
                         continue;
                     }
@@ -3510,21 +3656,26 @@ impl Searcher {
                 }
             }
 
+            let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
+            let dest_amenazada = if !mv.is_capture() {
+                let mapa = *amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
+                crate::bitboard::bit(mv.to) & mapa != 0
+            } else {
+                false
+            };
+
             // Registrar esta quiet como "buscada" ANTES de buscarla, para
             // poder penalizarla si otra jugada posterior causa el corte.
             if !mv.is_capture() && mv.promotion.is_none() && n_quiets_buscados < 64 {
-                quiets_buscados[n_quiets_buscados] =
-                    (mv.from, mv.to, casilla_amenazada(b, mv.to));
+                quiets_buscados[n_quiets_buscados] = (mv.from, mv.to, dest_amenazada);
                 n_quiets_buscados += 1;
             }
             if mv.is_capture() && n_capts_buscadas < 32 {
-                let pt_c = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                 capts_buscadas[n_capts_buscadas] =
-                    (pt_c as u8, mv.to, victima_de(b, mv) as u8);
+                    (pt_mv as u8, mv.to, victima_de(b, mv) as u8);
                 n_capts_buscadas += 1;
             }
 
-            let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
             self.tt_prefetch(next.zobrist);
             crate::eval_cache::prefetch(next.zobrist);
@@ -3558,7 +3709,11 @@ impl Searcher {
             // Se calcula el resultado como Result SIN aplicar `?` todavia:
             // el undo del acumulador NNUE tiene que correr en todos los
             // caminos, incluido el corte por tiempo.
-            let sc_res: Result<i32, TimeUp> = if es_reducible && !next.in_check(next.turn) {
+            let sc_res: Result<i32, TimeUp> = if es_reducible
+                && !*da_jaque.get_or_insert_with(|| {
+                    info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv)
+                })
+            {
                 self.lmr_intentos += 1;
                 // Reduccion tablada + ajustes contextuales (PV / historia /
                 // improving / capturas con SEE malo). Nunca menos de 1 ply
@@ -3592,7 +3747,7 @@ impl Searcher {
                     // el history principal pesa el doble que cada
                     // continuation history. Se suma tambien cont_history_2
                     // (follow-up a 2 plies), que antes no se usaba aca.
-                    let h = if casilla_amenazada(b, mv.to) {
+                    let h = if dest_amenazada {
                         self.history_amenaza[mv.from as usize][mv.to as usize]
                     } else {
                         self.history[mv.from as usize][mv.to as usize]
@@ -3781,7 +3936,7 @@ impl Searcher {
                 alpha = sc;
             }
             if alpha >= beta {
-                self.registrar_corte(b, *mv, ply, depth, prev, prev2, pt_mv);
+                self.registrar_corte(b, *mv, ply, depth, prev, prev2, pt_mv, dest_amenazada);
                 // History malus: las quiets buscadas antes de esta (que no
                 // cortaron) se penalizan con la misma magnitud del bonus que
                 // recibe la que si corto. Asi el ordenamiento distingue quiets
@@ -3795,9 +3950,8 @@ impl Searcher {
                 // sin exito fallaron igual en ambos casos.
                 {
                     let malus = hist_bonus(depth);
-                    let pt_cortante = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
                     let cortante = if mv.is_capture() {
-                        Some((pt_cortante as u8, mv.to, victima_de(b, mv) as u8))
+                        Some((pt_mv as u8, mv.to, victima_de(b, mv) as u8))
                     } else {
                         None
                     };
