@@ -1977,6 +1977,7 @@ pub fn uci_loop() {
                     // camino de un hilo: propiedad exclusiva, sin locks.
                     let mut pool = pool_slot.take().unwrap_or_else(search::PoolMemoriaSMP::nuevo);
                     let handle = std::thread::spawn(move || {
+                        request_macos_qos();
                         let t0 = std::time::Instant::now();
                         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
                             &board_copy,
@@ -2028,6 +2029,7 @@ pub fn uci_loop() {
                     s.root_moves_filtro = searchmoves_filtro.clone();
                     s.nodes_limit = nodes_limit;
                     let handle = std::thread::spawn(move || {
+                        request_macos_qos();
                         let (mv, _sc, _) =
                             s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms, pv| {
                                 let pv_txt =
@@ -2162,7 +2164,21 @@ mod tests {
 /// exponia un `rlib` que el binario pudiera enlazar. Cada arreglo habia que
 /// aplicarlo DOS veces y ya habian divergido de hecho (la copia de lib.rs se
 /// habia quedado sin MultiPV). Ahora hay una sola copia.
+#[cfg(target_os = "macos")]
+pub fn request_macos_qos() {
+    unsafe {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        pthread_set_qos_class_self_np(0x19, 0); // QOS_CLASS_USER_INITIATED
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_macos_qos() {}
+
 pub fn run_cli() {
+    request_macos_qos();
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {

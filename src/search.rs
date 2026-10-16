@@ -4957,6 +4957,7 @@ pub fn buscar_lazy_smp(
             // resultado: durante la busqueda tiene un unico dueño, sin locks.
             let memoria = pool.tomar(i);
             std::thread::spawn(move || {
+                crate::request_macos_qos();
                 let mut s = Searcher::new_con_tt_compartida(tt, tt_mask, modo_lmr);
                 s.instalar_memoria(memoria);
                 s.set_tt_generacion(generacion);
