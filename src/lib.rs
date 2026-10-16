@@ -42,12 +42,20 @@ use types::{Move, MoveFlag, PieceType};
 /// rango normal, que es donde de verdad se leen las evaluaciones; las
 /// ventajas decisivas seguiran reportandose algo altas.
 ///
-/// El origen de la inflacion es que `evaluate_with_state` suma la clasica
-/// COMPLETA y la red bullet COMPLETA (ambas evaluan la posicion entera), asi
-/// que el material se cuenta dos veces. Eso NO es un bug de fuerza: medido,
-/// el modo "red pura" busca ~1.4 plies menos hondo a 3s y un h2h previo lo
-/// dio peor (55.0% contra 63.3%). Los margenes de poda se afinaron dentro de
-/// esta escala y son consistentes con ella.
+/// El origen de la inflacion es simplemente `peso_bullet` = 1.6 (neural.rs),
+/// que multiplica la salida de la red. NO es que se sumen dos evaluaciones:
+/// con la configuracion por defecto el modo "red pura" esta ACTIVO
+/// (`bullet_pura()` es true si MITTENS_BULLET_PURA no vale 0/false), asi que
+/// `evaluate_with_state` devuelve `1.6 * red + TEMPO` y la eval clasica no
+/// entra en el puntaje de ningun nodo. (Este parrafo antes afirmaba que se
+/// sumaban la clasica COMPLETA y la red COMPLETA y que el material se
+/// contaba dos veces; eso describia una version anterior del motor y ya no
+/// es cierto. Se corrige porque esa premisa falsa hace perder dias midiendo
+/// terminos de un evaluador que esta apagado.)
+///
+/// Nada de esto es un bug de fuerza: los margenes de poda se afinaron dentro
+/// de esta escala y son consistentes con ella, y ya se midio que
+/// "normalizarla" globalmente pierde Elo.
 ///
 /// Por eso este ajuste es SOLO de presentacion: se aplica al imprimir y a
 /// nada mas. La busqueda, los margenes y las ventanas de aspiracion siguen
@@ -1303,7 +1311,13 @@ pub fn uci_loop() {
                 println!("option name OwnBook type check default false");
                 println!("option name UseNNUE type check default true");
                 println!("option name NNUEPath type string default <empty>");
-                println!("option name UseNN type check default false");
+                // UseNN es un alias historico de UseNNUE: el handler de
+                // setoption escribe el MISMO estado con los dos nombres. Se
+                // sigue aceptando por compatibilidad, pero ya no se anuncia:
+                // anunciarlo declaraba un segundo check para el mismo booleano
+                // y con default opuesto (false), asi que un GUI que reenvia los
+                // defaults que el motor publica (Arena y varios puentes)
+                // terminaba apagando la NNUE en silencio.
                 println!("option name NNPath type string default <empty>");
                 println!("option name QSearchNNUE type check default true");
                 println!("option name NNUEClassicalDepth type spin default 0 min 0 max 4");
@@ -1414,6 +1428,8 @@ pub fn uci_loop() {
                                 ),
                             }
                         }
+                    // "usenn" es el alias historico de "usennue": se acepta pero
+                    // ya no se anuncia en `uci` (ver comentario alli).
                     } else if (nombre.eq_ignore_ascii_case("usennue")
                         || nombre.eq_ignore_ascii_case("usenn"))
                         && let Some(v) = valor
