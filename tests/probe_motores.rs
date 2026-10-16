@@ -155,6 +155,7 @@ fn resumir(r: &Resultado) {
 }
 
 #[test]
+#[ignore = "prueba informativa: requiere motores externos; ejecutar con --ignored"]
 fn sonda_movetime_2000() {
     let motores = [
         "Bufanda", "Termo", "Jabon", "Cesped", "Escoba", "Musgo", "Mittens",
@@ -168,6 +169,7 @@ fn sonda_movetime_2000() {
 }
 
 #[test]
+#[ignore = "prueba informativa: requiere motores externos; ejecutar con --ignored"]
 fn sonda_reloj_real_bufanda_termo() {
     for m in ["Bufanda", "Termo", "Jabon"] {
         match sondear(m, "go wtime 2000 btime 2000 winc 200 binc 200") {

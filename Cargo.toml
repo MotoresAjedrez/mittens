@@ -9,6 +9,10 @@ name = "mimotor_core"
 crate-type = ["rlib", "staticlib", "cdylib"]
 path = "src/lib.rs"
 
+[features]
+# Preset para torneos donde todas las tablas se valoran sin contempt.
+tournament = []
+
 [dependencies]
 arrayvec = "0.7.8"
 rand = "0.10.2"

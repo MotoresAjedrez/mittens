@@ -13,7 +13,7 @@ use crate::movegen::{
 };
 use crate::types::{Move, MoveFlag, PieceType};
 use arrayvec::ArrayVec;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -36,12 +36,22 @@ const MAX_PATH: usize = 512;
 // guardarla en la TT igual que cualquier otro puntaje.
 const CONTEMPT_UMBRAL: i32 = 500;
 const CONTEMPT_PENALIZACION: i32 = 200;
+pub const CONTEMPT_DEFAULT: i32 = if cfg!(feature = "tournament") { 0 } else { CONTEMPT_PENALIZACION };
+static CONTEMPT: AtomicI32 = AtomicI32::new(CONTEMPT_DEFAULT);
+
+pub fn fijar_contempt(valor: i32) {
+    CONTEMPT.store(valor.clamp(0, 2000), Ordering::Relaxed);
+}
 
 fn draw_score(
     b: &Board,
     eval_state: &EvalState,
     nnue: Option<&crate::neural::NnueAccumulator>,
 ) -> i32 {
+    let penalizacion = CONTEMPT.load(Ordering::Relaxed);
+    if penalizacion == 0 {
+        return 0;
+    }
     // Para decidir el signo del contempt en tablas (repeticion/regla de 50)
     // solo importa si la posicion esta CLARAMENTE ganada o perdida (fuera
     // del umbral). Se consulta la MISMA evaluacion con la que juega el motor,
@@ -59,9 +69,9 @@ fn draw_score(
     //     su capa de salida sobre el acumulador que ya viene actualizado.
     let se = evaluate_with_state(b, eval_state, nnue);
     if se > CONTEMPT_UMBRAL {
-        -CONTEMPT_PENALIZACION
+        -penalizacion
     } else if se < -CONTEMPT_UMBRAL {
-        CONTEMPT_PENALIZACION
+        penalizacion
     } else {
         0
     }
@@ -1202,6 +1212,47 @@ pub fn limpiar_tt(tt: &SharedTT) {
     }
 }
 
+/// Lee una PV sin reservar histories ni buffers de un Searcher. En SMP la
+/// primera jugada se fija a la elegida por la votacion, ya que la ultima
+/// entrada raiz de la TT puede pertenecer a otro hilo.
+pub fn extraer_pv_tt(
+    tt: &SharedTT,
+    mask: usize,
+    b: &Board,
+    max_len: usize,
+    primera: Option<Move>,
+) -> Vec<Move> {
+    let mut pv = Vec::with_capacity(max_len);
+    let mut vistos = Vec::with_capacity(max_len);
+    let mut actual = *b;
+    for i in 0..max_len {
+        if vistos.contains(&actual.zobrist) {
+            break;
+        }
+        vistos.push(actual.zobrist);
+        let guardada = || {
+            tt.get((actual.zobrist as usize) & mask)?
+                .0
+                .iter()
+                .find_map(|slot| tt_desempaquetar(slot.load(Ordering::Relaxed), actual.zobrist))
+                .and_then(|e| e.best)
+        };
+        let Some(mv) = (if i == 0 {
+            primera.or_else(guardada)
+        } else {
+            guardada()
+        }) else {
+            break;
+        };
+        if !generate_legal(&actual).contains(&mv) {
+            break;
+        }
+        pv.push(mv);
+        actual = actual.make_move(&mv);
+    }
+    pv
+}
+
 pub struct Searcher {
     tt: Arc<SharedTT>,
     tt_mask: usize,
@@ -1960,25 +2011,7 @@ impl Searcher {
     /// Uso: solo para mostrar informacion (modo "simple", UCI "info pv"),
     /// no participa de la busqueda en si.
     pub fn extraer_pv(&self, b: &Board, max_len: usize) -> Vec<Move> {
-        let mut pv = Vec::with_capacity(max_len);
-        let mut vistos = Vec::with_capacity(max_len);
-        let mut actual = *b;
-        for _ in 0..max_len {
-            if vistos.contains(&actual.zobrist) {
-                break;
-            }
-            vistos.push(actual.zobrist);
-            let mv = match self.tt_probe(actual.zobrist).and_then(|e| e.best) {
-                Some(mv) => mv,
-                None => break,
-            };
-            if !generate_legal(&actual).contains(&mv) {
-                break;
-            }
-            pv.push(mv);
-            actual = actual.make_move(&mv);
-        }
-        pv
+        extraer_pv_tt(&self.tt, self.tt_mask, b, max_len, None)
     }
 
     /// Indice de CUBETA para `key` (bits bajos). La verificacion usa los 15
@@ -2302,9 +2335,11 @@ impl Searcher {
         qdepth: i32,
     ) -> Result<i32, TimeUp> {
         self.check_time()?;
-        // Quiescence también puede cruzar una secuencia de 50 plies sin
-        // captura ni peón. No usar el stand-pat allí: por regla es tablas.
+        // El mate termina la partida antes de un posible reclamo de tablas.
         if b.halfmove_clock >= 100 {
+            if b.in_check(b.turn) && !crate::movegen::existe_jugada_legal_con_jaque(b, true) {
+                return Ok(-MATE + ply as i32);
+            }
             return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
         }
 
@@ -2395,10 +2430,15 @@ impl Searcher {
             let raw = self.evaluar_quiescence(b, eval_state);
             self.eval_corregida(b, raw, None)
         };
-        if ply >= MAX_PLY {
-            return Ok(stand_pat);
-        }
-        if stand_pat >= beta {
+        if ply >= MAX_PLY || stand_pat >= beta {
+            // Stand-pat solo es valido si hay alguna jugada legal. Un
+            // ahogado con eval positiva no puede producir un corte beta.
+            if !crate::movegen::existe_jugada_legal_con_jaque(b, false) {
+                return Ok(0);
+            }
+            if ply >= MAX_PLY {
+                return Ok(stand_pat);
+            }
             self.tt_store(key, 0, stand_pat, ply, TTFlag::Beta, None, false);
             // Fail-soft: se devuelve el valor real (lo mismo que se guardo en
             // la TT), no beta.
@@ -2644,6 +2684,9 @@ impl Searcher {
         };
 
         if b.halfmove_clock >= 100 {
+            if b.in_check(b.turn) && !crate::movegen::existe_jugada_legal_con_jaque(b, true) {
+                return Ok(-MATE + ply as i32);
+            }
             return Ok(draw_score(b, eval_state, self.nnue_de(eval_state)));
         }
 
@@ -4135,6 +4178,9 @@ impl Searcher {
         // y el UCI imprimia "bestmove 0000" en cualquier posicion repetida,
         // perdiendo la partida. Ahora se busca normalmente y solo se
         // SOBRESCRIBE el score al final.
+        if !crate::movegen::existe_jugada_legal(b) {
+            return (None, if b.in_check(b.turn) { -MATE } else { 0 }, self.nodes);
+        }
         let raiz_tablas = self.posicion_raiz_tablas(b);
         let sc_tablas = draw_score(b, &root_eval, self.nnue_de(&root_eval));
         let mut mejor_mv = None;
@@ -4315,6 +4361,11 @@ impl Searcher {
         // "bestmove 0000" (equivalente a abandonar) en cualquier posicion
         // repetida o con la regla de 50 cumplida. Se sigue buscando una
         // jugada normal y solo se sobrescribe el score reportado.
+        if !crate::movegen::existe_jugada_legal(b) {
+            let score = if b.in_check(b.turn) { -MATE } else { 0 };
+            on_info(0, score, 0, 0, &[]);
+            return (None, score, 0);
+        }
         let raiz_tablas = self.posicion_raiz_tablas(b);
         let sc_tablas = draw_score(b, &root_eval, self.nnue_de(&root_eval));
 
@@ -6271,5 +6322,76 @@ mod validacion_movegen_from_to {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod regresiones_terminales {
+    use super::*;
+
+    #[test]
+    fn profundidad_fija_resuelve_terminales_antes_de_tablas_reclamables() {
+        for (fen, esperado) in [
+            ("7k/6Q1/5K2/8/8/8/8/8 b - - 100 1", -MATE),
+            ("1n6/1P6/1P6/1P6/1P6/1P5p/1P3k1P/7K w - - 0 1", 0),
+        ] {
+            let b = Board::from_fen(fen).unwrap();
+            let mut s = Searcher::new(1);
+            let (mv, score, _) = s.search_fixed_depth(&b, 4);
+            assert!(mv.is_none());
+            assert_eq!(score, esperado);
+        }
+    }
+
+    #[test]
+    fn stalemate_must_be_zero_in_a_narrow_window() {
+        let b = Board::from_fen("1n6/1P6/1P6/1P6/1P6/1P5p/1P3k1P/7K w - - 0 1").unwrap();
+        assert!(!b.in_check(b.turn));
+        assert!(generate_legal(&b).is_empty());
+        let es = crear_eval_state(&b);
+        let mut s = Searcher::new(1);
+        let raw = s.evaluar_quiescence(&b, &es);
+        assert!(raw > 0, "test requires positive evaluation, got {raw}");
+        let beta = raw / 2;
+        let score = s.quiescence(&b, &es, beta - 1, beta, 3, 0).unwrap();
+        println!(
+            "stalemate static_eval={raw}, window=[{},{}], returned={score}",
+            beta - 1,
+            beta
+        );
+        assert_eq!(
+            score, 0,
+            "stalemate must be scored as a draw before stand-pat cutoff"
+        );
+    }
+
+    #[test]
+    fn checkmate_on_halfmove_100_takes_precedence_in_negamax() {
+        let b = Board::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 100 1").unwrap();
+        assert!(b.in_check(b.turn));
+        assert!(generate_legal(&b).is_empty());
+        let es = crear_eval_state(&b);
+        let mut s = Searcher::new(1);
+        let score = s
+            .negamax(&b, &es, 1, -INFINITO, INFINITO, 1, None, None, false, false)
+            .unwrap();
+        println!(
+            "mate on halfmove 100: negamax returned={score}, expected={}",
+            -MATE + 1
+        );
+        assert_eq!(score, -MATE + 1);
+    }
+
+    #[test]
+    fn checkmate_on_halfmove_100_takes_precedence_in_quiescence() {
+        let b = Board::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 100 1").unwrap();
+        let es = crear_eval_state(&b);
+        let mut s = Searcher::new(1);
+        let score = s.quiescence(&b, &es, -INFINITO, INFINITO, 1, 0).unwrap();
+        println!(
+            "mate on halfmove 100: quiescence returned={score}, expected={}",
+            -MATE + 1
+        );
+        assert_eq!(score, -MATE + 1);
     }
 }

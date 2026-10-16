@@ -1295,11 +1295,25 @@ pub fn uci_loop() {
 
         match partes[0] {
             "uci" => {
-                println!("id name Mittens");
+                if cfg!(feature = "tournament") {
+                    let sistema = if cfg!(target_os = "windows") {
+                        "Windows"
+                    } else if cfg!(target_os = "linux") {
+                        "Linux"
+                    } else if cfg!(target_os = "macos") {
+                        "macOS"
+                    } else {
+                        std::env::consts::OS
+                    };
+                    println!("id name Mittens CEDR {sistema}");
+                } else {
+                    println!("id name Mittens{}", if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) { " AVX2" } else { "" });
+                }
                 println!("id author Tavito y Claude");
                 println!("option name Hash type spin default 64 min 1 max 131072");
                 println!("option name Clear Hash type button");
                 println!("option name Move Overhead type spin default 75 min 0 max 5000");
+                println!("option name Contempt type spin default {} min 0 max 2000", search::CONTEMPT_DEFAULT);
                 println!("option name Max Move Time type spin default 0 min 0 max 300000");
                 println!(
                     "option name Threads type spin default {} min 1 max 16",
@@ -1338,6 +1352,11 @@ pub fn uci_loop() {
                             } else {
                                 println!("info string valor de Personalidad invalido: {}", valor);
                             }
+                        }
+                    } else if nombre.eq_ignore_ascii_case("contempt") {
+                        if let Some(v) = valor.and_then(|v| v.parse::<i32>().ok()) {
+                            search::fijar_contempt(v);
+                            reiniciar_tt = true;
                         }
                     } else if nombre.eq_ignore_ascii_case("hash") {
                         if let Some(mb) = valor.and_then(|v| v.parse::<usize>().ok()) {
@@ -1598,111 +1617,15 @@ pub fn uci_loop() {
                     .position(|&p| p == "nodes")
                     .and_then(|i| partes.get(i + 1))
                     .and_then(|s| s.parse().ok());
-                if let Some(i) = partes.iter().position(|&p| p == "depth") {
-                    let depth: i32 = partes.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(6);
-                    // BUG corregido (2026-08-20): "go depth N" tomaba SIEMPRE
-                    // el searcher de un solo hilo, ignorando la opcion
-                    // Threads -- cualquier analisis a profundidad fija (GUIs,
-                    // testers) corria con 1 hilo aunque el usuario pidiera 8,
-                    // y toda medicion de escalado SMP hecha con "go depth"
-                    // media un solo hilo determinista (nodos identicos entre
-                    // corridas). Ahora con Threads>1 se enruta por
-                    // buscar_lazy_smp igual que movetime/reloj, con el limite
-                    // de profundidad pedido y sin deadline de tiempo.
-                    if n_hilos > 1 {
-                        let modo_lmr = searcher_slot.as_ref().unwrap().modo_lmr;
-                        let qsearch_nnue = searcher_slot.as_ref().unwrap().qsearch_nnue;
-                        let nnue_classical_depth =
-                            searcher_slot.as_ref().unwrap().nnue_classical_depth;
-                        let tt = Arc::clone(&smp_tt);
-                        let mask = smp_tt_mask;
-                        let generacion = Arc::clone(&smp_generacion);
-                        let stop_flag = Arc::new(AtomicBool::new(false));
-                        let flag = Arc::clone(&stop_flag);
-                        let hist_copy = game_history.clone();
-                        let board_copy = board;
-                        let mut pool =
-                            pool_slot.take().unwrap_or_else(search::PoolMemoriaSMP::nuevo);
-                        let handle = std::thread::spawn(move || {
-                            let t0 = std::time::Instant::now();
-                            let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
-                                &board_copy,
-                                None,
-                                depth,
-                                n_hilos,
-                                &tt,
-                                &generacion,
-                                mask,
-                                modo_lmr,
-                                qsearch_nnue,
-                                nnue_classical_depth,
-                                &hist_copy,
-                                flag,
-                                None,
-                                &mut pool,
-                                nodes_limit,
-                            );
-                            let profundidad =
-                                resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
-                            let ms = t0.elapsed().as_millis().max(1) as u64;
-                            let nps = nodos.saturating_mul(1000) / ms;
-                            let lector =
-                                Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, modo_lmr);
-                            let pv = lector.extraer_pv(&board_copy, profundidad.max(1) as usize);
-                            let pv_txt =
-                                pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
-                            println!(
-                                "info depth {} score {} nodes {} time {} nps {} pv {}",
-                                profundidad, formatear_score_uci(sc), nodos, ms, nps, pv_txt
-                            );
-                            println!(
-                                "bestmove {}",
-                                mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
-                            );
-                            io::stdout().flush().ok();
-                            (None, Some(pool))
-                        });
-                        activa = Some(BusquedaActiva { handle, stop_flag });
-                        continue;
-                    }
-                    let mut s = searcher_slot.take().unwrap();
-                    s.set_game_history(game_history.clone());
-                    s.nodes_limit = nodes_limit;
-                    let stop_flag = Arc::new(AtomicBool::new(false));
-                    s.set_external_stop(Some(Arc::clone(&stop_flag)));
-                    let board_copy = board;
-                    let handle = std::thread::spawn(move || {
-                        // Sin movetime (None): search_time no aplica deadline y
-                        // se detiene sola al completar `depth` (mismo bucle
-                        // for d in 1..=max_depth que search_fixed_depth), pero
-                        // a diferencia de esa reutiliza el reporte "info depth
-                        // ... nodes ... time ... nps ..." por iteracion que ya
-                        // usan movetime/infinite -- antes "go depth N" solo
-                        // imprimia "info score cp X" suelto, sin depth/nodes/
-                        // time/nps, una desviacion real del protocolo UCI que
-                        // rompe el parseo de GUIs y testers (Cutechess, Arena,
-                        // herramientas de CCRL).
-                        let (mv, _sc, _) =
-                            s.search_time(&board_copy, None, depth, |depth, score, nodes, ms, pv| {
-                                let nps = nodes.saturating_mul(1000) / ms.max(1);
-                                let pv_txt =
-                                    pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
-                                println!(
-                                    "info depth {} score {} nodes {} time {} nps {} pv {}",
-                                    depth, formatear_score_uci(score), nodes, ms, nps, pv_txt
-                                );
-                                io::stdout().flush().ok();
-                            });
-                        println!(
-                            "bestmove {}",
-                            mv.map(|m| m.to_uci()).unwrap_or_else(|| "0000".to_string())
-                        );
-                        io::stdout().flush().ok();
-                        (Some(s), None)
-                    });
-                    activa = Some(BusquedaActiva { handle, stop_flag });
-                    continue;
-                }
+                // Todos los limites se resuelven antes de elegir 1 hilo/SMP.
+                let depth_limit = partes.iter().position(|&p| p == "depth").map(|i| {
+                    partes
+                        .get(i + 1)
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(6)
+                        .clamp(1, 128)
+                });
+                let max_depth = depth_limit.unwrap_or(64);
 
                 // movetime explicito, o wtime/btime(+winc/binc/movestogo), o
                 // "go infinite" (sin limite propio, corta solo con "stop").
@@ -1763,7 +1686,7 @@ pub fn uci_loop() {
                             movetime.unwrap_or(0),
                             max_move_time_ms,
                         ));
-                    } else if nodes_limit.is_none() {
+                    } else if nodes_limit.is_none() && depth_limit.is_none() {
                         movetime = Some(2000); // "go" sin ningun parametro de tiempo: default razonable
                     }
                 }
@@ -1797,6 +1720,22 @@ pub fn uci_loop() {
                     .map(|i| {
                         partes[i + 1..]
                             .iter()
+                            .take_while(|s| {
+                                !matches!(
+                                    **s,
+                                    "depth"
+                                        | "nodes"
+                                        | "movetime"
+                                        | "wtime"
+                                        | "btime"
+                                        | "winc"
+                                        | "binc"
+                                        | "movestogo"
+                                        | "infinite"
+                                        | "ponder"
+                                        | "mate"
+                                )
+                            })
                             .filter_map(|s| parse_uci_move(&board, s))
                             .collect()
                     });
@@ -1860,7 +1799,7 @@ pub fn uci_loop() {
                             let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
                                 &board_copy,
                                 tiempo_por_linea,
-                                64,
+                                max_depth,
                                 n_hilos,
                                 &smp_tt,
                                 &smp_generacion,
@@ -1879,23 +1818,20 @@ pub fn uci_loop() {
                                 nodes_limit,
                             );
                             let prof = resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
-                            // La TT compartida ya tiene el resultado: se
-                            // reconstruye la PV envolviendola en un Searcher
-                            // liviano solo para leerla (no busca nada).
-                            let lector = Searcher::new_con_tt_compartida(
-                                Arc::clone(&smp_tt),
-                                smp_tt_mask,
-                                modo_lmr,
-                            );
-                            let pv = lector.extraer_pv(&board_copy, 10);
+                            let pv =
+                                search::extraer_pv_tt(&smp_tt, smp_tt_mask, &board_copy, 10, mv);
                             (mv, sc, nodos, prof, pv)
                         } else {
                             let mut s = searcher_slot.take().expect("searcher multipv");
                             s.set_game_history(hist_copy.clone());
                             s.root_moves_filtro = Some(candidatas);
                             s.nodes_limit = nodes_limit;
-                            let (mv, sc, prof) =
-                                s.search_time(&board_copy, tiempo_por_linea, 64, |_, _, _, _, _| {});
+                            let (mv, sc, prof) = s.search_time(
+                                &board_copy,
+                                tiempo_por_linea,
+                                max_depth,
+                                |_, _, _, _, _| {},
+                            );
                             let nodos = s.nodes;
                             let pv = s.extraer_pv(&board_copy, 10);
                             searcher_slot = Some(s);
@@ -1944,8 +1880,11 @@ pub fn uci_loop() {
                     s.set_external_stop(Some(Arc::clone(&stop_flag)));
                     s.root_moves_filtro = searchmoves_filtro.clone();
                     s.nodes_limit = nodes_limit;
-                    let (mv, _sc, _) =
-                        s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms, pv| {
+                    let (mv, _sc, _) = s.search_time(
+                        &board_copy,
+                        movetime,
+                        max_depth,
+                        |depth, score, nodes, ms, pv| {
                             let pv_txt =
                                 pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
                             println!(
@@ -1982,7 +1921,7 @@ pub fn uci_loop() {
                         let (mv, sc, nodos, resultados) = search::buscar_lazy_smp(
                             &board_copy,
                             movetime,
-                            64,
+                            max_depth,
                             n_hilos,
                             &tt,
                             &generacion,
@@ -2000,15 +1939,13 @@ pub fn uci_loop() {
                             resultados.iter().map(|r| r.profundidad).max().unwrap_or(0);
                         let ms = t0.elapsed().as_millis().max(1) as u64;
                         let nps = nodos.saturating_mul(1000) / ms;
-                        // La TT compartida ya tiene el resultado de todos los
-                        // hilos: se reconstruye la PV envolviendola en un
-                        // Searcher liviano solo para leerla (no busca nada),
-                        // igual que en el camino MultiPV. Se usa el mismo
-                        // tablero raiz para todos los hilos, asi que la
-                        // caminata de la TT es coherente con el hilo 0.
-                        let lector =
-                            Searcher::new_con_tt_compartida(Arc::clone(&tt), mask, modo_lmr);
-                        let pv = lector.extraer_pv(&board_copy, profundidad.max(1) as usize);
+                        let pv = search::extraer_pv_tt(
+                            &tt,
+                            mask,
+                            &board_copy,
+                            profundidad.max(1) as usize,
+                            mv,
+                        );
                         let pv_txt = pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
                         println!(
                             "info depth {} score {} nodes {} time {} nps {} pv {}",
@@ -2030,8 +1967,11 @@ pub fn uci_loop() {
                     s.nodes_limit = nodes_limit;
                     let handle = std::thread::spawn(move || {
                         request_macos_qos();
-                        let (mv, _sc, _) =
-                            s.search_time(&board_copy, movetime, 64, |depth, score, nodes, ms, pv| {
+                        let (mv, _sc, _) = s.search_time(
+                            &board_copy,
+                            movetime,
+                            max_depth,
+                            |depth, score, nodes, ms, pv| {
                                 let pv_txt =
                                     pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ");
                                 println!(

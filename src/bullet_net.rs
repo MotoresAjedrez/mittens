@@ -92,6 +92,9 @@ const ARQUITECTURAS_SOPORTADAS: [(usize, usize); 4] =
 /// Maximo de output buckets soportado.
 pub const B_MAX: usize = 8;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod avx2;
+
 pub struct RedBullet {
     /// Neuronas de la capa oculta de ESTA red (256, 512 o 1024; ver
     /// ARQUITECTURAS_SOPORTADAS).
@@ -245,6 +248,11 @@ impl RedBullet {
             add.iter().chain(sub).all(|&f| (f as usize) < N_ENTRADA),
             "feature fuera de rango en aplicar_features_desde"
         );
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if self.h % 32 == 0 {
+            self.aplicar_features_desde_avx2(src, dst, add, sub);
+            return;
+        }
         #[cfg(target_arch = "aarch64")]
         if self.h % 32 == 0 {
             unsafe {
@@ -369,6 +377,11 @@ impl RedBullet {
         // Bloques de 32 i16 = 4 registros NEON. Las redes reales tienen
         // h = 256, 512 o 1024 (todas multiplos de 32); si algun dia hubiera
         // otra, se cae al camino escalar, que da exactamente lo mismo.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if self.h % 32 == 0 {
+            self.aplicar_features_avx2(acc, add, sub);
+            return;
+        }
         #[cfg(target_arch = "aarch64")]
         if self.h % 32 == 0 {
             unsafe {
@@ -848,7 +861,7 @@ impl AcumBullet {
     /// Salida en centipeones desde la perspectiva del lado que mueve
     /// (misma convencion que la evaluacion clasica del motor).
     pub fn evaluar(&self) -> f32 {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2")))]
         if let Some((suma, bk)) = self.evaluar_fusionado() {
             let salida = suma / QA as i64 + self.red.l1b[bk] as i64;
             return (salida * scale() as i64) as f32 / (QA * QB) as f32;
@@ -884,7 +897,7 @@ impl AcumBullet {
     /// ensancha a i64 antes de reunir: la suma entera es exacta, el i64 es
     /// identico. Solo se usa con pesos de salida cortos (l1w_cortos) y
     /// h multiplo de 32; si no, `None` y se sigue el camino de siempre.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2")))]
     #[inline]
     fn evaluar_fusionado(&self) -> Option<(i64, usize)> {
         let red = self.red;
@@ -901,7 +914,7 @@ impl AcumBullet {
         let padre = &izq[nivel - 1];
         let hijo = &mut der[0];
         let bk = self.bucket(hijo.piezas);
-        // SAFETY: aarch64 (NEON siempre disponible), h % 32 == 0 y
+        // SAFETY: NEON o AVX2 habilitado al compilar, h % 32 == 0 y
         // h <= H_MAX (garantizado por ARQUITECTURAS_SOPORTADAS), pesos de
         // salida en -128..=128 (l1w_cortos), features < 768 (calcular_cambios).
         let suma = unsafe {
@@ -1026,6 +1039,9 @@ impl AcumBullet {
         {
             #[cfg(target_arch = "x86_64")]
             if self.red.l1w_cortos {
+                #[cfg(target_feature = "avx2")]
+                return self.producto_punto_avx2(yo, rival, bucket);
+                #[cfg(not(target_feature = "avx2"))]
                 return self.producto_punto_sse2(yo, rival, bucket);
             }
             self.producto_punto_escalar(yo, rival, bucket)

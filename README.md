@@ -64,7 +64,7 @@ cargo build --release
 El ejecutable quedara en:
 
 ```text
-target/release/mi-motor-rust
+target/release/mittens
 ```
 
 Pruebas recomendadas antes de conectarlo al bot:
@@ -101,7 +101,7 @@ Opciones principales:
   sustituye al libro embebido.
 - `SyzygyPath`: tablas de finales.
 - `UseNNUE`: **activado por defecto**. La red va EMBEBIDA en el ejecutable
-  (`pesos_bullet_512_buckets8.bin`, formato bullet `768 -> 512`x2 -> 1 SCReLU
+  (`pesos_bullet_1024_buckets8.bin`, formato bullet `768 -> 1024`x2 -> 1 SCReLU
   con 8 output buckets), asi que el motor evalua con NNUE sin necesidad de
   configurar nada ni de que el .bin viaje junto al binario. Antes el valor por
   defecto era `false` con `NNUEPath` vacio: cualquier tester que no
@@ -112,7 +112,7 @@ Opciones principales:
 Ejemplo de red alternativa (ruta relativa a esta carpeta):
 
 ```text
-setoption name NNUEPath value pesos_bullet_512_buckets8.bin
+setoption name NNUEPath value pesos_bullet_1024_buckets8.bin
 setoption name UseNNUE value true
 ```
 
@@ -134,13 +134,11 @@ LMR queda activado salvo que se defina expresamente `MITTENS_LMR=0`.
 
 ## Archivos binarios
 
-- `pesos_bullet_512_buckets8.bin`: pesos de la red NNUE ACTUAL en produccion
-  (formato bullet, `768 -> 512`x2 -> 1 SCReLU, 8 output buckets). Va embebida
+- `pesos_bullet_1024_buckets8.bin`: pesos de la red NNUE ACTUAL en produccion
+  (formato bullet, `768 -> 1024`x2 -> 1 SCReLU, 8 output buckets). Va embebida
   en el ejecutable via `include_bytes!` desde `src/neural.rs`.
-- `pesos_amenazas_prueba.bin`: nombre historico; es BYTE A BYTE el mismo
-  archivo que `pesos_bullet_512_buckets8.bin` (mismo md5). Se conserva solo
-  porque scripts h2h antiguos lo nombran. NO es la arquitectura de 5378
-  entradas que decia esta documentacion.
+- `pesos_amenazas_prueba.bin`: fixture histórico de la red Bullet de 512
+  neuronas usado por scripts antiguos; no es la red de 1024 embebida actual.
 - `pesos_v1.bin`: fixture de la arquitectura VIEJA (770 entradas, `770 -> 256 -> 32 -> 1`), conservado solo porque dos tests unitarios en `src/neural.rs` (`rechaza_nan_sin_panico`, `checksum_es_estable`) lo usan via `include_bytes!` para probar el validador de bytes -- no representa la red que juega hoy.
 - `performance.bin`: libro de aperturas Polyglot (1.487.264 bytes = 92.954 entradas,
   77.872 posiciones unicas). Va EMBEBIDO en el ejecutable via `include_bytes!`
@@ -153,5 +151,40 @@ LMR queda activado salvo que se defina expresamente `MITTENS_LMR=0`.
 
 ## Estado de validacion de este paquete
 
-`cargo test` corre 31/31 pruebas, incluido un fuzz de ~1920 posiciones aleatorias comparando el acumulador NNUE incremental contra el recalculo completo (ver `src/neural.rs`). El manifiesto `MANIFEST_SHA256.txt` se regenera con `shasum -a 256 * src/* > MANIFEST_SHA256.txt` cada vez que cambia el codigo o los pesos -- si no coincide con los archivos actuales, es que el proyecto se modifico despues de la ultima regeneracion, no necesariamente que este corrupto.
+`cargo test --release --locked` ejecuta las pruebas unitarias y del protocolo UCI,
+incluidas las regresiones de mate en el límite de 50 movimientos, ahogado y
+combinaciones de profundidad, reloj y `searchmoves`. Los duelos H2H y las sondas
+que requieren otros motores están marcados `ignore`; se ejecutan expresamente con
+`cargo test --release --test h2h_mittens_vs_termino -- --ignored --nocapture`
+(o el nombre de la integración correspondiente), con los binarios externos disponibles.
+Las pruebas de los acumuladores incluyen recorridos aleatorios comparando la
+actualización incremental con el recálculo completo. El manifiesto `MANIFEST_SHA256.txt` se regenera con `shasum -a 256 * src/* > MANIFEST_SHA256.txt` cada vez que cambia el codigo o los pesos -- si no coincide con los archivos actuales, es que el proyecto se modifico despues de la ultima regeneracion, no necesariamente que este corrupto.
 Vibecoded
+
+## Ryzen 9 6900HX: Windows x64 y AVX2
+
+La NNUE Bullet usa AVX2 de 256 bits para actualizar acumuladores, calcular
+SCReLU y fusionar actualización y evaluación cuando AVX2 está habilitado
+al compilar. Las compilaciones portables x86-64 conservan SSE2; ARM conserva NEON.
+
+En un Windows con Rust MSVC y las herramientas de C++ instaladas:
+
+```powershell
+$env:RUSTFLAGS = "-C target-cpu=znver3 -C target-feature=+avx2"
+cargo build --release --locked --features tournament --target x86_64-pc-windows-msvc --bin mittens
+```
+
+`znver3` orienta el código a Zen 3, base usada por el compilador para el
+6900HX (Zen 3+). La feature `tournament` fija `Contempt` a 0 por defecto.
+Sin esa feature se conserva el valor histórico 200; ahora puede ajustarse por UCI.
+Las compilaciones de torneo se identifican en UCI como `Mittens CEDR Windows`,
+`Mittens CEDR Linux` o `Mittens CEDR macOS`, según el sistema.
+La NNUE embebida permanece activada por defecto (`UseNNUE=true`).
+
+Ajustes del torneo: `Threads=4`, `Hash=2048`, `Contempt=0`, `OwnBook=false`.
+Configurar 3 minutos + 3 segundos y Perfect 2021 en la GUI. Para tablas
+Syzygy de hasta 5 piezas, indicar la carpeta en `SyzygyPath`.
+
+Las pruebas de AVX2 comparan los resultados con el cálculo escalar exacto,
+incluidos pesos extremos y actualizaciones incrementales. La emulación
+verifica corrección; la velocidad debe medirse en el Ryzen real.
