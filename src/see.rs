@@ -90,6 +90,7 @@ fn rey_puede_capturar(
 /// exactamente el mismo (quitar y volver a poner el mismo bit con `&= !b` y
 /// `|= b` es la operacion inversa exacta) y el llamador recupera su arreglo
 /// intacto, asi que el valor devuelto es identico.
+#[cfg_attr(not(test), allow(dead_code))]
 fn see_recurse(
     to_sq: Square,
     occupied: Bitboard,
@@ -154,6 +155,127 @@ pub fn see(b: &Board, mv: &Move) -> i32 {
         valor(atacante_tipo)
     };
 
+    let resto = see_iterativo(to_sq, occupied, &mut bb, color_atacante.opposite(), valor_en_to);
+    gain0 - resto
+}
+
+/// VELOCIDAD (exacto): misma funcion que `see_recurse`, sin recursion y sin
+/// recalcular los rayos deslizantes en cada nivel.
+///
+/// `see_recurse` elige en cada nivel el PRIMER capturador disponible por
+/// orden de valor (y si es el rey y no puede capturar legalmente, nadie) y
+/// devuelve `max(0, termino - resto)`: no ramifica, asi que la secuencia de
+/// capturas es determinista. Aqui se recorre hacia adelante guardando los
+/// terminos (valor en la casilla + bonus de promocion) y se pliega hacia
+/// atras con el mismo `max(0, t - r)`: resultado identico.
+///
+/// Los atacantes de cada nivel son los mismos que da `atacantes_a` con la
+/// ocupacion vigente: los ataques de rey/caballo/peon se filtran por los
+/// bitboards locales (que pierden cada pieza usada), y los rayos de alfil y
+/// torre DESDE `to_sq` solo cambian si la pieza quitada estaba en ellos
+/// (si no es primer bloqueador de ningun rayo, quitarla no cambia el
+/// conjunto), asi que solo entonces se recalculan.
+fn see_iterativo(
+    to_sq: Square,
+    mut occupied: Bitboard,
+    bb: &mut [[Bitboard; 6]; 2],
+    mut color: Color,
+    mut valor_en_to: i32,
+) -> i32 {
+    const B: usize = PieceType::Bishop as usize;
+    const R: usize = PieceType::Rook as usize;
+    const Q: usize = PieceType::Queen as usize;
+    // Como mucho 32 piezas pueden capturar en la casilla.
+    let mut terminos = [0i32; 32];
+    let mut n = 0usize;
+    let mut rayos_d = bishop_attacks(to_sq, occupied);
+    let mut rayos_o = rook_attacks(to_sq, occupied);
+    let fijos_rey = king_attacks(to_sq);
+    let fijos_caballo = knight_attacks(to_sq);
+    let fuera = !bit(to_sq);
+    loop {
+        let idx = color as usize;
+        let p = &bb[idx];
+        let atacantes = ((fijos_rey & p[PieceType::King as usize])
+            | (fijos_caballo & p[PieceType::Knight as usize])
+            | (rayos_d & (p[B] | p[Q]))
+            | (rayos_o & (p[R] | p[Q]))
+            | (pawn_attacks(color.opposite(), to_sq) & p[PieceType::Pawn as usize]))
+            & fuera;
+        let mut elegido = None;
+        for &pt in &ORDEN_POR_VALOR {
+            let disponibles = atacantes & bb[idx][pt as usize];
+            if disponibles == 0 {
+                continue;
+            }
+            let sq = lsb(disponibles);
+            if pt == PieceType::King && !rey_puede_capturar(color, sq, to_sq, occupied, bb) {
+                continue;
+            }
+            elegido = Some((pt, sq));
+            break;
+        }
+        let Some((pt, sq)) = elegido else { break };
+        let (nuevo_valor, bonus_promocion) = resultado_capturador(color, pt, to_sq);
+        if n < terminos.len() {
+            terminos[n] = valor_en_to + bonus_promocion;
+            n += 1;
+        } else {
+            // Inalcanzable (32 piezas como maximo); por las dudas, la
+            // referencia exacta.
+            debug_assert!(false, "see_iterativo: mas de 32 capturas");
+            break;
+        }
+        let b_sq = bit(sq);
+        occupied &= !b_sq;
+        bb[idx][pt as usize] &= !b_sq;
+        if rayos_d & b_sq != 0 {
+            rayos_d = bishop_attacks(to_sq, occupied);
+        }
+        if rayos_o & b_sq != 0 {
+            rayos_o = rook_attacks(to_sq, occupied);
+        }
+        valor_en_to = nuevo_valor;
+        color = color.opposite();
+    }
+    let mut resto = 0;
+    for &t in terminos[..n].iter().rev() {
+        resto = (t - resto).max(0);
+    }
+    resto
+}
+
+/// SEE original (recursiva), referencia exacta de `see` en los tests.
+#[cfg(test)]
+pub fn see_referencia(b: &Board, mv: &Move) -> i32 {
+    let to_sq = mv.to;
+    let from_sq = mv.from;
+    let es_al_paso = mv.flag == MoveFlag::EnPassant;
+    let victima_tipo = if es_al_paso {
+        Some(PieceType::Pawn)
+    } else {
+        b.piece_at(to_sq).map(|(_, pt)| pt)
+    };
+    let (color_atacante, atacante_tipo) = b.piece_at(from_sq).expect("see: no hay pieza en 'from'");
+    let mut occupied = b.occupied;
+    let mut bb = b.pieces;
+    let mut gain0 = victima_tipo.map(valor).unwrap_or(0);
+    bb[color_atacante as usize][atacante_tipo as usize] &= !bit(from_sq);
+    occupied &= !bit(from_sq);
+    if es_al_paso {
+        let them = color_atacante.opposite();
+        let victima_sq = make_square(file_of(to_sq), rank_of(from_sq));
+        bb[them as usize][PieceType::Pawn as usize] &= !bit(victima_sq);
+        occupied &= !bit(victima_sq);
+    } else if let Some((color_victima, tipo_victima)) = b.piece_at(to_sq) {
+        bb[color_victima as usize][tipo_victima as usize] &= !bit(to_sq);
+    }
+    let valor_en_to = if let Some(promo) = mv.promotion {
+        gain0 += valor(promo) - valor(PieceType::Pawn);
+        valor(promo)
+    } else {
+        valor(atacante_tipo)
+    };
     let resto = see_recurse(to_sq, occupied, &mut bb, color_atacante.opposite(), valor_en_to);
     gain0 - resto
 }
@@ -239,6 +361,58 @@ mod tests {
             .into_iter()
             .find(|m| m.to_uci() == uci)
             .unwrap_or_else(|| panic!("jugada legal no encontrada: {uci}"))
+    }
+
+    /// VELOCIDAD bit-exacta: `see` (iterativa) debe dar EXACTAMENTE lo
+    /// mismo que la recursion original para TODAS las jugadas legales (no
+    /// solo capturas: la busqueda tambien la llama para quiets en algunos
+    /// sitios) de miles de posiciones de recorridos aleatorios con muchas
+    /// capturas, promociones, al paso y reyes cerca de la accion.
+    #[test]
+    fn see_iterativa_igual_que_recursiva() {
+        let fens = [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "2rq1rk1/pp1bppbp/2np1np1/8/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 0 11",
+            "r2q1rk1/ppp2ppp/2n1bn2/2b1p3/4P3/2NP1N2/PPP1BPPP/R1BQ1RK1 w - - 4 8",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "8/4k3/4p3/3K4/8/8/8/4R3 w - - 0 1",
+        ];
+        let mut semilla = 0x8C4F_2A6B_D15E_0937u64;
+        let mut azar = move || {
+            semilla ^= semilla << 13;
+            semilla ^= semilla >> 7;
+            semilla ^= semilla << 17;
+            semilla
+        };
+        let (mut comparadas, mut capturas) = (0u32, 0u32);
+        for fen in fens {
+            for _ in 0..120 {
+                let mut b = Board::from_fen(fen).unwrap();
+                for _ in 0..50 {
+                    let jugadas = generate_legal(&b);
+                    if jugadas.is_empty() {
+                        break;
+                    }
+                    for mv in &jugadas {
+                        assert_eq!(see(&b, mv), see_referencia(&b, mv),
+                            "SEE distinta para {} en {}", mv.to_uci(), b.to_fen());
+                        comparadas += 1;
+                        capturas += mv.is_capture() as u32;
+                    }
+                    // Preferir capturas para llegar a posiciones tacticas.
+                    let caps: Vec<_> = jugadas.iter().filter(|m| m.is_capture()).collect();
+                    let mv = if !caps.is_empty() && azar() % 3 != 0 {
+                        *caps[(azar() % caps.len() as u64) as usize]
+                    } else {
+                        jugadas[(azar() % jugadas.len() as u64) as usize]
+                    };
+                    b = b.make_move(&mv);
+                }
+            }
+        }
+        assert!(comparadas > 200_000 && capturas > 20_000, "{comparadas} {capturas}");
     }
 
     #[test]

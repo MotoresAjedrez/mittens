@@ -577,6 +577,76 @@ fn casilla_amenazada(b: &Board, sq: crate::types::Square) -> bool {
 /// se permuta EXACTAMENTE igual que `claves` para que quede sincronizado con
 /// `moves` despues del ordenamiento.
 fn ordenar_estable(moves: &mut [Move], claves: &mut [i32], sees: &mut [i32], inicio: usize, n: usize) {
+    // VELOCIDAD (bit-exacto): el insertion sort de abajo movia TRES arreglos
+    // por cada inversion (~n^2/4 con n ~ 35-45 jugadas) y era ~7.5% del
+    // tiempo de busqueda. Un orden ESTABLE por clave equivale exactamente a
+    // ordenar por el par (clave, indice original): ese par es unico, asi que
+    // CUALQUIER algoritmo de orden (aunque no sea estable) da la misma
+    // secuencia. Se empaqueta en un u64 = (clave con el bit de signo
+    // invertido, que preserva el orden de i32 como u32) << 32 | indice, se
+    // ordena un solo arreglo de enteros con `sort_unstable` (redes de
+    // ordenamiento sin saltos para listas cortas) y despues se permutan
+    // jugadas/SEE con los indices. El test `ordenar_estable_igual_que_insercion`
+    // lo compara contra el insertion sort original.
+    let len = n.saturating_sub(inicio);
+    if len < 2 {
+        return;
+    }
+    if len <= MAX_MOVES && n <= moves.len() && n <= claves.len() && n <= sees.len() {
+        use std::mem::MaybeUninit;
+        // Buffers en la pila SIN inicializar (4 KB que antes se ponian a cero
+        // en cada llamada). Solo se leen las `len` primeras posiciones, y
+        // todas se escriben antes: `paq` en el bucle de empaquetado y las
+        // copias con copy_nonoverlapping de exactamente `len` elementos.
+        let mut paq_buf = [MaybeUninit::<u64>::uninit(); MAX_MOVES];
+        let mut mv_buf = [MaybeUninit::<Move>::uninit(); MAX_MOVES];
+        let mut see_buf = [MaybeUninit::<i32>::uninit(); MAX_MOVES];
+        for i in 0..len {
+            let clave = ((claves[inicio + i] as u32) ^ 0x8000_0000) as u64;
+            paq_buf[i].write((clave << 32) | i as u64);
+        }
+        // SAFETY: las `len` primeras posiciones de los tres buffers quedan
+        // inicializadas (bucle de arriba y las dos copias de `len` elementos
+        // desde rangos validos: n <= len de cada slice, comprobado arriba);
+        // MaybeUninit<T> tiene el mismo layout que T.
+        let (paq, mv_orig, see_orig) = unsafe {
+            std::ptr::copy_nonoverlapping(
+                moves.as_ptr().add(inicio),
+                mv_buf.as_mut_ptr().cast::<Move>(),
+                len,
+            );
+            std::ptr::copy_nonoverlapping(
+                sees.as_ptr().add(inicio),
+                see_buf.as_mut_ptr().cast::<i32>(),
+                len,
+            );
+            (
+                std::slice::from_raw_parts_mut(paq_buf.as_mut_ptr().cast::<u64>(), len),
+                std::slice::from_raw_parts(mv_buf.as_ptr().cast::<Move>(), len),
+                std::slice::from_raw_parts(see_buf.as_ptr().cast::<i32>(), len),
+            )
+        };
+        paq.sort_unstable();
+        for (k, &p) in paq.iter().enumerate() {
+            let i = (p as u32) as usize;
+            moves[inicio + k] = mv_orig[i];
+            sees[inicio + k] = see_orig[i];
+            claves[inicio + k] = ((p >> 32) as u32 ^ 0x8000_0000) as i32;
+        }
+        return;
+    }
+    ordenar_estable_insercion(moves, claves, sees, inicio, n);
+}
+
+/// Insertion sort estable ORIGINAL; queda como referencia de los tests y
+/// como camino de respaldo (inalcanzable: n <= MAX_MOVES siempre).
+fn ordenar_estable_insercion(
+    moves: &mut [Move],
+    claves: &mut [i32],
+    sees: &mut [i32],
+    inicio: usize,
+    n: usize,
+) {
     for i in (inicio + 1)..n {
         let m = moves[i];
         let k = claves[i];
@@ -661,6 +731,83 @@ fn da_jaque_sin_copiar(b: &Board, mv: &Move) -> bool {
         return true;
     }
     false
+}
+
+/// Informacion de jaque de UN nodo (estilo `CheckInfo`/`checkSquares` de
+/// Stockfish): se calcula una sola vez y despues responder "¿esta jugada da
+/// jaque?" es un par de AND en vez de reconstruir la posicion virtual.
+/// Respuesta EXACTAMENTE igual a `da_jaque_sin_copiar` (ver test).
+#[derive(Clone, Copy)]
+struct InfoJaque {
+    ksq: crate::types::Square,
+    /// Por tipo de pieza: casillas desde las que esa pieza propia daria jaque
+    /// directo al rey rival (con la ocupacion actual).
+    directo: [u64; 6],
+    /// Piezas propias que tapan la linea entre un deslizante propio y el rey
+    /// rival: si se van de la linea, jaque descubierto.
+    descubridoras: u64,
+}
+
+impl InfoJaque {
+    #[inline]
+    fn nueva(b: &Board) -> InfoJaque {
+        use crate::bitboard::{
+            bishop_attacks, king_attacks, knight_attacks, pawn_attacks, pinned_pieces,
+            rook_attacks,
+        };
+        let us = b.turn;
+        let them = us.opposite();
+        let ksq = b.king_square(them);
+        let occ = b.occupied;
+        let p = &b.pieces[us as usize];
+        let alf = bishop_attacks(ksq, occ);
+        let tor = rook_attacks(ksq, occ);
+        let mut directo = [0u64; 6];
+        directo[PieceType::Pawn as usize] = pawn_attacks(them, ksq);
+        directo[PieceType::Knight as usize] = knight_attacks(ksq);
+        directo[PieceType::Bishop as usize] = alf;
+        directo[PieceType::Rook as usize] = tor;
+        directo[PieceType::Queen as usize] = alf | tor;
+        directo[PieceType::King as usize] = 0;
+        let _ = king_attacks;
+        // Mismo calculo que las clavadas, con los papeles invertidos: piezas
+        // PROPIAS que son la unica pieza entre un deslizante PROPIO y el rey
+        // rival.
+        let descubridoras = pinned_pieces(
+            ksq,
+            b.occupied_co[us as usize],
+            p[PieceType::Rook as usize] | p[PieceType::Queen as usize],
+            p[PieceType::Bishop as usize] | p[PieceType::Queen as usize],
+            occ,
+        );
+        InfoJaque { ksq, directo, descubridoras }
+    }
+
+    #[inline]
+    fn da_jaque(&self, b: &Board, mv: &Move) -> bool {
+        use crate::bitboard::{between, bit};
+        if mv.promotion.is_some()
+            || matches!(
+                mv.flag,
+                MoveFlag::EnPassant | MoveFlag::CastleKing | MoveFlag::CastleQueen
+            )
+        {
+            return da_jaque_sin_copiar(b, mv);
+        }
+        let (_, pt) = b.piece_at(mv.from).expect("InfoJaque::da_jaque: no hay pieza en 'from'");
+        if self.directo[pt as usize] & bit(mv.to) != 0 {
+            return true;
+        }
+        if self.descubridoras & bit(mv.from) != 0 {
+            // Descubre salvo que se quede en la misma linea rey-from.
+            let k = self.ksq;
+            let alineada = between(k, mv.to) & bit(mv.from) != 0
+                || between(k, mv.from) & bit(mv.to) != 0
+                || between(mv.from, mv.to) & bit(k) != 0;
+            return !alineada;
+        }
+        false
+    }
 }
 
 // TT compartida entre hilos (Lazy SMP): LOCKLESS de verdad, sin Mutex.
@@ -2059,6 +2206,7 @@ impl Searcher {
             for &mv in evasiones.iter() {
                 let next = b.make_move(&mv);
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
                 // Ligar el resultado ANTES de deshacer, y recien despues
                 // aplicar el `?`: asi ningun retorno temprano se salta el
@@ -2165,13 +2313,11 @@ impl Searcher {
 
         let mut best = stand_pat;
         let mut best_mv: Option<Move> = None;
+        let mut info_j: Option<InfoJaque> = None;
         for &(mv, see) in moves.iter() {
-            let next = b.make_move(&mv);
-            self.tt_prefetch(next.zobrist);
-            let da_jaque = next.in_check(next.turn);
-
             // Nunca podar promociones ni jaques por SEE/delta: una captura
             // materialmente mala puede ser mate o forzar una secuencia tactica.
+            //
             // ESCALA: la eval interna va ~1.6x inflada respecto de 100cp = peon
             // (peso_bullet), pero valor_pieza y los margenes de aqui estaban
             // en centipeones clasicos, o sea que el delta pruning podaba con
@@ -2182,7 +2328,14 @@ impl Searcher {
             } else {
                 (1, 1, 250, -50)
             };
-            if !da_jaque && mv.promotion.is_none() && see.unwrap_or(0) < umbral_see {
+            // VELOCIDAD (bit a bit identico): el jaque se consulta solo si
+            // algun filtro lo necesita (InfoJaque, una vez por nodo) y el
+            // tablero se copia recien cuando la jugada de verdad se busca.
+            let mut da_jaque: Option<bool> = None;
+            if mv.promotion.is_none()
+                && see.unwrap_or(0) < umbral_see
+                && !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, &mv))
+            {
                 continue;
             }
             let victim = if mv.flag == MoveFlag::EnPassant {
@@ -2194,9 +2347,14 @@ impl Searcher {
             } * esc_num / esc_den;
             let promo_gain =
                 mv.promotion.map(|pt| valor_pieza(pt) - 100).unwrap_or(0) * esc_num / esc_den;
-            if !da_jaque && stand_pat + victim + promo_gain + margen_delta <= alpha {
+            if stand_pat + victim + promo_gain + margen_delta <= alpha
+                && !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, &mv))
+            {
                 continue;
             }
+            let next = b.make_move(&mv);
+            self.tt_prefetch(next.zobrist);
+            crate::eval_cache::prefetch(next.zobrist);
 
             let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
             let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
@@ -2230,7 +2388,7 @@ impl Searcher {
                 if mv.is_capture() || mv.promotion.is_some() {
                     continue;
                 }
-                if !da_jaque_sin_copiar(b, &mv) {
+                if !info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, &mv) {
                     continue;
                 }
                 // Filtro barato antes del caro: SEE solo sobre las que ya
@@ -2243,6 +2401,7 @@ impl Searcher {
 
                 let next = b.make_move(&mv);
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_quiescence(eval_state, b, &next);
                 let res = self.quiescence(&next, &next_eval, -beta, -alpha, ply + 1, qdepth + 1);
                 self.salir_hijo(&next_eval, b, &next);
@@ -2603,6 +2762,7 @@ impl Searcher {
                 let r = r.min(depth - 1).max(1);
                 let next = b.make_null_move();
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 let next_eval = self.siguiente_estado_busqueda(eval_state, b, &next, depth - 1 - r);
                 // El hijo NO llega por LMR: limpiar el estado hindsight del
                 // ply hijo para que no lea la reduccion de otro subarbol.
@@ -2682,6 +2842,7 @@ impl Searcher {
                 }
                 let next = b.make_move(mv);
                 self.tt_prefetch(next.zobrist);
+                crate::eval_cache::prefetch(next.zobrist);
                 if next.in_check(next.turn) {
                     continue;
                 }
@@ -3045,6 +3206,7 @@ impl Searcher {
         // (ver se_poda_en_sonda). Fuera de la sonda siempre estan activas.
         let podar_en_este_nodo = excluida.is_none() || se_poda_en_sonda();
         let mut idx_siguiente = 0usize;
+        let mut info_j: Option<InfoJaque> = None;
         'jugadas: loop {
             // Se agotaron las jugadas: fin del bucle.
             if idx_siguiente >= n_moves {
@@ -3176,7 +3338,7 @@ impl Searcher {
                 // cruda) daria a profundidad 14 un margen de 1550 centesimas y
                 // podaria medio arbol de una.
                 if ev + FUT_MARGEN_BASE + margen_ply * fut_depth <= alpha {
-                    if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                    if !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv)) {
                         continue;
                     }
                 }
@@ -3207,7 +3369,7 @@ impl Searcher {
                 && beta.abs() < MATE - 1000
                 && idx >= lmp_umbral
             {
-                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                if !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv)) {
                     continue;
                 }
             }
@@ -3258,7 +3420,7 @@ impl Searcher {
                     let see_malo =
                         || crate::see::see(b, mv) < -23 * lmr_depth * lmr_depth;
                     if (hist_mala || see_malo())
-                        && !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv))
+                        && !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv))
                     {
                         continue;
                     }
@@ -3343,7 +3505,7 @@ impl Searcher {
                     see_cacheado < SEE_PRUNE_MARGEN_POR_PLY * depth
                 }
             {
-                if !*da_jaque.get_or_insert_with(|| da_jaque_sin_copiar(b, mv)) {
+                if !*da_jaque.get_or_insert_with(|| info_j.get_or_insert_with(|| InfoJaque::nueva(b)).da_jaque(b, mv)) {
                     continue;
                 }
             }
@@ -3365,6 +3527,7 @@ impl Searcher {
             let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
             let next = b.make_move(mv);
             self.tt_prefetch(next.zobrist);
+            crate::eval_cache::prefetch(next.zobrist);
             let child_prev = Some((pt_mv, mv.to as usize));
             let child_prev2 = prev;
             // ext puede valer -2, 0, +1 o +2 (ver ext_singular arriba). El
@@ -4730,6 +4893,56 @@ pub fn buscar_lazy_smp(
 mod regression_tests {
     use super::*;
 
+    /// VELOCIDAD bit-exacta: `ordenar_estable` (clave+indice empaquetados y
+    /// sort_unstable) debe dejar jugadas, claves y SEE EXACTAMENTE igual que
+    /// el insertion sort estable original, incluidos empates (muchas claves
+    /// repetidas), extremos de i32, listas de 0..=MAX_MOVES y `inicio` != 0.
+    #[test]
+    fn ordenar_estable_igual_que_insercion() {
+        let mut semilla = 0x9E37_79B9_7F4A_7C15u64;
+        let mut azar = || {
+            semilla ^= semilla << 13;
+            semilla ^= semilla >> 7;
+            semilla ^= semilla << 17;
+            semilla
+        };
+        let extremos = [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX];
+        for caso in 0..4000 {
+            let n = match caso % 7 {
+                0 => (azar() % 3) as usize,
+                1 => MAX_MOVES,
+                _ => (azar() % 80) as usize,
+            };
+            let inicio = if n > 0 && caso % 3 == 0 { (azar() as usize) % n } else { 0 };
+            let rango = [2u64, 5, 50, 1 << 20, u64::MAX][caso % 5];
+            let mut moves = Vec::with_capacity(n);
+            let mut claves = Vec::with_capacity(n);
+            let mut sees = Vec::with_capacity(n);
+            for i in 0..n {
+                let r = azar();
+                // Jugada distinta por posicion para detectar cualquier
+                // permutacion: from/to codifican el indice original.
+                moves.push(Move::new((i % 64) as u8, (i / 64) as u8, None, MoveFlag::Quiet));
+                let k = if caso % 11 == 0 {
+                    extremos[(r % extremos.len() as u64) as usize]
+                } else if rango == u64::MAX {
+                    r as i32
+                } else {
+                    (r % rango) as i32 - (rango / 2) as i32
+                };
+                claves.push(k);
+                sees.push((azar() as i32) | 1);
+            }
+            let (mut m1, mut c1, mut s1) = (moves.clone(), claves.clone(), sees.clone());
+            let (mut m2, mut c2, mut s2) = (moves, claves, sees);
+            ordenar_estable(&mut m1, &mut c1, &mut s1, inicio, n);
+            ordenar_estable_insercion(&mut m2, &mut c2, &mut s2, inicio, n);
+            assert_eq!(m1, m2, "caso {caso}: jugadas distintas (n={n}, inicio={inicio})");
+            assert_eq!(c1, c2, "caso {caso}: claves distintas");
+            assert_eq!(s1, s2, "caso {caso}: SEE distintos");
+        }
+    }
+
     /// BUG: un "stop" (o cualquier comando que aborte la busqueda) que llega
     /// ANTES de que termine la profundidad 1 dejaba `mejor_mv` en el
     /// fallback, que es la PRIMERA jugada en orden de generacion -- a2a3 en
@@ -4779,6 +4992,8 @@ mod regression_tests {
     fn jaque_coincide_con_verdad(b: &Board) {
         for mv in generate_legal(b) {
             let rapido = da_jaque_sin_copiar(b, &mv);
+            let info = InfoJaque::nueva(b).da_jaque(b, &mv);
+            assert_eq!(info, rapido, "InfoJaque difiere en {} {}", b.to_fen(), mv.to_uci());
             // Verdad de fondo: tras la jugada, el bando que ahora mueve
             // (el rival) esta en jaque?
             let despues = b.make_move(&mv);
