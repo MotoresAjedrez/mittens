@@ -52,37 +52,142 @@ Guia completa de integracion (clase Kotlin exacta, como cargar los pesos
 NNUE, advertencias de threading, y que se verifico realmente):
 [`ANDROID_JNI_README.md`](ANDROID_JNI_README.md).
 
-## Compilar en macOS
+## Compilación y Guía de Rendimiento por CPU (Mac, Intel, AMD)
 
-Requiere Rust con soporte para edition 2024.
+Mittens cuenta con optimizaciones vectoriales y despacho dinámico de instrucciones según el procesador anfitrión:
+- **Apple Silicon (ARM64):** soporte nativo para **`USDOT` (`FEAT_I8MM`)** en Apple M2/M3/M4/M5 con bloques de 32 neuronas y elevación a núcleos de alto rendimiento (P-cores vía QoS de macOS), con fallback a **NEON** de 128 bits en Apple M1.
+- **Procesadores Intel (x86-64):** aceleración **AVX2** de 256 bits (`vpmaddwd`) para la red neuronal NNUE y ataques de piezas deslizantes por hardware con **BMI2 (`_pext_u64`)** a ~3 ciclos de reloj.
+- **Procesadores AMD Ryzen (x86-64):** detección automática de microarquitectura en el arranque. En **Zen 3 / Zen 4 / Zen 5** activa `PEXT` acelerado por hardware; en **Zen 1 / Zen+ / Zen 2** desactiva `PEXT` automáticamente y usa **Magic Bitboards** (evitando la penalización de ~18 ciclos del microcódigo lento de Zen 1/2).
+- **CPUs x86-64 heredadas:** fallback vectorizado **SSE2** fusionado (`pmaddwd`) para correr en cualquier PC sin fallar por `Illegal instruction`.
 
+Requiere Rust con soporte para edición 2024 (`rustup update`).
+
+---
+
+### 1. 🍏 Apple Silicon & Mac (M1 a M5, Intel Mac)
+
+#### Para Apple Silicon M2, M3, M4, M5 (y iPad Pro M2/M4)
+Aprovecha el kernel `USDOT` (`i8mm`) optimizado con `UZP1`/`UZP2`, reuso de pila NNUE y pool persistente SMP:
 ```bash
-cd mi-motor-rust-produccion
-cargo build --release
+# Compilación estándar (aplica automáticamente .cargo/config.toml con +i8mm):
+cargo build --release --bin mittens
+
+# O especificando la arquitectura manualmente:
+RUSTFLAGS="-C target-cpu=apple-m2 -C target-feature=+i8mm" cargo build --release --bin mittens
+```
+*El ejecutable quedará en `target/release/mittens`.*
+
+#### Para Apple Silicon M1 (o iPad Air/Pro M1)
+El silicio M1 no dispone de la instrucción `i8mm`, pero ejecuta el kernel `NEON` vectorizado de 128 bits a máxima velocidad:
+```bash
+RUSTFLAGS="-C target-cpu=apple-m1" cargo build --release --bin mittens
 ```
 
-El ejecutable quedara en:
+#### Para Mac con procesador Intel (x86-64)
+```bash
+# Si tu Mac Intel soporta AVX2:
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin mittens
 
-```text
-target/release/mittens
+# O binario universal compatible con cualquier Mac Intel:
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release --bin mittens
 ```
 
-Pruebas recomendadas antes de conectarlo al bot:
+---
+
+### 2. 🔷 Procesadores Intel (Core i3 / i5 / i7 / i9 / Core Ultra / Xeon)
+
+Los procesadores Intel desde la 4.ª generación (Haswell, 2013) en adelante cuentan con **AVX2** y **BMI2 (`PEXT`)** nativo y de baja latencia (3 ciclos).
+
+#### Compilación local optimizada (máximo rendimiento en la máquina actual):
+- **En Linux / macOS / WSL:**
+  ```bash
+  RUSTFLAGS="-C target-cpu=native" cargo build --release --bin mittens
+  ```
+- **En Windows (PowerShell con MSVC):**
+  ```powershell
+  $env:RUSTFLAGS = "-C target-cpu=native"
+  cargo build --release --bin mittens
+  ```
+
+#### Binario portátil optimizado para Intel moderno (Haswell o superior):
+```bash
+# Linux:
+RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+avx2,+bmi2" cargo build --release --bin mittens
+
+# Windows (MSVC):
+$env:RUSTFLAGS = "-C target-cpu=x86-64-v3 -C target-feature=+avx2,+bmi2"
+cargo build --release --target x86_64-pc-windows-msvc --bin mittens
+```
+
+---
+
+### 3. 🔴 Procesadores AMD Ryzen (Zen 1, Zen+, Zen 2, Zen 3, Zen 4, Zen 5)
+
+> [!IMPORTANT]
+> **Comportamiento arquitectónico de `PEXT` (BMI2) en AMD:**
+> - En **AMD Ryzen series 1000, 2000 y 3000 (Zen 1, Zen+, Zen 2)**, AMD implementó la instrucción `_pext_u64` mediante microcódigo emulado que toma **~18 ciclos de reloj**, frente a los **~3 ciclos** de los *Magic Bitboards*. Forzar `+bmi2` en esos procesadores frena el motor entre un 15 % y un 25 %.
+> - En **AMD Ryzen series 5000, 7000, 8000 y 9000 (Zen 3, Zen 4, Zen 5)**, `PEXT` está implementado directamente en hardware a máxima velocidad.
+
+Mittens incorpora **despacho inteligente en runtime**: detecta la familia de procesador al arrancar y usa `PEXT` solo si es Intel o AMD Zen 3+ (`Family >= 0x19`), cayendo automáticamente a Magic Bitboards en chips Zen 1/Zen 2.
+
+#### Para AMD Ryzen Zen 3, Zen 4 o Zen 5 (Serie 5000 / 7000 / 8000 / 9000):
+```bash
+# Linux:
+RUSTFLAGS="-C target-cpu=znver3 -C target-feature=+avx2" cargo build --release --bin mittens
+
+# Windows (PowerShell):
+$env:RUSTFLAGS = "-C target-cpu=znver3 -C target-feature=+avx2"
+cargo build --release --target x86_64-pc-windows-msvc --bin mittens
+```
+
+#### Para AMD Ryzen Zen 1, Zen+ o Zen 2 (Serie 1000 / 2000 / 3000):
+```bash
+# Evita forzar BMI2 por compilador para que utilice Magic Bitboards:
+RUSTFLAGS="-C target-cpu=znver1 -C target-feature=+avx2,-bmi2" cargo build --release --bin mittens
+```
+
+---
+
+### 4. 🌐 Binario Universal x86-64 (Recomendado para CCRL, CEDR o Distribución General)
+
+Si deseas un solo ejecutable que corra en cualquier PC (Intel o AMD) y aproveche siempre lo mejor de cada chip sin crashear en equipos antiguos:
 
 ```bash
-cargo fmt --check
-cargo check
-cargo test
+# Linux / macOS x86-64:
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release --bin mittens
+
+# Windows (PowerShell con MSVC):
+$env:RUSTFLAGS = "-C target-cpu=x86-64-v2"
+cargo build --release --target x86_64-pc-windows-msvc --bin mittens
+```
+
+**Matriz de selección automática en tiempo de ejecución:**
+| Procesador anfitrión | Red Neuronal (NNUE) | Ataques de Torres y Alfiles |
+| :--- | :--- | :--- |
+| **Intel con AVX2 + BMI2** (Haswell+) | AVX2 256 bits (`vpmaddwd`) | PEXT en hardware (3 ciclos) |
+| **AMD Zen 3 / Zen 4 / Zen 5** | AVX2 256 bits (`vpmaddwd`) | PEXT en hardware (3 ciclos) |
+| **AMD Zen 1 / Zen+ / Zen 2** | AVX2 256 bits (`vpmaddwd`) | **Magic Bitboards automáticos** (evita microcódigo lento) |
+| **CPUs x86-64 antiguas (sin AVX2)** | SSE2 128 bits (`pmaddwd`) | Magic Bitboards |
+
+---
+
+### 5. 🧪 Verificación y Pruebas del Motor
+
+Tras compilar, puedes validar la integridad y velocidad del binario:
+
+```bash
+# Suite de pruebas unitarias (144 tests exactos):
+cargo test --release --lib
+
+# Pruebas de velocidad de nodos (bench):
+cargo run --release -- bench 12    # Referencia estándar: 604,743 nodos
+cargo run --release -- bench 16    # Referencia extendida: 2,761,927 nodos
+
+# Pruebas de validación de reglas y ajedrez:
 cargo run --release -- perft
 cargo run --release -- matetest
 cargo run --release -- seetest
 cargo run --release -- repetitiontest
-```
-
-La suite `perft` completa llega a profundidades altas y puede tardar. Para una prueba corta:
-
-```bash
-cargo test perft_inicio_hasta_tres
 ```
 
 ## Uso UCI
@@ -199,17 +304,21 @@ Windows` or `Mittens CCRL Linux`, `Hash=256` MiB, `Threads=1`, `Contempt=0`,
 still configure options through UCI. The 1024-neuron, 8-output-bucket NNUE
 is embedded in the executable and enabled by default.
 
-Two CPU variants are available:
+Three build approaches are available:
 
 | Variant | CPU requirements | NNUE and sliding attacks |
 |---|---|---|
+| **Universal (Recommended)** | x86-64 baseline (`x86-64-v2`) | Runtime dispatch: AVX2 on modern chips, SSE2 on older; PEXT on Intel/Zen3+, Magic Bitboards on AMD Zen 1/2 |
 | Portable | x86-64 baseline with SSE2 | SSE2 NNUE; magic bitboards |
-| AVX2/BMI2 | x86-64-v3 and operating-system AVX support | AVX2 NNUE; PEXT/BMI2 attack lookup |
+| Fixed AVX2/BMI2 | x86-64-v3 and operating-system AVX support | AVX2 NNUE; PEXT/BMI2 attack lookup |
 
-Choose Portable when unsure which CPU extensions are available. The optimized
-variant uses the generic x86-64-v3 target, which includes AVX2, BMI1/BMI2,
-F16C, FMA, LZCNT, MOVBE, POPCNT and the preceding x86-64 feature levels.
-Both variants use the same source, network, settings and UCI name.
+The **Universal** variant is the easiest and safest choice for rating list operators (CCRL, CEDR): a single binary automatically runs at peak speed on both Intel and AMD Zen 3+ without crashing on older systems and without the 18-cycle PEXT slowdown on AMD Zen 1/Zen 2.
+
+```sh
+# Universal CCRL Linux build:
+RUSTFLAGS="-C target-cpu=x86-64-v2" \
+cargo build --release --locked --features ccrl --target x86_64-unknown-linux-musl --bin mittens
+```
 
 Example Linux builds (musl target and linker must be installed):
 

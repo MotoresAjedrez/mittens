@@ -10,3 +10,6 @@
 /results_sprt/
 __pycache__/
 target-*/
+.claude/
+sprt_real*.py
+aperturas.txt
