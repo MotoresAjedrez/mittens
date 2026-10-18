@@ -11,21 +11,34 @@ use std::arch::aarch64::*;
 /// se integra `#[inline(always)]` sin sobrecosto de llamada ABI. En compilaciones
 /// sin `+i8mm` global (ej. `apple-m1` portable) puede forzarse con `MITTENS_I8MM=1`
 /// si el procesador soporta `i8mm`.
-#[inline]
+#[inline(always)]
 pub(super) fn tiene_i8mm() -> bool {
-    if let Ok(v) = std::env::var("MITTENS_I8MM") {
-        match v.trim() {
-            "0" | "false" | "no" | "off" => return false,
-            "1" | "true" | "yes" | "on" => {
-                #[cfg(target_feature = "i8mm")]
-                return true;
-                #[cfg(not(target_feature = "i8mm"))]
-                return std::arch::is_aarch64_feature_detected!("i8mm");
-            }
-            _ => {}
-        }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(0);
+    let v = CACHE.load(Ordering::Relaxed);
+    if v != 0 {
+        return v == 2;
     }
-    cfg!(target_feature = "i8mm")
+    #[cold]
+    fn inicializar() -> bool {
+        let usar = match std::env::var("MITTENS_I8MM").ok().as_deref().map(str::trim) {
+            Some("0" | "false" | "no" | "off") => false,
+            Some("1" | "true" | "yes" | "on") => {
+                #[cfg(target_feature = "i8mm")]
+                {
+                    true
+                }
+                #[cfg(not(target_feature = "i8mm"))]
+                {
+                    std::arch::is_aarch64_feature_detected!("i8mm")
+                }
+            }
+            _ => cfg!(target_feature = "i8mm"),
+        };
+        CACHE.store(if usar { 2 } else { 1 }, Ordering::Relaxed);
+        usar
+    }
+    inicializar()
 }
 
 // El intrinseco Rust vusdotq_s32 sigue siendo experimental. Esta instruccion
@@ -66,7 +79,7 @@ macro_rules! acumular {
 }
 
 impl RedBullet {
-    #[target_feature(enable = "i8mm")]
+    #[cfg_attr(not(target_feature = "i8mm"), target_feature(enable = "i8mm"))]
     #[cfg_attr(target_feature = "i8mm", inline(always))]
     pub(super) unsafe fn actualizar_y_salida_i8mm(
         &self,
@@ -157,7 +170,7 @@ impl RedBullet {
         }
     }
 
-    #[target_feature(enable = "i8mm")]
+    #[cfg_attr(not(target_feature = "i8mm"), target_feature(enable = "i8mm"))]
     #[cfg_attr(target_feature = "i8mm", inline(always))]
     pub(super) unsafe fn producto_punto_i8mm(
         &self,

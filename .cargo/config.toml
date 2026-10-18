@@ -41,20 +41,26 @@ linker = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/
 ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
 rustflags = []
 
-# --- Cross-compilation a Windows x64 (para someter a CCRL) ---
-# x86-64-v2 (SSE4.2+POPCNT) es una linea base segura: la soporta
-# practicamente cualquier CPU x86_64 desde ~2009, a diferencia de "native"
-# (que optimizaria para ESTA maquina de build y podria generar SIGILL en la
-# maquina de quien lo descargue). No es tan agresivo como v3/AVX2 a proposito,
-# para no dejar fuera CPUs mas viejas que aun corren Windows moderno.
+# --- Binario universal x86_64 (Windows / Linux / macOS Intel / Rosetta 2) ---
+# x86-64-v2 (SSE4.2+POPCNT) es la linea base segura de compilacion: corre en
+# cualquier CPU x86_64 desde ~2009 sin riesgo de SIGILL, pero el binario
+# detecta en tiempo de ejecucion (`is_x86_feature_detected!`):
+#   - AVX2 (256 bits) vs SSE2 (128 bits) en `src/bullet_net.rs` (tanto en
+#     actualizacion incremental del acumulador como en salida SCReLU).
+#   - BMI2 `PEXT` vs Magic Bitboards en `src/bitboard.rs`, excluyendo
+#     automaticamente AMD pre-Zen 3 (`AuthenticAMD` con `display_family < 0x19`,
+#     donde `PEXT` era microcodificado ~18 ciclos).
 [target.x86_64-pc-windows-gnu]
 linker = "/opt/homebrew/bin/x86_64-w64-mingw32-gcc"
 ar = "/opt/homebrew/bin/x86_64-w64-mingw32-ar"
 rustflags = ["-C", "target-cpu=x86-64-v2"]
 
 # --- Linux x86_64 nativo (para quien clone el repo y compile ahi) ---
-# Misma logica que Windows: x86-64-v2 como piso seguro y portable.
 [target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+# --- macOS x86_64 (Mac Intel y validacion bajo Rosetta 2) ---
+[target.x86_64-apple-darwin]
 rustflags = ["-C", "target-cpu=x86-64-v2"]
 
 # --- Linux ARM64 nativo (ej. servidores ARM, Raspberry Pi 4/5 de 64 bits) ---

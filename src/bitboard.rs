@@ -302,6 +302,63 @@ struct Magics {
     rook: [MagicEntry; 64],
     bishop: [MagicEntry; 64],
     table: Vec<Bitboard>,
+    #[cfg(target_arch = "x86_64")]
+    usa_pext: bool,
+}
+
+/// Evalua a partir de las hojas 0 y 1 de CPUID si el procesador es un AMD
+/// anterior a Zen 3 (`AuthenticAMD` con `display_family < 0x19`), donde `PEXT`
+/// esta microcodificada (~18 ciclos) y es mas lenta que magic bitboards.
+#[cfg(any(target_arch = "x86_64", test))]
+pub fn es_pext_rapido_segun_cpuid(ebx0: u32, edx0: u32, ecx0: u32, eax1: u32) -> bool {
+    // "AuthenticAMD": ebx="Auth" (0x68747541), edx="enti" (0x69746e65), ecx="cAMD" (0x444d4163)
+    let es_amd = ebx0 == 0x6874_7541 && edx0 == 0x6974_6e65 && ecx0 == 0x444d_4163;
+    if es_amd {
+        let base_family = (eax1 >> 8) & 0x0F;
+        let ext_family = (eax1 >> 20) & 0xFF;
+        let display_family = if base_family == 0x0F {
+            base_family + ext_family
+        } else {
+            base_family
+        };
+        return display_family >= 0x19;
+    }
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detectar_pext_rapido() -> bool {
+    if let Ok(v) = std::env::var("MITTENS_BMI2") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" | "magic" => return false,
+            "1" | "true" | "yes" | "on" | "pext" => {
+                return std::arch::is_x86_feature_detected!("bmi2");
+            }
+            _ => {}
+        }
+    }
+    if !std::arch::is_x86_feature_detected!("bmi2") {
+        return false;
+    }
+    let leaf0 = core::arch::x86_64::__cpuid(0);
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    es_pext_rapido_segun_cpuid(leaf0.ebx, leaf0.edx, leaf0.ecx, leaf1.eax)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn pext_u64_hw(occupied: Bitboard, mask: Bitboard) -> usize {
+    let idx: u64;
+    unsafe {
+        core::arch::asm!(
+            "pext {idx}, {occ}, {mask}",
+            idx = out(reg) idx,
+            occ = in(reg) occupied,
+            mask = in(reg) mask,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+    }
+    idx as usize
 }
 
 
@@ -389,8 +446,15 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 fn build_magics() -> Magics {
+    #[cfg(target_arch = "x86_64")]
+    let usa_pext = detectar_pext_rapido();
+    #[cfg(not(target_arch = "x86_64"))]
+    let usa_pext = false;
+    build_magics_con_modo(usa_pext)
+}
+
+fn build_magics_con_modo(_usa_pext: bool) -> Magics {
     let mut table: Vec<Bitboard> = Vec::new();
-    #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut rook: Vec<MagicEntry> = Vec::with_capacity(64);
     let mut bishop: Vec<MagicEntry> = Vec::with_capacity(64);
@@ -400,7 +464,6 @@ fn build_magics() -> Magics {
             let mask = relevant_mask(sq, dirs);
             let bits = popcount(mask);
             let size = 1usize << bits;
-            #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
             let shift = 64 - bits;
 
             // Todos los subconjuntos de la máscara (truco Carry-Rippler) con
@@ -422,20 +485,20 @@ fn build_magics() -> Magics {
             // PEXT empaqueta exactamente los bits relevantes en [0, size).
             // La tabla debe construirse con el MISMO índice que el lookup;
             // una tabla en orden mágico no puede consultarse con PEXT.
-            #[cfg(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2"))]
-            {
+            #[cfg(target_arch = "x86_64")]
+            if _usa_pext {
                 for (i, &occ) in occs.iter().enumerate() {
-                    // SAFETY: esta ruta solo se compila con target_feature=bmi2.
-                    let idx = unsafe { core::arch::x86_64::_pext_u64(occ, mask) } as usize;
+                    // SAFETY: `_usa_pext` solo es true si la CPU soporta BMI2.
+                    let idx = unsafe { pext_u64_hw(occ, mask) };
                     table[offset + idx] = refs[i];
                 }
                 out.push(MagicEntry { mask, magic: 0, shift: 0, offset });
+                continue;
             }
             // Se toma el magico ya resuelto para esta casilla en vez de
             // buscarlo (ver la nota de MAGICOS_TORRE/MAGICOS_ALFIL arriba).
             // El bucle se conserva porque si algun magico precalculado no
             // sirviera, cae a la busqueda de siempre en vez de romperse.
-            #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
             {
                 let mut precalculado = Some(if _es_torre { MAGICOS_TORRE[sq as usize] } else { MAGICOS_ALFIL[sq as usize] });
                 'busqueda: loop {
@@ -486,6 +549,8 @@ fn build_magics() -> Magics {
         rook,
         bishop,
         table,
+        #[cfg(target_arch = "x86_64")]
+        usa_pext: _usa_pext,
     }
 }
 
@@ -494,30 +559,29 @@ fn magics() -> &'static Magics {
 }
 
 #[inline(always)]
-fn slider_index(m: &MagicEntry, occupied: Bitboard) -> usize {
-    #[cfg(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2"))]
-    {
-        // SAFETY: esta ruta solo se compila con target_feature=bmi2.
-        unsafe { core::arch::x86_64::_pext_u64(occupied, m.mask) as usize }
+fn slider_index(ms: &Magics, m: &MagicEntry, occupied: Bitboard) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if ms.usa_pext {
+        // SAFETY: `ms.usa_pext` solo se activa si `is_x86_feature_detected!("bmi2")`
+        // fue verdadero al construir `Magics`.
+        return unsafe { pext_u64_hw(occupied, m.mask) };
     }
-    #[cfg(not(all(feature = "intel-bmi2", target_arch = "x86_64", target_feature = "bmi2")))]
-    {
-        ((occupied & m.mask).wrapping_mul(m.magic) >> m.shift) as usize
-    }
+    let _ = ms;
+    ((occupied & m.mask).wrapping_mul(m.magic) >> m.shift) as usize
 }
 
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let ms = magics();
     let m = &ms.rook[sq as usize];
-    ms.table[m.offset + slider_index(m, occupied)]
+    ms.table[m.offset + slider_index(ms, m, occupied)]
 }
 
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
     let ms = magics();
     let m = &ms.bishop[sq as usize];
-    ms.table[m.offset + slider_index(m, occupied)]
+    ms.table[m.offset + slider_index(ms, m, occupied)]
 }
 
 pub fn queen_attacks(sq: Square, occupied: Bitboard) -> Bitboard {
@@ -889,6 +953,67 @@ mod magicos_tests {
                     slider_attacks_ref(sq, occ, &BISHOP_RAYS),
                     "alfil en {sq} con ocupacion 0x{occ:016X}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn cpuid_pext_excluye_amd_pre_zen3_y_acepta_intel_y_zen3_plus() {
+        // GenuineIntel: ebx="Genu", edx="ineI", ecx="ntel"
+        let (intel_b, intel_d, intel_c) = (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+        // AuthenticAMD: ebx="Auth", edx="enti", ecx="cAMD"
+        let (amd_b, amd_d, amd_c) = (0x6874_7541, 0x6974_6e65, 0x444d_4163);
+        let eax_familia = |display_fam: u32| -> u32 {
+            let base = 0x0Fu32;
+            let ext = display_fam - base;
+            (ext << 20) | (base << 8)
+        };
+        // Intel siempre usa PEXT si tiene BMI2
+        assert!(es_pext_rapido_segun_cpuid(intel_b, intel_d, intel_c, 6 << 8));
+        // AMD Excavator (0x15) y Zen/Zen+/Zen 2 (0x17) -> microcodificado lento (false)
+        assert!(!es_pext_rapido_segun_cpuid(amd_b, amd_d, amd_c, eax_familia(0x15)));
+        assert!(!es_pext_rapido_segun_cpuid(amd_b, amd_d, amd_c, eax_familia(0x17)));
+        // AMD Zen 3/4 (0x19) y Zen 5 (0x1A) -> hardware rapido (true)
+        assert!(es_pext_rapido_segun_cpuid(amd_b, amd_d, amd_c, eax_familia(0x19)));
+        assert!(es_pext_rapido_segun_cpuid(amd_b, amd_d, amd_c, eax_familia(0x1A)));
+    }
+
+    #[test]
+    fn tablas_magics_y_pext_coinciden_con_referencia() {
+        let ms_magic = build_magics_con_modo(false);
+        let mut estado: u64 = 0xCAFE_1234_5678_9ABC;
+        for sq in 0..64u8 {
+            for _ in 0..20 {
+                let occ = xorshift(&mut estado) & xorshift(&mut estado);
+                let mr = &ms_magic.rook[sq as usize];
+                let mb = &ms_magic.bishop[sq as usize];
+                assert_eq!(
+                    ms_magic.table[mr.offset + slider_index(&ms_magic, mr, occ)],
+                    slider_attacks_ref(sq, occ, &ROOK_RAYS)
+                );
+                assert_eq!(
+                    ms_magic.table[mb.offset + slider_index(&ms_magic, mb, occ)],
+                    slider_attacks_ref(sq, occ, &BISHOP_RAYS)
+                );
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("bmi2") {
+            let ms_pext = build_magics_con_modo(true);
+            for sq in 0..64u8 {
+                for _ in 0..20 {
+                    let occ = xorshift(&mut estado) & xorshift(&mut estado);
+                    let mr = &ms_pext.rook[sq as usize];
+                    let mb = &ms_pext.bishop[sq as usize];
+                    assert_eq!(
+                        ms_pext.table[mr.offset + slider_index(&ms_pext, mr, occ)],
+                        slider_attacks_ref(sq, occ, &ROOK_RAYS)
+                    );
+                    assert_eq!(
+                        ms_pext.table[mb.offset + slider_index(&ms_pext, mb, occ)],
+                        slider_attacks_ref(sq, occ, &BISHOP_RAYS)
+                    );
+                }
             }
         }
     }

@@ -92,9 +92,9 @@ const ARQUITECTURAS_SOPORTADAS: [(usize, usize); 4] =
 /// Maximo de output buckets soportado.
 pub const B_MAX: usize = 8;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 mod avx2;
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(target_arch = "x86_64")]
 mod sse2;
 #[cfg(target_arch = "aarch64")]
 mod neon_i8mm;
@@ -115,6 +115,10 @@ pub struct RedBullet {
     /// la CPU soporta FEAT_I8MM y TODOS los pesos originales caben en i8.
     #[cfg(target_arch = "aarch64")]
     l1w_i8: Option<Vec<i8>>,
+    /// Despacho en tiempo de ejecucion en x86_64 (AVX2 si la CPU lo soporta;
+    /// SSE2 universal en caso contrario).
+    #[cfg(target_arch = "x86_64")]
+    usa_avx2: bool,
     /// Permite el producto NEON corto solo cuando es exacto para ESTA red.
     /// El formato sigue aceptando todos los pesos i16 mediante el fallback.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -188,6 +192,8 @@ impl RedBullet {
         } else {
             None
         };
+        #[cfg(target_arch = "x86_64")]
+        let usa_avx2 = avx2::tiene_avx2();
         let l1b_v = leer(cursor, buckets);
 
         let mut l0b = [0i16; H_MAX];
@@ -206,6 +212,8 @@ impl RedBullet {
             l1w,
             #[cfg(target_arch = "aarch64")]
             l1w_i8,
+            #[cfg(target_arch = "x86_64")]
+            usa_avx2,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             l1w_cortos,
             l1b,
@@ -264,9 +272,13 @@ impl RedBullet {
             add.iter().chain(sub).all(|&f| (f as usize) < N_ENTRADA),
             "feature fuera de rango en aplicar_features_desde"
         );
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(target_arch = "x86_64")]
         if self.h % 32 == 0 {
-            self.aplicar_features_desde_avx2(src, dst, add, sub);
+            if self.usa_avx2 {
+                unsafe { self.aplicar_features_desde_avx2(src, dst, add, sub) };
+            } else {
+                unsafe { self.aplicar_features_desde_sse2(src, dst, add, sub) };
+            }
             return;
         }
         #[cfg(target_arch = "aarch64")]
@@ -393,9 +405,13 @@ impl RedBullet {
         // Bloques de 32 i16 = 4 registros NEON. Las redes reales tienen
         // h = 256, 512 o 1024 (todas multiplos de 32); si algun dia hubiera
         // otra, se cae al camino escalar, que da exactamente lo mismo.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(target_arch = "x86_64")]
         if self.h % 32 == 0 {
-            self.aplicar_features_avx2(acc, add, sub);
+            if self.usa_avx2 {
+                unsafe { self.aplicar_features_avx2(acc, add, sub) };
+            } else {
+                unsafe { self.aplicar_features_sse2(acc, add, sub) };
+            }
             return;
         }
         #[cfg(target_arch = "aarch64")]
@@ -439,6 +455,25 @@ impl RedBullet {
         }
         for &f in sub {
             self.restar(acc, f as usize);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn actualizar_y_salida(
+        &self,
+        src: &[[i16; H_MAX]; 2],
+        dst: &mut [[i16; H_MAX]; 2],
+        cambios: &[Cambios; 2],
+        negras_mueven: bool,
+        bucket: usize,
+    ) -> Option<i64> {
+        unsafe {
+            if self.usa_avx2 {
+                self.actualizar_y_salida_avx2(src, dst, cambios, negras_mueven, bucket)
+            } else {
+                self.actualizar_y_salida_sse2(src, dst, cambios, negras_mueven, bucket)
+            }
         }
     }
 
@@ -1067,9 +1102,9 @@ impl AcumBullet {
         {
             #[cfg(target_arch = "x86_64")]
             if self.red.l1w_cortos {
-                #[cfg(target_feature = "avx2")]
-                return self.producto_punto_avx2(yo, rival, bucket);
-                #[cfg(not(target_feature = "avx2"))]
+                if self.red.usa_avx2 {
+                    return unsafe { self.producto_punto_avx2(yo, rival, bucket) };
+                }
                 return self.producto_punto_sse2(yo, rival, bucket);
             }
             self.producto_punto_escalar(yo, rival, bucket)
