@@ -1397,6 +1397,38 @@ pub fn crear_acumulador(b: &Board) -> Option<NnueAccumulator> {
     })
 }
 
+/// Re-ancla el acumulador en `slot` al tablero `b`, reutilizando la asignacion
+/// de la pila `Vec<Nivel>` (~600 KB) cuando ya existe un `AcumBullet` de la
+/// misma red.
+pub fn reiniciar_acumulador(slot: &mut Option<NnueAccumulator>, b: &Board) {
+    if !ACTIVA.load(Ordering::Relaxed) {
+        *slot = None;
+        return;
+    }
+    let Some(red) = *almacenamiento()
+        .read()
+        .expect("candado NNUE envenenado")
+    else {
+        *slot = None;
+        return;
+    };
+    if let (Some(NnueAccumulator::Bullet(acum)), RedCargada::Bullet(r)) = (slot.as_mut(), red)
+        && acum.misma_red(r)
+    {
+        acum.reiniciar_en_tablero(r, b);
+        return;
+    }
+    *slot = Some(match red {
+        RedCargada::Amenazas(r) => NnueAccumulator::Amenazas(AcumAmenazas::desde_tablero(r, b)),
+        RedCargada::Bullet(r) => {
+            NnueAccumulator::Bullet(crate::bullet_net::AcumBullet::desde_tablero(r, b))
+        }
+        RedCargada::BulletAmenazas(r) => NnueAccumulator::BulletAmenazas(
+            crate::bullet_net_amenazas::AcumBulletAmenazas::desde_tablero(r, b),
+        ),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

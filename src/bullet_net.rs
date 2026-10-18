@@ -697,6 +697,29 @@ impl AcumBullet {
         AcumBullet { red, pila: std::cell::RefCell::new(pila), nivel: 0 }
     }
 
+    /// True si este acumulador apunta a la misma instancia estatica de red.
+    #[inline]
+    pub fn misma_red(&self, red: &'static RedBullet) -> bool {
+        std::ptr::eq(self.red, red)
+    }
+
+    /// Re-ancla el acumulador a `b` reutilizando la asignacion `Vec<Nivel>`
+    /// (~600 KB) y los slots de niveles ya reservados en vez de liberar y
+    /// volver a pedir memoria en cada profundidad de iterative deepening y en
+    /// cada llamada a `go`.
+    #[inline]
+    pub fn reiniciar_en_tablero(&mut self, red: &'static RedBullet, b: &Board) {
+        self.red = red;
+        self.nivel = 0;
+        let inicial = Self::nivel_desde_tablero(red, b);
+        let pila = self.pila.get_mut();
+        if pila.is_empty() {
+            pila.push(inicial);
+        } else {
+            pila[0] = inicial;
+        }
+    }
+
     /// Construye UN nivel recalculando el acumulador entero desde el tablero.
     fn nivel_desde_tablero(red: &'static RedBullet, b: &Board) -> Nivel {
         let mut persp = [red.l0b, red.l0b];
