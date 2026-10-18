@@ -6,6 +6,12 @@
 # compilar). La optimizacion especifica del M5 va SOLO en la seccion
 # [target.aarch64-apple-darwin] de abajo, que solo aplica cuando se compila
 # para Mac Apple Silicon.
+# Perfiles de Apple Silicon:
+# - Local en esta Mac (por defecto): `target-cpu=apple-m5` (activa FEAT_I8MM / USDOT inline).
+# - Distribuible M2+ (Mac M2/M3/M4/M5 e iPads M2/M4 con FEAT_I8MM):
+#     RUSTFLAGS="-C target-cpu=apple-m2" cargo build --release
+# - Distribuible universal Apple Silicon (incluye Mac/iPad M1 sin SIGILL):
+#     RUSTFLAGS="-C target-cpu=apple-m1" cargo build --release
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m5", "-C", "target-feature=+dotprod"]
 
@@ -18,10 +24,9 @@ ar = "/opt/homebrew/Caskroom/android-ndk/29/AndroidNDK14206865.app/Contents/NDK/
 # bandera -- no es una optimizacion "a lo mejor la CPU la tiene", es un
 # requisito duro del codigo fuente. dotprod es ARMv8.2+ (~2017 en adelante),
 # lo trae practicamente cualquier telefono o servidor ARM64 moderno
-# (confirmado FEAT_DotProd=1 en los 2 celulares de prueba). Un ARM64 mas
-# viejo que ARMv8.2 simplemente no puede compilar este binario tal como esta
-# escrito el codigo -- eso requeriria agregar una ruta escalar de fallback
-# en neural.rs, que es un cambio de codigo, no de config.
+# (confirmado FEAT_DotProd=1 en los 2 celulares de prueba).
+# Para celulares ARMv8.6+ con FEAT_I8MM (ej. Snapdragon 8 Gen 1..Elite Gen 5):
+#     RUSTFLAGS="-C target-feature=+dotprod,+i8mm" cargo build --release --target aarch64-linux-android
 rustflags = ["-C", "target-feature=+dotprod"]
 
 # --- Android 32 bits (celulares viejos/economicos) ---

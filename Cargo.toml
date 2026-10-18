@@ -16,6 +16,8 @@ tournament = []
 ccrl = ["tournament"]
 # Lookup PEXT para Intel con BMI2; otras arquitecturas conservan magic bitboards.
 intel-bmi2 = []
+# Salida SCReLU exacta con USDOT (FEAT_I8MM) en ARM64 cuando los pesos l1w caben en i8.
+experimental-i8mm = []
 
 [dependencies]
 arrayvec = "0.7.8"

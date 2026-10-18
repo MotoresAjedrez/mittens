@@ -96,7 +96,7 @@ pub const B_MAX: usize = 8;
 mod avx2;
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 mod sse2;
-#[cfg(all(target_arch = "aarch64", target_feature = "i8mm", feature = "experimental-i8mm"))]
+#[cfg(target_arch = "aarch64")]
 mod neon_i8mm;
 
 pub struct RedBullet {
@@ -112,8 +112,8 @@ pub struct RedBullet {
     /// bloque, la mitad "stm" empieza en 0 y la mitad "ntm" en H_MAX.
     l1w: Vec<i16>,
     /// Copia exacta de salida para USDOT. No requantiza: solo se usa cuando
-    /// TODOS los pesos originales caben en i8; otras redes conservan i16.
-    #[cfg(all(target_arch = "aarch64", target_feature = "i8mm", feature = "experimental-i8mm"))]
+    /// la CPU soporta FEAT_I8MM y TODOS los pesos originales caben en i8.
+    #[cfg(target_arch = "aarch64")]
     l1w_i8: Option<Vec<i8>>,
     /// Permite el producto NEON corto solo cuando es exacto para ESTA red.
     /// El formato sigue aceptando todos los pesos i16 mediante el fallback.
@@ -182,8 +182,12 @@ impl RedBullet {
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let l1w_cortos = h <= 1024 && l1w.iter().all(|&w| (-128..=128).contains(&w));
-        #[cfg(all(target_arch = "aarch64", target_feature = "i8mm", feature = "experimental-i8mm"))]
-        let l1w_i8 = l1w.iter().map(|&w| i8::try_from(w)).collect::<Result<Vec<_>, _>>().ok();
+        #[cfg(target_arch = "aarch64")]
+        let l1w_i8 = if neon_i8mm::tiene_i8mm() {
+            l1w.iter().map(|&w| i8::try_from(w)).collect::<Result<Vec<_>, _>>().ok()
+        } else {
+            None
+        };
         let l1b_v = leer(cursor, buckets);
 
         let mut l0b = [0i16; H_MAX];
@@ -200,7 +204,7 @@ impl RedBullet {
             l0w,
             l0b,
             l1w,
-            #[cfg(all(target_arch = "aarch64", target_feature = "i8mm", feature = "experimental-i8mm"))]
+            #[cfg(target_arch = "aarch64")]
             l1w_i8,
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             l1w_cortos,
@@ -458,7 +462,6 @@ impl RedBullet {
         bucket: usize,
     ) -> Option<i64> {
         unsafe {
-            #[cfg(all(target_feature = "i8mm", feature = "experimental-i8mm"))]
             if self.l1w_i8.is_some() {
                 return self.actualizar_y_salida_i8mm(src, dst, cambios, negras_mueven, bucket);
             }
@@ -971,7 +974,6 @@ impl AcumBullet {
         unsafe {
             use std::arch::aarch64::*;
             if self.red.l1w_cortos {
-                #[cfg(all(target_feature = "i8mm", feature = "experimental-i8mm"))]
                 if let Some(suma) = self.red.producto_punto_i8mm(yo, rival, bucket) {
                     return suma;
                 }
