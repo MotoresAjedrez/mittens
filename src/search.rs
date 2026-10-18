@@ -505,10 +505,10 @@ fn hash_no_peones(b: &Board, color: usize) -> u64 {
 /// Actualizacion con "gravedad" (Stockfish): el bonus crece con la
 /// profundidad y con el error, y se amortigua a medida que la entrada se
 /// aleja de cero -- acota la tabla sin resets bruscos.
-fn corrhist_update(entry: &mut i32, diff: i32, depth: i32) {
+fn corrhist_update(entry: &mut i16, diff: i32, depth: i32) {
     let bonus = (diff * depth / 8).clamp(-CORR_MAX, CORR_MAX);
-    *entry += bonus - *entry * bonus.abs() / 512;
-    *entry = (*entry).clamp(-CORR_MAX, CORR_MAX);
+    let value = i32::from(*entry);
+    *entry = (value + bonus - value * bonus.abs() / 512).clamp(-CORR_MAX, CORR_MAX) as i16;
 }
 
 /// Techo de las tablas de historia (mismo orden de magnitud que Stockfish).
@@ -537,10 +537,10 @@ fn hist_bonus(depth: i32) -> i32 {
 /// Antes se hacia `entry += depth*depth` a secas, que con profundidades
 /// altas dejaba unas pocas entradas dominando todo el ordenamiento.
 #[inline]
-fn hist_update(entry: &mut i32, bonus: i32) {
+fn hist_update(entry: &mut i16, bonus: i32) {
     let bonus = bonus.clamp(-MAX_HIST, MAX_HIST);
-    *entry += bonus - *entry * bonus.abs() / MAX_HIST;
-    *entry = (*entry).clamp(-MAX_HIST, MAX_HIST);
+    let value = i32::from(*entry);
+    *entry = (value + bonus - value * bonus.abs() / MAX_HIST).clamp(-MAX_HIST, MAX_HIST) as i16;
 }
 
 // 6 tipos de pieza x 64 casilleros, dos veces (jugada rival + jugada propia).
@@ -1281,7 +1281,7 @@ pub struct Searcher {
     // killers son validos solo dentro de esta busqueda (por ply del arbol
     // actual); history SI persiste entre jugadas de la partida, igual que la TT.
     killers: Vec<[Option<Move>; 2]>,
-    history: Box<[[i32; 64]; 64]>, // [from][to] -- arreglo plano, mas rapido que un HashMap aqui
+    history: Box<[[i16; 64]; 64]>, // [from][to] -- arreglo plano, mas rapido que un HashMap aqui
     // Historial separado para jugadas cuya casilla DESTINO esta amenazada por
     // el rival en el momento de jugarlas (idea tomada de Quanticade Cronus,
     // top-10 CCRL: indexa su historial por amenazas en vez de una sola tabla
@@ -1290,7 +1290,7 @@ pub struct Searcher {
     // difumina la señal. Se consulta ANTES de jugar el movimiento (con el
     // tablero todavia en la posicion actual), asi que refleja si la jugada
     // "camina hacia el peligro", no si termino resultando bien o mal.
-    history_amenaza: Box<[[i32; 64]; 64]>,
+    history_amenaza: Box<[[i16; 64]; 64]>,
     // Continuation history ("counter-move history"): a diferencia de history
     // (que solo sabe "esta jugada [from][to] corto mucho, en general"), esta
     // tabla sabe "esta jugada [pieza][to] corto mucho DESPUES de que el
@@ -1299,16 +1299,16 @@ pub struct Searcher {
     // history plano no distingue del resto. Indexada
     // [pieza_rival][casillero_rival][pieza_propia][casillero_propio],
     // aplanada en un Vec para evitar arrays anidados de tamano fijo.
-    cont_history: Vec<i32>,
+    cont_history: Vec<i16>,
     // Continuation history de 2 plies ("follow-up"): igual que cont_history
     // pero indexada por la jugada PROPIA de 2 plies atras en vez de la
     // jugada rival inmediata -- captura patrones de plan (p.ej. "despues de
     // avanzar este peon, esta jugada de caballo corta mucho").
-    cont_history_2: Vec<i32>,
+    cont_history_2: Vec<i16>,
     // Capture history: historial analogo al de las quiets pero para capturas,
     // indexado [pieza_que_mueve][destino][victima]. Solo se usa como DESEMPATE
     // dentro del carril que ya define el SEE (ver clave_orden_movimiento).
-    capture_history: Vec<i32>,
+    capture_history: Vec<i16>,
     // Counter moves: la mejor respuesta silenciosa conocida contra cada
     // jugada rival (pieza, destino). Se prueba en el ordenamiento despues
     // de los killers.
@@ -1397,10 +1397,10 @@ pub struct Searcher {
     // la de 2 plies atras en la MISMA linea (mismo bando a mover).
     eval_stack: Vec<i32>,
     // Correction history (ver constantes CORR_* arriba): [bando][hash].
-    corr_pawn: Vec<i32>,
-    corr_nonpawn: [Vec<i32>; 2],
+    corr_pawn: Vec<i16>,
+    corr_nonpawn: [Vec<i16>; 2],
     // Continuation corrhist: (pieza_rival, destino_rival, bando) aplanado.
-    corr_cont: Vec<i32>,
+    corr_cont: Vec<i16>,
     // Lazy SMP: escalonamiento de profundidad (skip arrays al estilo
     // Stockfish clasico). `Some((size, phase))` hace que este hilo AYUDANTE
     // se saltee bloques de iteraciones de la profundizacion: salta la
@@ -1459,8 +1459,8 @@ pub struct Searcher {
     /// Mientras esta en true, `check_time` NO levanta `self.stop`: ni por
     /// deadline ni por la bandera externa. Se usa SOLO durante la primera
     /// iteracion de profundizacion (ver search_time) para garantizar que la
-    /// profundidad 1 siempre termine y `mejor_mv` sea una jugada realmente
-    /// buscada, nunca el fallback de generacion. Cuesta microsegundos.
+    /// profundidad 1 termine cuando hay margen. Con techo <=10 ms el reloj
+    /// manda tambien en esa iteracion; el fallback legal evita bestmove 0000.
     blindar_stop: bool,
 }
 
@@ -1492,11 +1492,11 @@ impl Searcher {
             stop: false,
             tt_generation: 0,
             killers: vec![[None, None]; MAX_KILLER_PLY],
-            history: Box::new([[0i32; 64]; 64]),
-            history_amenaza: Box::new([[0i32; 64]; 64]),
-            cont_history: vec![0i32; CONT_HIST_SIZE],
-            cont_history_2: vec![0i32; CONT_HIST_SIZE],
-            capture_history: vec![0i32; CAPT_HIST_SIZE],
+            history: Box::new([[0i16; 64]; 64]),
+            history_amenaza: Box::new([[0i16; 64]; 64]),
+            cont_history: vec![0i16; CONT_HIST_SIZE],
+            cont_history_2: vec![0i16; CONT_HIST_SIZE],
+            capture_history: vec![0i16; CAPT_HIST_SIZE],
             counter_moves: vec![None; 6 * 64],
             // Activado por defecto: el torneo h2h de esta sesion confirmo
             // +80 ELO (61.3% en 40 partidas) con la reescritura PVS -- ver
@@ -1596,11 +1596,11 @@ impl Searcher {
             nodes_limit: None,
             stop: false,
             killers: vec![[None, None]; MAX_KILLER_PLY],
-            history: Box::new([[0i32; 64]; 64]),
-            history_amenaza: Box::new([[0i32; 64]; 64]),
-            cont_history: vec![0i32; CONT_HIST_SIZE],
-            cont_history_2: vec![0i32; CONT_HIST_SIZE],
-            capture_history: vec![0i32; CAPT_HIST_SIZE],
+            history: Box::new([[0i16; 64]; 64]),
+            history_amenaza: Box::new([[0i16; 64]; 64]),
+            cont_history: vec![0i16; CONT_HIST_SIZE],
+            cont_history_2: vec![0i16; CONT_HIST_SIZE],
+            capture_history: vec![0i16; CAPT_HIST_SIZE],
             counter_moves: vec![None; 6 * 64],
             tt_generation: 0,
             modo_lmr,
@@ -1910,13 +1910,13 @@ impl Searcher {
     fn eval_corregida(&self, b: &Board, static_eval: i32, prev: Option<(usize, usize)>) -> i32 {
         let stm = b.turn as usize;
         let base = stm * CORR_SIZE;
-        let pawn = self.corr_pawn[base + (hash_peones(b) as usize & CORR_MASK)];
-        let npw = self.corr_nonpawn[0]
-            [base + (hash_no_peones(b, 0) as usize & CORR_MASK)];
-        let npb = self.corr_nonpawn[1]
-            [base + (hash_no_peones(b, 1) as usize & CORR_MASK)];
+        let pawn = i32::from(self.corr_pawn[base + (hash_peones(b) as usize & CORR_MASK)]);
+        let npw = i32::from(self.corr_nonpawn[0]
+            [base + (hash_no_peones(b, 0) as usize & CORR_MASK)]);
+        let npb = i32::from(self.corr_nonpawn[1]
+            [base + (hash_no_peones(b, 1) as usize & CORR_MASK)]);
         let cont = match prev {
-            Some((pt, to)) => self.corr_cont[(pt * 64 + to) * 2 + stm],
+            Some((pt, to)) => i32::from(self.corr_cont[(pt * 64 + to) * 2 + stm]),
             None => 0,
         };
         static_eval + (pawn + (npw + npb) / 2 + cont / 2) / 2
@@ -2208,7 +2208,7 @@ impl Searcher {
             // rango material ocupa [0, 7200], asi que un desempate de +-400
             // solo reordena capturas de valor CASI IGUAL: nunca saca a una
             // captura de su carril.
-            let ch = self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))]
+            let ch = i32::from(self.capture_history[capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))])
                 .clamp(-400, 400);
             if see >= 0 {
                 return -(10_000 + see * 8 + ch);
@@ -2238,20 +2238,20 @@ impl Searcher {
         }
         let mapa = *amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
         let h = if crate::bitboard::bit(mv.to) & mapa != 0 {
-            self.history_amenaza[mv.from as usize][mv.to as usize]
+            i32::from(self.history_amenaza[mv.from as usize][mv.to as usize])
         } else {
-            self.history[mv.from as usize][mv.to as usize]
+            i32::from(self.history[mv.from as usize][mv.to as usize])
         };
         let pt_mv = b.piece_at(mv.from).map(|(_, pt)| pt as usize).unwrap_or(0);
         let ch = match prev {
             Some((prev_pt, prev_to)) => {
-                self.cont_history[cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize)]
+                i32::from(self.cont_history[cont_idx(prev_pt, prev_to, pt_mv, mv.to as usize)])
             }
             None => 0,
         };
         let ch2 = match prev2 {
             Some((p2_pt, p2_to)) => {
-                self.cont_history_2[cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize)]
+                i32::from(self.cont_history_2[cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize)])
             }
             None => 0,
         };
@@ -3625,19 +3625,19 @@ impl Searcher {
                     let mapa = *amenazas.get_or_insert_with(|| b.attack_map(b.turn.opposite()));
                     let dest_amenazada = crate::bitboard::bit(mv.to) & mapa != 0;
                     let h = if dest_amenazada {
-                        self.history_amenaza[mv.from as usize][mv.to as usize]
+                        i32::from(self.history_amenaza[mv.from as usize][mv.to as usize])
                     } else {
-                        self.history[mv.from as usize][mv.to as usize]
+                        i32::from(self.history[mv.from as usize][mv.to as usize])
                     };
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
-                            self.cont_history[cont_idx(p_pt, p_to, pt_q, mv.to as usize)]
+                            i32::from(self.cont_history[cont_idx(p_pt, p_to, pt_q, mv.to as usize)])
                         }
                         None => 0,
                     };
                     let ch2 = match prev2 {
                         Some((p2_pt, p2_to)) => {
-                            self.cont_history_2[cont_idx(p2_pt, p2_to, pt_q, mv.to as usize)]
+                            i32::from(self.cont_history_2[cont_idx(p2_pt, p2_to, pt_q, mv.to as usize)])
                         }
                         None => 0,
                     };
@@ -3834,19 +3834,19 @@ impl Searcher {
                     // continuation history. Se suma tambien cont_history_2
                     // (follow-up a 2 plies), que antes no se usaba aca.
                     let h = if dest_amenazada {
-                        self.history_amenaza[mv.from as usize][mv.to as usize]
+                        i32::from(self.history_amenaza[mv.from as usize][mv.to as usize])
                     } else {
-                        self.history[mv.from as usize][mv.to as usize]
+                        i32::from(self.history[mv.from as usize][mv.to as usize])
                     };
                     let ch = match prev {
                         Some((p_pt, p_to)) => {
-                            self.cont_history[cont_idx(p_pt, p_to, pt_mv, mv.to as usize)]
+                            i32::from(self.cont_history[cont_idx(p_pt, p_to, pt_mv, mv.to as usize)])
                         }
                         None => 0,
                     };
                     let ch2 = match prev2 {
                         Some((p2_pt, p2_to)) => {
-                            self.cont_history_2[cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize)]
+                            i32::from(self.cont_history_2[cont_idx(p2_pt, p2_to, pt_mv, mv.to as usize)])
                         }
                         None => 0,
                     };
@@ -3867,8 +3867,8 @@ impl Searcher {
                     // buen resultado antes), se resta 1 mas -- igual que el
                     // bonus de history para quiets arriba.
                     r -= 1;
-                    let ch_capt = self.capture_history
-                        [capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))];
+                    let ch_capt = i32::from(self.capture_history
+                        [capt_idx(pt_mv, mv.to as usize, victima_de(b, mv))]);
                     if ch_capt > 0 {
                         r -= 1;
                     }
@@ -4332,6 +4332,9 @@ impl Searcher {
         max_depth: i32,
         mut on_info: impl FnMut(i32, i32, u64, u64, &[Move]),
     ) -> (Option<Move>, i32, i32) {
+        // El reloj incluye preparacion de historial, NNUE y raiz, no solo
+        // el bucle de profundizacion: esa preparacion ya consume tiempo UCI.
+        let inicio = Instant::now();
         // Red de seguridad (ver from_fen y search_fixed_depth): nunca buscar
         // una posicion ilegal; devolver sin jugada (bestmove 0000) en vez de
         // abortar el proceso por la captura del rey rival.
@@ -4413,7 +4416,6 @@ impl Searcher {
             }
         }
 
-        let inicio = Instant::now();
         // GESTION DE TIEMPO DE DOS PRESUPUESTOS (estilo timeman.cpp):
         //   - `optimo` = movetime_ms: el objetivo normal, y la base sobre la
         //     que se aplican los factores reactivos del corte blando.
@@ -4441,16 +4443,26 @@ impl Searcher {
             (None, _) => None,
         };
         self.deadline = maximo_ms.map(|ms| {
-            let budget = ms.saturating_sub(margen_interno_tiempo(ms));
+            // Un objetivo de 1 ms con techo de 2 ms no puede repetirse
+            // indefinidamente sobre los ultimos milisegundos del reloj.
+            // En emergencia se devuelve la jugada legal/TT ya disponible.
+            let budget = if hay_reloj_real && ms <= 2 {
+                0
+            } else {
+                ms.saturating_sub(margen_interno_tiempo(ms))
+            };
             inicio + std::time::Duration::from_millis(budget)
         });
 
         // Siempre conservar una jugada legal de emergencia. Asi un reloj de
         // pocos milisegundos no termina en bestmove 0000 si no completa depth 1.
-        let fallback = match &self.root_moves_filtro {
-            Some(filtro) => generate_legal(b).into_iter().find(|m| filtro.contains(m)),
-            None => generate_legal(b).into_iter().next(),
-        };
+        let legales = generate_legal(b);
+        let permitida = |mv: &Move| self.root_moves_filtro.as_ref()
+            .is_none_or(|filtro| filtro.contains(mv));
+        let fallback = self.tt_probe(b.zobrist)
+            .and_then(|entry| entry.best)
+            .filter(|mv| legales.contains(mv) && permitida(mv))
+            .or_else(|| legales.into_iter().find(permitida));
         let mut mejor_mv: Option<Move> = fallback;
         let mut mejor_sc: i32 = self.evaluar_completo(b, &root_eval);
         let mut mejor_prof = 0;
@@ -4479,12 +4491,12 @@ impl Searcher {
             {
                 continue;
             }
-            // Blindaje de la profundidad 1 (ver `blindar_stop`): sin esto, un
-            // "stop" que llega en el primer milisegundo abortaba antes de
-            // puntuar una sola jugada de raiz y se devolvia el fallback de
-            // generacion (a2a3 en la posicion inicial). A partir de d=2 el
-            // corte es normal, porque ya hay una jugada buscada que devolver.
-            self.blindar_stop = d == 1;
+            // En relojes diminutos depth 1 tambien debe respetar el techo;
+            // el fallback legal cubre una interrupcion antes de completarlo.
+            if self.deadline.is_some_and(|dl| Instant::now() >= dl) {
+                break;
+            }
+            self.blindar_stop = d == 1 && maximo_ms.is_none_or(|ms| ms > 10);
             self.reiniciar_nnue(b);
             let mut moves = generate_legal(b);
             if let Some(filtro) = &self.root_moves_filtro {
@@ -4737,11 +4749,9 @@ impl Searcher {
             if mejor_sc.abs() >= MATE - 1000 {
                 break;
             }
-            // En ultrabullet el deadline duro ya reserva margen; el corte
-            // blando impedía completar la siguiente iteración aun cuando
-            // quedaban milisegundos útiles. Para tiempos normales se
-            // conserva el comportamiento previo, pero ahora la fraccion es
-            // ADAPTATIVA segun la estabilidad del PV en vez de un 70% fijo:
+            // Con reloj real hay que ahorrar tambien por debajo de 25 ms:
+            // omitir este corte gastaba hasta cuatro objetivos por jugada.
+            // La fraccion es adaptativa segun la estabilidad de la PV:
             // PV estable hace varias iteraciones -> se puede cortar antes.
             // PV recien cambio -> se le da mas margen para una iteracion
             // adicional que confirme la jugada nueva.
@@ -4781,7 +4791,6 @@ impl Searcher {
             // la practica se clava en el techo duro y duplica el reloj
             // gastado por jugada.
             if let Some(ms) = optimo_ms
-                && ms > 25
                 && hay_reloj_real
                 && !self.ayudante_smp
             {
@@ -4849,15 +4858,15 @@ pub struct ResultadoHilo {
 /// caso el ordenamiento de jugadas arranca con estadisticas de la jugada
 /// anterior, que es exactamente el objetivo.
 pub struct TablasPersistentes {
-    history: Box<[[i32; 64]; 64]>,
-    history_amenaza: Box<[[i32; 64]; 64]>,
-    cont_history: Vec<i32>,
-    cont_history_2: Vec<i32>,
-    capture_history: Vec<i32>,
+    history: Box<[[i16; 64]; 64]>,
+    history_amenaza: Box<[[i16; 64]; 64]>,
+    cont_history: Vec<i16>,
+    cont_history_2: Vec<i16>,
+    capture_history: Vec<i16>,
     counter_moves: Vec<Option<Move>>,
-    corr_pawn: Vec<i32>,
-    corr_nonpawn: [Vec<i32>; 2],
-    corr_cont: Vec<i32>,
+    corr_pawn: Vec<i16>,
+    corr_nonpawn: [Vec<i16>; 2],
+    corr_cont: Vec<i16>,
 }
 
 /// Memoria persistente de UN hilo de Lazy SMP entre llamadas a "go".
@@ -6401,5 +6410,61 @@ mod regresiones_terminales {
             -MATE + 1
         );
         assert_eq!(score, -MATE + 1);
+    }
+}
+
+#[cfg(test)]
+mod compact_history_tests {
+    use super::*;
+
+    #[test]
+    fn compact_hist_matches_i32_reference_at_every_storable_value() {
+        for initial in -MAX_HIST..=MAX_HIST {
+            for bonus in [-40000i32, -16384, -1600, -20, 0, 20, 1600, 16384, 40000] {
+                let bounded = bonus.clamp(-MAX_HIST, MAX_HIST);
+                let expected = (initial + bounded - initial * bounded.abs() / MAX_HIST)
+                    .clamp(-MAX_HIST, MAX_HIST);
+                let mut compact = initial as i16;
+                hist_update(&mut compact, bonus);
+                assert_eq!(i32::from(compact), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_correction_matches_i32_reference() {
+        for initial in -CORR_MAX..=CORR_MAX {
+            for diff in [-30000i32, -513, -128, -1, 0, 1, 128, 513, 30000] {
+                for depth in [0, 1, 2, 8, 64, 128] {
+                    let bonus = (diff * depth / 8).clamp(-CORR_MAX, CORR_MAX);
+                    let expected = (initial + bonus - initial * bonus.abs() / 512)
+                        .clamp(-CORR_MAX, CORR_MAX);
+                    let mut compact = initial as i16;
+                    corrhist_update(&mut compact, diff, depth);
+                    assert_eq!(i32::from(compact), expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod emergency_clock_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_clock_returns_legal_tt_move_without_starting_depth_one() {
+        let board = Board::from_fen("r1bqk2r/ppp2ppp/2n2n2/2bpp3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 6").unwrap();
+        let mut searcher = Searcher::new(1);
+        let legal = generate_legal(&board);
+        // Seed a legal choice that differs from the first generated move.
+        let preferred = *legal.last().unwrap();
+        assert_ne!(preferred, legal[0]);
+        searcher.tt_store(board.zobrist, 12, 0, 0, TTFlag::Exact, Some(preferred), true);
+        searcher.tiempo_maximo_ms = Some(2);
+        let (mv, _, depth) = searcher.search_time(&board, Some(1), 64, |_, _, _, _, _| {});
+        assert_eq!(mv, Some(preferred));
+        assert_eq!(depth, 0);
+        assert_eq!(searcher.nodes, 0);
     }
 }

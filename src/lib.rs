@@ -1098,7 +1098,7 @@ fn calcular_movetime_reloj(
 /// DOS limites, y manda el mas chico:
 ///  - 80% del tiempo realmente disponible en el reloj (ya descontado el
 ///    Move Overhead): la red de seguridad absoluta.
-///  - 4x el presupuesto objetivo: sin esto, una sola iteracion profunda
+///  - 2x el objetivo con <=1s en el reloj; 4x con mas tiempo. Una iteracion
 ///    arrancada justo antes del corte blando podia comerse casi todo el
 ///    reloj de golpe (se midio una partida perdida por tiempo asi).
 /// Perder por tiempo es peor que cualquier Elo que se gane.
@@ -1111,7 +1111,10 @@ fn calcular_movetime_maximo(
     let mio = mio_i.max(0) as u64;
     let disponible = mio.saturating_sub(move_overhead_ms);
     let por_reloj = disponible.saturating_mul(80) / 100;
-    let por_objetivo = objetivo_ms.saturating_mul(4);
+    // Con menos de un segundo no conviene gastar cuatro objetivos en una
+    // sola jugada: se agotaba el reloj antes de alcanzar el final.
+    let multiplicador = if mio <= 1_000 { 2 } else { 4 };
+    let por_objetivo = objetivo_ms.saturating_mul(multiplicador);
     let maximo = por_reloj.min(por_objetivo);
     // Tercer limite: el tope duro del operador ("Max Move Time", 0 = off).
     // Manda el mas chico de los tres.
@@ -1867,14 +1870,15 @@ pub fn uci_loop() {
                     continue;
                 }
 
-                // A relojes extremadamente cortos el overhead de crear y
-                // despertar el hilo UCI pesa tanto como una fracción de la
-                // búsqueda. Como `go movetime` ya tiene deadline duro y este
-                // camino es exclusivo de <=25ms/Threads=1, responder de modo
-                // síncrono gana tiempo real sin dejar una búsqueda infinita
-                // imposible de detener.
+                // En presupuestos diminutos el coste de crear y despertar
+                // el hilo pesa sobre el reloj. Esta ruta de un solo hilo
+                // solo acepta busquedas acotadas a <=25 ms.
+                // Un reloj real con techo <=25 ms tambien puede responder
+                // aqui: evita crear un hilo cuando ese coste consume buena
+                // parte de la jugada. Infinite/ponder siguen asincronos.
+                let reloj_ultracorto = movetime_maximo.is_some_and(|ms| ms <= 25);
                 if n_hilos == 1
-                    && sync_ultrabullet
+                    && (sync_ultrabullet || reloj_ultracorto)
                     && !partes.contains(&"ponder")
                     && movetime.is_some_and(|ms| ms <= 25)
                 {
@@ -2044,6 +2048,19 @@ mod tests {
         assert_eq!(calcular_movetime_reloj(20, 0, 30, 75, 0), 1);
         assert!(calcular_movetime_reloj(1_000, 0, 1, 75, 0) <= 925);
         assert!(calcular_movetime_reloj(10_000, 100, 30, 75, 0) <= 9_925);
+    }
+
+    #[test]
+    fn reloj_corto_reserva_tiempo_para_las_siguientes_jugadas() {
+        for reloj in [10, 20, 50, 100, 250, 500, 1_000] {
+            let objetivo = calcular_movetime_reloj(reloj, 0, 30, 5, 0);
+            let maximo = super::calcular_movetime_maximo(reloj, 5, objetivo, 0);
+            assert!(maximo <= (2 * objetivo).max(1));
+            assert!(maximo <= ((reloj as u64).saturating_sub(5) * 80 / 100).max(1));
+        }
+        // El reparto normal y el tope del operador siguen disponibles.
+        assert_eq!(super::calcular_movetime_maximo(10_000, 5, 100, 0), 400);
+        assert_eq!(super::calcular_movetime_maximo(1_000, 5, 100, 50), 50);
     }
 
     /// "Max Move Time" se anunciaba en `uci` como tope duro por jugada pero

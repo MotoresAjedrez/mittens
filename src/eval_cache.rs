@@ -58,11 +58,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Mascara de los 48 bits de verificacion (los altos del zobrist).
 const TAG_MASK: u64 = !0xFFFF;
 
-/// Tamano por defecto en MB. 16 MB = 2^21 casilleros de 8 bytes: bastante
-/// mas chico que la TT por defecto (64 MB) porque cada acierto ahorra "solo"
-/// un producto punto (~cientos de ns), no un subarbol; no hace falta
-/// retener posiciones viejas por mucho tiempo.
-const DEFAULT_MB: usize = 16;
+/// Tamano por defecto en MiB. 2 MiB dejan espacio en la L2 compartida del
+/// M5 para pesos NNUE, historiales y datos de busqueda. Se puede ajustar
+/// con MITTENS_EVAL_CACHE_MB; cero deshabilita la cache.
+const DEFAULT_MB: usize = 2;
 const MAX_MB: usize = 4096;
 
 /// `None` = cache deshabilitada (MITTENS_EVAL_CACHE_MB=0).
