@@ -445,6 +445,18 @@ fn se_doble_activa() -> bool {
     *CACHE.get_or_init(|| std::env::var("MITTENS_SE_DOBLE").as_deref() != Ok("0"))
 }
 
+/// Pesos 2*h + ch + ch2 en clave_orden_movimiento (consistente con LMR y poda de quiets).
+fn orden_hist_2x() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("MITTENS_ORDEN_HIST2X").as_deref() == Ok("1"))
+}
+
+/// Activa LMR desde la segunda jugada (idx >= 1) para quiets fuera de la PV.
+fn lmr_quiet_desde_1() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("MITTENS_LMR_QUIET1").as_deref() == Ok("1"))
+}
+
 // Tabla LMR precalculada: reduccion base en plies para cada par
 // (profundidad, numero de jugada en el orden). Formula logaritmica clasica
 // (Ethereal/Stockfish): crece suave con ambas -- las jugadas muy tardias a
@@ -2311,7 +2323,11 @@ impl Searcher {
         // killers (-3000). Dividida por 16 queda acotada a ~+-3072, ordenando
         // los quiets entre si con buena granularidad sin sacar a ninguno de
         // su carril salvo casos extremos.
-        -((h + ch + ch2) / 16)
+        if orden_hist_2x() {
+            -((2 * h + ch + ch2) / 24)
+        } else {
+            -((h + ch + ch2) / 16)
+        }
     }
 
     /// Igual que order_moves pero ademas usa killers/history (por ply) para
@@ -3563,6 +3579,8 @@ impl Searcher {
                 && if mv.is_capture() {
                     idx >= LMR_CAPTURAS_MOVES_SIN_REDUCIR
                         && self.see_negamax[pl_claves][idx] < 0
+                } else if !es_pv && lmr_quiet_desde_1() {
+                    idx >= 1
                 } else {
                     idx >= LMR_MOVES_SIN_REDUCIR
                 };
@@ -5219,6 +5237,17 @@ impl Drop for PoolHilosSMP {
 /// Searcher normal persiste entre llamadas a "go" -- si se reconstruyera
 /// de cero en cada jugada, Lazy SMP perderia la continuidad de la TT entre
 /// plies, una desventaja injusta frente a la version de un solo hilo.
+/// Tabla de escalonamiento de profundidad `(size, phase)` para hilos ayudantes
+/// (`i >= 1`) en Lazy SMP. Como `((d + phase) / size) % 2` tiene periodo
+/// `2 * size` en `phase`, cada bloque `size = 1..=4` tiene exactamente
+/// `2 * size` fases distintas (`2 + 4 + 6 + 8 = 20` patrones únicos).
+pub(crate) const SALTOS_SMP: [(u32, u32); 20] = [
+    (1, 0), (1, 1),
+    (2, 0), (2, 1), (2, 2), (2, 3),
+    (3, 0), (3, 1), (3, 2), (3, 3), (3, 4), (3, 5),
+    (4, 0), (4, 1), (4, 2), (4, 3), (4, 4), (4, 5), (4, 6), (4, 7),
+];
+
 #[allow(clippy::too_many_arguments)]
 pub fn buscar_lazy_smp(
     b: &Board,
@@ -5250,14 +5279,12 @@ pub fn buscar_lazy_smp(
 
     // Escalonamiento de profundidad para los AYUDANTES (i >= 1): tabla de
     // (size, phase) al estilo de los SkipSize/SkipPhase del Stockfish
-    // clasico. El hilo 0 (principal) nunca salta; los ayudantes se saltean
-    // bloques de iteraciones y quedan 1-2 plies por delante, llenando la TT
-    // compartida con entradas mas profundas que aceleran al principal.
-    const SALTOS: [(u32, u32); 20] = [
-        (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2), (2, 3),
-        (3, 0), (3, 1), (3, 2), (3, 3), (4, 0), (4, 1), (4, 2),
-        (4, 3), (4, 4), (4, 5), (5, 0), (5, 1), (5, 2),
-    ];
+    // clasico. Como `((d + phase) / size) % 2` tiene periodo `2 * size` en
+    // `phase`, cada bloque `size` tiene exactamente `2 * size` fases
+    // distintas: 2 + 4 + 6 + 8 = 20 entradas (antes `SALTOS[2]` era `(1, 2)`,
+    // equivalente idéntico a `(1, 0)`, haciendo que el 4.º hilo duplicara el
+    // patrón de saltos del 2.º hilo en Threads=4).
+    const SALTOS: [(u32, u32); 20] = SALTOS_SMP;
 
     // Bandera de aborto de los ayudantes: la levanta este hilo en cuanto el
     // hilo principal (indice 0) devuelve su resultado. Ver `stop_ayudantes`.
@@ -6948,4 +6975,28 @@ mod emergency_clock_tests {
         assert_eq!(depth, 0);
         assert_eq!(searcher.nodes, 0);
     }
+
+    #[test]
+    fn saltos_smp_tienen_20_patrones_unicos() {
+        let mut mascaras: Vec<u64> = Vec::with_capacity(SALTOS_SMP.len());
+        for &(size, phase) in &SALTOS_SMP {
+            assert!(size >= 1 && size <= 4);
+            assert!(phase < 2 * size, "phase={} excede el periodo 2*size={}", phase, 2 * size);
+            let mut mask = 0u64;
+            for d in 2u32..=64 {
+                if ((d + phase) / size) % 2 == 1 {
+                    mask |= 1u64 << (d - 2);
+                }
+            }
+            assert!(
+                !mascaras.contains(&mask),
+                "patron duplicado en SALTOS_SMP para ({}, {})",
+                size,
+                phase
+            );
+            mascaras.push(mask);
+        }
+        assert_eq!(mascaras.len(), 20);
+    }
 }
+

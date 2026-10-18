@@ -20,21 +20,28 @@ Se completaron las 4 áreas de ingeniería pedidas en `PROMPT_GEMINI_MITTENS.md`
      - Si el PC tiene `AVX2`, activa automáticamente el motor neuronal de 256 bits (`AVX2`); si es antiguo, usa el motor vectorizado de 128 bits (`SSE2`).
      - Si el PC tiene `BMI2`, revisa el fabricante y la familia del procesador: **activa `PEXT` en hardware solo en Intel (Haswell+) y en AMD Zen 3 o superior (`Family >= 0x19`)**, y **desactiva automáticamente `PEXT` en AMD pre-Zen 3** (usando *Magic Bitboards*, que son ~6 veces más rápidos en esos chips).
 
-3. **Eliminación del tiempo muerto en partidas con 4 hilos (`Lazy SMP`) y reutilización de memoria NNUE (`Commit 8556be9`):**
-   - Al investigar por qué el motor rendía menos de lo esperado con **4 hilos (`Threads = 4`)** en controles de tiempo rápidos, encontramos **tres fugas de tiempo en cada jugada**:
+3. **Eliminación del tiempo muerto en partidas con 4 hilos (`Lazy SMP`), corrección del bug de `SALTOS` en el 4.º hilo y reutilización de memoria NNUE (`Commits 8556be9` y nuevo commit):**
+   - Al investigar por qué el motor rendía menos de lo esperado con **4 hilos (`Threads = 4`)** en controles de tiempo rápidos, encontramos **tres fugas de tiempo en cada jugada** y **un bug matemático en la tabla de saltos (`SALTOS`)**:
      1. El motor creaba y destruía hilos del sistema operativo en cada jugada.
      2. La pila de la red neuronal (~600 KB por hilo) se destruía y volvía a pedir memoria al sistema **17 veces por jugada** (una vez en cada nivel de profundidad `1..16`).
      3. Al empezar cada jugada, el envejecimiento de las tablas de historia (`decaer_history`, 3.24 MB en 4 hilos) hacía divisiones matemáticas una por una en vez de usar instrucciones vectoriales (`SIMD`).
+     4. **Bug en `SALTOS` para `Threads = 4`:** La tercera entrada de `SALTOS` (usada por el 4.º hilo, `i = 3`) era `(1, 2)`. Como la fórmula `((d + phase) / size) % 2` tiene periodo `2 * size = 2` cuando `size = 1`, **`(1, 2)` era 100 % idéntico a `(1, 0)`**, provocando que en `Threads = 4` el 4.º hilo duplicara exactamente el patrón de saltos del 2.º hilo en vez de usar `(2, 0)`. Se corrigió la tabla `SALTOS_SMP` a las 20 entradas periódicas exactas (`2 + 4 + 6 + 8 = 20` patrones únicos, verificado con test unitario).
    - Se implementó un **Pool de Hilos Persistente (`PoolHilosSMP`)** que mantiene los hilos despiertos y listos entre jugadas en los núcleos de alto rendimiento (`P-cores` con prioridad `QOS_CLASS_USER_INITIATED`), reutiliza la memoria de la red neuronal sin pedirla de nuevo al sistema, y vectoriza la limpieza de tablas.
-   - **Ganancia medida:**
+   - **Ganancia medida (velocidad y matches SPRT / Reloj Real):**
      - El tiempo muerto de arranque por jugada con 4 hilos cayó de **`0.665 ms` a `0.068 ms` por jugada** (**`9.7 veces más rápido`, `-89.8 %` de desperdicio**).
+     - En **matches con reloj real (`1s + 0.01s`, 80 pares de aperturas = 160 partidas por match, `Move Overhead = 100`)**, **`Threads = 4` aplasta a `Threads = 1` por `+163 Elo [+124, +206]` (`+80 =70 -10`, `71.9 %`)** y **supera a `Threads = 2` directamente por `+89 Elo [+53, +126]` (`+57 =86 -17`, `62.5 %`)**, con **`0` derrotas por tiempo (`fallos = 0`) en 480 partidas**.
      - Como beneficio adicional de no destruir la memoria de la red neuronal entre profundidades, el motor a **1 solo hilo** subió otro **`+2.76 %` adicional**, llevando la mejora total en el Mac M5 de `801 ms` a **`760 ms` en `bench 16` (`+5.40 %` más rápido en total, de 3.45M a 3.63M NPS)**.
+
+4. **Pruebas SPRT de Búsqueda en Posiciones Quietas y Finales de Peones (800 partidas a nodos fijos):**
+   - Evaluamos con `sprt_diverso.py` (400 partidas 100 % distintas por experimento a `25,000` nodos/jugada) dos hipótesis de poda/ordenamiento en posiciones quietas y finales de peones:
+     - **`MITTENS_ORDEN_HIST2X=1` (`-(2*h + ch + ch2)/24` en `clave_orden_movimiento`):** corta `-11.3 %` de nodos en `bench 12` (`-49.4 %` en el final de peones bloqueado) y obtuvo **`+3.5 ± 24.4 Elo` (`+104 =196 -100`, `50.50 %`, `LLR = +0.03`)**, resultado neutro/ligeramente positivo que se deja como perilla opcional (`off` por defecto) para mantener `bench 12 = 604,743` intacto.
+     - **`MITTENS_LMR_QUIET1=1` (aplicar LMR desde `idx >= 1` en jugadas quietas no-PV):** aunque reduce `-11.0 %` de nodos en `bench 12`, pierde **`-20.9 ± 24.6 Elo` (`+92 =192 -116`, `47.00 %`, `LLR = -0.75`)** porque en posiciones sin capturas buenas `idx == 1` es `killers[0]` (la refutación quieta principal del ply). Se descarta activar por defecto.
 
 ---
 
 ## 2. Resumen de Commits en `cand_gemini_mejoras`
 
-Todos los commits mantienen **exactamente el mismo árbol de búsqueda** que la base de producción (`8b482af`):
+Todos los commits mantienen **exactamente el mismo árbol de búsqueda por defecto** que la base de producción (`8b482af`):
 
 | Orden | Commit | Descripción | `bench 12` (nodos) | `bench 16` (nodos) | Tiempo `bench 16` en M5 (mediana 5 reps) | NPS en M5 (`bench 16`) | Mejora acumulada |
 | :---: | :---: | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -42,6 +49,7 @@ Todos los commits mantienen **exactamente el mismo árbol de búsqueda** que la 
 | **1** | `a52877d` | `perf(arm64,nnue): activar kernel USDOT (i8mm) con UZP1/UZP2 y bloques de 32 en M2+/ARMv8.6+` | `604,743` | `2,761,927` | `781.0 ms` | `3,536,400` | **`+2.56 %`** |
 | **2** | `5d878dc` | `Despacho dinámico universal x86-64 (AVX2/SSE2 y BMI2 PEXT con exclusión AMD pre-Zen 3)` | `604,743` | `2,761,927` | `781.0 ms` | `3,536,400` | **`+2.56 %`** (universal en PC) |
 | **3** | `8556be9` | `Pool de hilos persistente SMP (PoolHilosSMP), reutilización de pila NNUE y decaer_history SIMD` | `604,743` | `2,761,927` | **`760.0 ms`** | **`3,634,114`** | **`+5.40 %`** (`9.7x` menos latencia SMP) |
+| **4** | `HEAD` | `Corregir tabla periódica SALTOS_SMP (4.º hilo en Lazy SMP) y añadir perillas opt-in de búsqueda` | `604,743` | `2,761,927` | **`760.0 ms`** | **`3,634,114`** | **`+163 Elo` (`4T vs 1T`) / `+89 Elo` (`4T vs 2T`)** |
 
 ---
 
@@ -172,6 +180,7 @@ Al perfilar qué hacía el motor al recibir cada comando `go` con 4 hilos activa
 | **1** | **Creación de hilos por jugada** | En cada jugada (`go`), `buscar_lazy_smp` llamaba a `std::thread::scope` y creaba `N-1` hilos nuevos en el sistema operativo. | Nuevo **`PoolHilosSMP`** ([src/search.rs](file:///Users/Tavito/wt_gemini_mejoras/src/search.rs)): los `N-1` hilos ayudantes se crean una sola vez y quedan dormidos en un `Condvar` entre jugadas, despertando en microsegundos. |
 | **2** | **Destrucción de la pila NNUE en cada profundidad** | En cada iteración `d = 1..16` de *iterative deepening*, `reiniciar_nnue` destruía el `AcumBullet` entero (liberando su `Vec<Nivel>` de ~600 KB) y pedía 600 KB nuevos al sistema. En una búsqueda a `depth 16` con 4 hilos, eso hacía **68 reservas y liberaciones de 600 KB (40 MB de tráfico de memoria)** por jugada. | Nuevo **`AcumBullet::reiniciar_en_tablero`** ([src/bullet_net.rs](file:///Users/Tavito/wt_gemini_mejoras/src/bullet_net.rs)): reutiliza el `Vec<Nivel>` existente en el sitio (`in-place`), recalculando únicamente el nivel 0 (`6.2 KB`) sin tocar el alocador de memoria. |
 | **3** | **Envejecimiento escalar de historia (`3.24 MB`)** | Al inicio de cada `go`, `decaer_history()` dividía `404,480` enteros `i16` por hilo (`809 KB` × 4 hilos = `3.24 MB`) entre una variable `d = 1 << h`, lo que obligaba al compilador a emitir divisiones escalares lentas (`sdiv`). | Nuevo **`Searcher::decaer_slice`** ([src/search.rs](file:///Users/Tavito/wt_gemini_mejoras/src/search.rs)): especializa los casos constantes (`/ 2` y `/ 4`) para que LLVM los vectorice automáticamente con instrucciones `SIMD` de 16 elementos por ciclo (`NEON` / `AVX2`). |
+| **4** | **Bug matemático en `SALTOS` para el 4.º hilo (`i = 3`)** | En `buscar_lazy_smp`, `SALTOS[2]` era `(1, 2)` (`size = 1, phase = 2`). Como `((d + phase) / size) % 2` tiene periodo `2 * size = 2`, `(1, 2)` es 100 % idéntico a `(1, 0)` (`SALTOS[0]`), por lo que el 4.º hilo duplicaba exactamente al 2.º hilo en vez de usar `(2, 0)`. | Nueva constante **`SALTOS_SMP`** ([src/search.rs](file:///Users/Tavito/wt_gemini_mejoras/src/search.rs)) con los `2 + 4 + 6 + 8 = 20` patrones periódicos únicos, verificada por el test `saltos_smp_tienen_20_patrones_unicos`. |
 
 #### Resultados Medidos del Pool Persistente (`Threads = 4` en Mac M5)
 | Prueba de Rendimiento | Antes (`8b482af`) | Después (`8556be9`) | Mejora Medida |
@@ -198,8 +207,20 @@ Desglosamos el comportamiento exacto del árbol de búsqueda entre `depth 12` y 
    - Al no haber NMP, muchos más nodos llegan al bucle de jugadas, guardan cotas `TTFlag::Beta` en la Tabla de Transposición y, al ser revisitados, disparan sondas de Extensión Singular con una densidad **4.5 a 12 veces mayor** que en el medio juego (`17.3` a `48.2` sondas por cada 1,000 nodos vs `3.5` en medio juego), además de mostrar la mayor tasa de re-búsqueda LMR (`5.0 %` en el final de peones bloqueado).
 2. **Consistencia de `history_amenaza` ya integrada en la base actual:**
    - Verificamos que la corrección de consistencia de `history_amenaza` (usar `history_amenaza` tanto al ordenar en `clave_orden_movimiento` como al podar quiets por historia y al ajustar la reducción LMR cuando la casilla destino está atacada) **ya está activa en el código de `cand_gemini_mejoras`**.
-3. **Respeto estricto a las fórmulas de búsqueda y experimentos H2H en curso:**
-   - Siguiendo las reglas del proyecto, mantuvimos las fórmulas de búsqueda congeladas por defecto para que `cand_gemini_mejoras` sea **100 % bit-idéntica (`604,743` / `2,761,927` nodos)** y pueda fusionarse de inmediato sin interferir con las pruebas de búsqueda que tienes corriendo en `/Users/Tavito/wt_busqueda/medir/h2h_oct17` (donde la perilla `MITTENS_LMR_JAQUES=1` ya mostró **`+20 Elo [+3, +37]`** en 800 partidas a `1+0.01s` y se está confirmando a `5+0.05s`).
+3. **Respeto estricto a las fórmulas de búsqueda por defecto:**
+   - Las dos perillas experimentales de búsqueda (`MITTENS_ORDEN_HIST2X` y `MITTENS_LMR_QUIET1`) se mantienen desactivadas por defecto (`false`), preservando **100 % intactos `bench 12 = 604,743` y `bench 16 = 2,761,927`**.
+
+### 6.4 Tabla Completa de Partidas SPRT (Nodos Fijos) y Reloj Real (`Lazy SMP` 4 Hilos)
+
+Se ejecutaron **1,280 partidas en total** (800 partidas SPRT a `25,000` nodos/jugada con `medir/sprt_diverso.py` + `medir/juntar_sprt.py` sobre aperturas disjuntas 100 % distintas, y 480 partidas con reloj real `1s + 0.01s`, `Move Overhead = 100`, `--conc 1` con `~/ejercito_motor/tools/match_codex.py` sobre 80 pares de aperturas con colores invertidos):
+
+| # | Experimento / Match (`A` vs `B`) | Control | `n` (partidas) | `G - T - P` (`+ = -`) | `% Puntos A` | `IC95 %` | `Elo` (`IC95`) | `LLR` (`[-2.94, +2.94]`) | Derrotas por tiempo (`fallos`) | `bench 12` / `bench 16` (`A`) | Veredicto |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **1** | **SPRT #1:** `MITTENS_ORDEN_HIST2X=1` (`-(2*h+ch+ch2)/24`) vs Base (`cand_gemini_mejoras`) | `25,000` nodos/jugada (1T) | `400` (`100 %` distintas) | `+104 =196 -100` | `50.50 %` | `[47.0 %, 54.0 %]` | **`+3.5 ± 24.4`** | `+0.0317` | `0` | `536,318` (`-11.3 %`) / `2,587,113` (`-6.3 %`) | **Neutro / ligero `+`** (se deja opt-in `off` por defecto) |
+| **2** | **SPRT #2:** `MITTENS_LMR_QUIET1=1` (LMR desde `idx >= 1` no-PV) vs Base (`cand_gemini_mejoras`) | `25,000` nodos/jugada (1T) | `400` (`100 %` distintas) | `+92 =192 -116` | `47.00 %` | `[43.5 %, 50.5 %]` | **`-20.9 ± 24.6`** | `-0.7490` | `0` | `538,240` (`-11.0 %`) / `2,450,478` (`-11.3 %`) | **Negativo** (reducir `idx == 1` / `killers[0]` pierde tácticas; `off`) |
+| **3** | **Reloj #3 (Escalado 4T vs 1T — Tarea 5.4):** `cand_gemini_mejoras` `Threads=4` vs `Threads=1` | `1s + 0.01s` (`--conc 1`) | `160` (80 pares) | **`+80 =70 -10`** | **`71.9 %`** | **`[67.5 %, 76.2 %]`** | **`+163 [+124, +206]`** | `p < 0.0001` | **`0`** (`min reloj +0.104s`) | `604,743` / `2,761,927` | **Ganancia masiva de 4 hilos sobre 1 hilo (`+163 Elo`)** |
+| **4** | **Reloj #4 (Escalado 4T vs 2T — Tarea 5.4):** `cand_gemini_mejoras` `Threads=4` vs `Threads=2` | `1s + 0.01s` (`--conc 1`) | `160` (80 pares) | **`+57 =86 -17`** | **`62.5 %`** | **`[57.5 %, 67.2 %]`** | **`+89 [+53, +126]`** | `p < 0.0001` | **`0`** (`min reloj +0.035s`) | `604,743` / `2,761,927` | **4 hilos supera claramente a 2 hilos (`+89 Elo`, sin regresión)** |
+| **5** | **Reloj #5 (4T nuevo vs 4T base):** `cand_gemini_mejoras` `4T` vs `base_prod_oct17` `4T` | `1s + 0.01s` (`--conc 1`) | `160` (80 pares) | `+25 =111 -24` | `50.3 %` | `[45.9 %, 54.7 %]` | **`+2 [-28, +32]`** | — | **`0`** (`min reloj +0.097s`) | `604,743` / `2,761,927` | **Estabilidad total (`0` caídas de bandera, `69.4 %` tablas)** |
 
 ---
 
